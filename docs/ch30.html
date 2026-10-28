@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 30 章 · 扩展点设计 — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="30">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 30 章 · 设计篇</span>
+<h1>扩展点设计</h1>
+<p class="lede">
+  Tomcat 最了不起的地方，不是它自己做了什么，而是它让别人能做什么：Spring、安全框架、监控代理、云厂商的定制版，
+  全都是在不改 Tomcat 一行代码的前提下接进来的。这一章把 Tomcat 的扩展点归纳成四种形态，
+  总结一个好扩展点的标准，再说说扩展点的代价——Tomcat 自己就删掉过好几个。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>能列出 Tomcat 的主要扩展点，并归入拦截链、事件监听、策略插槽、发现机制四种形态</li>
+    <li>知道遇到一个扩展需求时该选哪种形态</li>
+    <li>掌握好扩展点的七条标准，并能在代码里实现它们</li>
+    <li>会用子优先的类加载器隔离插件</li>
+    <li>知道什么时候不该加扩展点</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="map">Tomcat 的扩展点地图</h2>
+
+<p>把前面各章出现过的扩展点放在一起：</p>
+
+<div class="tw">
+<table>
+  <tr><th>扩展点</th><th>形态</th><th>挂在哪里</th><th>典型的使用者</th><th>章节</th></tr>
+  <tr><td><code>Valve</code></td><td>拦截链</td><td>Engine / Host / Context / Wrapper 的管道</td><td>访问日志、IP 过滤、认证器、错误页</td><td>5、10、22、28</td></tr>
+  <tr><td><code>Filter</code></td><td>拦截链</td><td>Web 应用（按 URL / Servlet 名 / 分派类型）</td><td>编码设置、Spring Security、WsFilter</td><td>11、21、26</td></tr>
+  <tr><td><code>LifecycleListener</code></td><td>事件监听</td><td>任何组件</td><td>ContextConfig、HostConfig、泄漏防护监听器</td><td>6、15、18、28</td></tr>
+  <tr><td><code>ServletContextListener</code> 等</td><td>事件监听</td><td>Web 应用</td><td>Spring 的 <code>ContextLoaderListener</code></td><td>25</td></tr>
+  <tr><td><code>Realm</code> / <code>Authenticator</code></td><td>策略插槽</td><td>Engine / Host / Context</td><td>JDBC、LDAP、单点登录</td><td>10</td></tr>
+  <tr><td><code>Manager</code> / <code>Store</code></td><td>策略插槽</td><td>Context</td><td>持久化会话、集群会话、Redis 会话</td><td>9</td></tr>
+  <tr><td><code>Loader</code> / <code>Resources</code></td><td>策略插槽</td><td>Context</td><td>虚拟类路径、从数据库加载资源</td><td>8、12</td></tr>
+  <tr><td><code>Executor</code> / <code>UpgradeProtocol</code></td><td>策略插槽</td><td>Service / Connector</td><td>共享线程池、虚拟线程、HTTP/2</td><td>23、26、27</td></tr>
+  <tr><td><code>className</code> 属性</td><td>发现机制</td><td>server.xml 里几乎每个元素</td><td>把任何组件换成自己的子类</td><td>15</td></tr>
+  <tr><td><code>ServletContainerInitializer</code></td><td>发现机制</td><td>jar 的 <code>META-INF/services</code></td><td>Spring MVC、WebSocket、JSP</td><td>25</td></tr>
+  <tr><td><code>ContainerServlet</code></td><td>特权通道</td><td>privileged 的 Context</td><td>Manager 应用</td><td>19</td></tr>
+  <tr><td>MBean</td><td>管理接口</td><td>所有组件</td><td>监控系统、运维脚本</td><td>20、28</td></tr>
+</table>
+</div>
+
+<h2 id="forms">四种形态</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 360" role="img" aria-label="四种扩展形态：拦截链、事件监听、策略插槽、发现机制">
+  <rect class="bx-d" x="20" y="16" width="355" height="160" rx="12"/>
+  <text class="ttl on-a" x="36" y="40">① 拦截链：包住一次调用</text>
+  <rect class="bx-a" x="40" y="62" width="70" height="34" rx="6"/><text class="sm" x="75" y="83" text-anchor="middle">阀 1</text>
+  <rect class="bx-a" x="130" y="62" width="70" height="34" rx="6"/><text class="sm" x="165" y="83" text-anchor="middle">阀 2</text>
+  <rect class="bx" x="220" y="62" width="90" height="34" rx="6"/><text class="sm" x="265" y="83" text-anchor="middle">基础阀</text>
+  <path class="ln-a" d="M112 79 H126" marker-end="url(#ar-a)"/><path class="ln-a" d="M202 79 H216" marker-end="url(#ar-a)"/>
+  <text class="sm" x="36" y="124">可以改写输入、包住前后、或者不调用 next（短路）</text>
+  <text class="sm" x="36" y="144">有顺序；一个阀抛异常，整条链失败</text>
+  <text class="sm" x="36" y="164">Valve、Filter、Spring 拦截器、Netty Handler</text>
+
+  <rect class="bx-d" x="385" y="16" width="355" height="160" rx="12"/>
+  <text class="ttl on-b" x="401" y="40">② 事件监听：知道发生了什么</text>
+  <rect class="bx" x="405" y="62" width="100" height="34" rx="6"/><text class="sm" x="455" y="83" text-anchor="middle">组件</text>
+  <path class="ln-b" d="M507 72 H560" marker-end="url(#ar-b)"/><path class="ln-b" d="M507 86 H560" marker-end="url(#ar-b)"/>
+  <rect class="bx-b" x="564" y="56" width="70" height="24" rx="5"/><text class="sm" x="599" y="72" text-anchor="middle">监听器</text>
+  <rect class="bx-b" x="564" y="82" width="70" height="24" rx="5"/><text class="sm" x="599" y="98" text-anchor="middle">监听器</text>
+  <text class="sm" x="401" y="124">一对多广播，单向，通常不改变主流程</text>
+  <text class="sm" x="401" y="144">出错是否中断主流程，要事先约定</text>
+  <text class="sm" x="401" y="164">LifecycleListener、ServletContextListener</text>
+
+  <rect class="bx-d" x="20" y="186" width="355" height="160" rx="12"/>
+  <text class="ttl on-g" x="36" y="210">③ 策略插槽：替换一整块能力</text>
+  <rect class="bx" x="40" y="226" width="120" height="44" rx="6"/><text class="sm" x="100" y="252" text-anchor="middle">Context</text>
+  <rect class="bx-g" x="160" y="236" width="24" height="24" rx="3"/>
+  <path class="ln-g" d="M186 248 H206"/>
+  <rect class="bx-g" x="210" y="222" width="140" height="22" rx="5"/><text class="sm" x="280" y="237" text-anchor="middle">内存 Realm（默认）</text>
+  <rect class="bx-d" x="210" y="250" width="140" height="22" rx="5"/><text class="sm" x="280" y="265" text-anchor="middle">JDBC / LDAP Realm</text>
+  <text class="sm" x="36" y="294">一个插槽一个实现，必须有默认值</text>
+  <text class="sm" x="36" y="314">实现者要遵守完整的契约（不只是一个方法）</text>
+  <text class="sm" x="36" y="334">Realm、Manager、Loader、Executor</text>
+
+  <rect class="bx-d" x="385" y="186" width="355" height="160" rx="12"/>
+  <text class="ttl on-p" x="401" y="210">④ 发现机制：实现从哪里来</text>
+  <rect class="bx-p" x="405" y="222" width="150" height="22" rx="5"/><text class="sm" x="480" y="237" text-anchor="middle">配置里的 className</text>
+  <rect class="bx-p" x="405" y="248" width="150" height="22" rx="5"/><text class="sm" x="480" y="263" text-anchor="middle">META-INF/services</text>
+  <rect class="bx-p" x="405" y="274" width="150" height="22" rx="5"/><text class="sm" x="480" y="289" text-anchor="middle">注解扫描</text>
+  <path class="ln-p" d="M557 259 H600" marker-end="url(#ar-p)"/>
+  <rect class="bx" x="604" y="240" width="120" height="38" rx="6"/><text class="sm" x="664" y="263" text-anchor="middle">注册表 / 插槽</text>
+  <text class="sm" x="401" y="318">和前三种正交：决定「装哪个」，不决定「怎么用」</text>
+  <text class="sm" x="401" y="336">className、SCI、@HandlesTypes</text>
+</svg>
+<figcaption>图 30-1　前三种决定扩展「怎么参与」，第四种决定扩展「从哪里来」</figcaption>
+</figure>
+
+<h3>怎么选</h3>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="选择扩展形态的决策：需要改变流程选拦截链，只需要知道选监听，需要替换整块能力选策略插槽">
+  <rect class="bx" x="20" y="90" width="150" height="50" rx="10"/>
+  <text class="ttl" x="95" y="120" text-anchor="middle">一个扩展需求</text>
+  <path class="ln" d="M172 115 C200 115 200 46 226 44" marker-end="url(#ar)"/>
+  <path class="ln" d="M172 115 H226" marker-end="url(#ar)"/>
+  <path class="ln" d="M172 115 C200 115 200 184 226 186" marker-end="url(#ar)"/>
+  <rect class="bx" x="230" y="22" width="270" height="44" rx="8"/><text class="sm" x="365" y="49" text-anchor="middle">需要修改、阻止或包住某个调用？</text>
+  <rect class="bx" x="230" y="93" width="270" height="44" rx="8"/><text class="sm" x="365" y="120" text-anchor="middle">只需要在某件事发生时得到通知？</text>
+  <rect class="bx" x="230" y="164" width="270" height="44" rx="8"/><text class="sm" x="365" y="191" text-anchor="middle">要把一整块能力换成另一种实现？</text>
+  <path class="ln-a" d="M502 44 H546" marker-end="url(#ar-a)"/>
+  <path class="ln-b" d="M502 115 H546" marker-end="url(#ar-b)"/>
+  <path class="ln-g" d="M502 186 H546" marker-end="url(#ar-g)"/>
+  <rect class="bx-a" x="550" y="22" width="190" height="44" rx="8"/><text class="ttl on-a" x="645" y="49" text-anchor="middle">拦截链</text>
+  <rect class="bx-b" x="550" y="93" width="190" height="44" rx="8"/><text class="ttl on-b" x="645" y="120" text-anchor="middle">事件监听</text>
+  <rect class="bx-g" x="550" y="164" width="190" height="44" rx="8"/><text class="ttl on-g" x="645" y="191" text-anchor="middle">策略插槽</text>
+</svg>
+<figcaption>图 30-2　然后再问：实现是我们自己写的（直接注册），还是第三方提供的（需要发现机制）？</figcaption>
+</figure>
+
+<p>
+  常见的误用是「用监听器改流程」：例如在 <code>BEFORE_START</code> 事件里抛异常阻止组件启动。能做到，但调用者很难理解启动为什么失败。
+  反过来，「用拦截链做通知」会让每个阀都背上「记得调用 next」的义务。形态选对了，扩展者的心智负担就小。
+</p>
+
+<h2 id="criteria">好扩展点的七条标准</h2>
+
+<ol class="steps">
+  <li><strong>窄而稳定的接口</strong>。<code>Valve.invoke(request, response)</code> 只有一个核心方法。方法越少，实现者越容易写对，接口也越不需要改。</li>
+  <li><strong>有默认实现</strong>。没配置 Realm、Manager、Loader 时，Context 会创建默认的。扩展是可选的，不是使用的前提。</li>
+  <li><strong>明确的调用约定</strong>：在哪个线程调用、调用几次、以什么顺序、能不能阻塞。Servlet 规范花了大量篇幅写这些，第 24 章的 <code>ReadListener</code> 就规定了只能在 <code>isReady()</code> 为真时读。</li>
+  <li><strong>和生命周期集成</strong>。Tomcat 在启动 Context 时检查 <code>if (realm instanceof Lifecycle)</code>，是就一起启动。扩展不需要自己找时机初始化。</li>
+  <li><strong>错误隔离策略要想清楚，并写进约定</strong>。拦截链里一个阀出错，整个请求失败（它在主路径上）。监听器则要分情况：
+      <code>LifecycleListener</code> 抛异常会让组件启动失败——因为 ContextConfig 这样的监听器本身就承担着配置工作，失败了就不该继续；
+      而会话的创建、销毁、属性变化这类通知，Tomcat 会捕获监听器的异常、记日志后继续——一个统计在线人数的监听器出 bug，不该让用户的会话无法失效。
+      关键是「这个扩展失败了，主流程还有没有意义」。</li>
+  <li><strong>为演化留余地</strong>。给扩展者一个抽象基类（<code>ValveBase</code>、<code>RealmBase</code>、<code>HttpServlet</code>），接口加方法时在基类里提供默认实现；Java 8 之后也可以直接用 <code>default</code> 方法。</li>
+  <li><strong>可诊断</strong>。能列出「现在装了哪些扩展」：Tomcat 的每个阀、每个 Realm 都是 MBean，可以在 JConsole 里看到。扩展一多，「这个请求到底经过了哪些阀」就是最常见的问题。</li>
+</ol>
+
+<h2 id="isolation">插件隔离：子优先的类加载器</h2>
+
+<p>
+  当扩展由第三方提供时，还有一个问题：插件自带的依赖可能和宿主冲突（插件要 Jackson 2.17，宿主用 2.15）。
+  第 8 章的 WebappClassLoader 给出了答案，本章把它提炼成工具包里的 <code>PluginClassLoader</code>：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="插件类加载器：API 包父优先，插件自己的类子优先">
+  <rect class="bx-a" x="20" y="20" width="300" height="120" rx="12"/>
+  <text class="ttl on-a" x="170" y="44" text-anchor="middle">宿主（应用类加载器）</text>
+  <rect class="bx-g" x="40" y="58" width="260" height="30" rx="6"/><text class="mono sm" x="170" y="78" text-anchor="middle">API：modern.design.ch30.spi.*</text>
+  <rect class="bx" x="40" y="96" width="260" height="30" rx="6"/><text class="sm" x="170" y="116" text-anchor="middle">宿主实现、宿主的第三方库</text>
+  <rect class="bx-b" x="440" y="20" width="300" height="120" rx="12"/>
+  <text class="ttl on-b" x="590" y="44" text-anchor="middle">PluginClassLoader("webhook-plugin")</text>
+  <rect class="bx-b" x="460" y="58" width="260" height="30" rx="6"/><text class="mono sm" x="590" y="78" text-anchor="middle">WebhookChannel</text>
+  <rect class="bx-b" x="460" y="96" width="260" height="30" rx="6"/><text class="sm" x="590" y="116" text-anchor="middle">插件自带的库（可以和宿主版本不同）</text>
+  <path class="ln-g" d="M458 73 H302" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="380" y="66" text-anchor="middle">API 包：父优先</text>
+  <text class="sm" x="380" y="116" text-anchor="middle">其他类：子优先</text>
+  <rect class="bx-d" x="20" y="166" width="720" height="78" rx="10"/>
+  <text class="sm" x="36" y="190">为什么 API 必须父优先？如果插件自己也加载了一份 Channel 接口，那么插件里的 WebhookChannel 实现的是「插件的 Channel」，</text>
+  <text class="sm" x="36" y="210">宿主拿到后转成「宿主的 Channel」会抛 ClassCastException——同名的类被不同加载器加载，在 JVM 看来就是两个类。</text>
+  <text class="sm" x="36" y="230">Tomcat 对 java.*、jakarta.servlet.* 永远父优先，原因相同。</text>
+</svg>
+<figcaption>图 30-3　共享接口父优先，私有实现子优先</figcaption>
+</figure>
+
+<p>
+  写这个示例时踩到了两个坑，都是 Tomcat 早已处理过的：一是第一版用普通的 <code>URLClassLoader</code>（父优先），由于插件类恰好也在宿主的类路径上，
+  被父加载器抢先加载了——插件根本没有被隔离；二是 <code>ServiceLoader</code> 在子加载器上查找时，会把父加载器的服务声明也找出来，
+  导致宿主的渠道被每个插件重复发现一遍。修复后，发现时只接受「由这个加载器自己定义」的实现。
+</p>
+
+<h2 id="cost">扩展点的代价</h2>
+
+<p>
+  每个公开的扩展点都是一个承诺：有人依赖它，你就不能随便改。Tomcat 的历史里删掉过不少扩展点，每一个都付出了迁移成本：
+</p>
+
+<div class="tw">
+<table>
+  <tr><th>被移除的扩展点</th><th>出现在</th><th>为什么移除</th><th>教训</th></tr>
+  <tr><td><code>ValveContext</code></td><td>第 5 章</td><td>每次请求要创建的有状态迭代器，阀直接持有 next 更简单</td><td>扩展接口里不要暴露实现细节</td></tr>
+  <tr><td>容器级的 <code>Mapper</code> 接口</td><td>第 5、12 章</td><td>映射逻辑后来集中到连接器的全局 Mapper，没人需要替换它</td><td>没有第二个实现的接口只是负担</td></tr>
+  <tr><td><code>Logger</code> 接口</td><td>第 7 章</td><td>改用通用的日志门面</td><td>通用设施别自己定义扩展点</td></tr>
+  <tr><td><code>Deployer</code> 接口</td><td>第 18 章</td><td>StandardHost 只是把方法转发给 StandardHostDeployer</td><td>不要为了「看起来可扩展」而抽接口</td></tr>
+  <tr><td><code>SingleThreadModel</code></td><td>第 11 章</td><td>给了虚假的线程安全保证</td><td>扩展点的语义如果有坑，越早删越好</td></tr>
+</table>
+</div>
+
+<div class="box key">
+  <div class="t">&#128273; 什么时候加扩展点：三次法则</div>
+  <p>
+    第一次遇到需求，直接写；第二次遇到相似的需求，忍住，复制一下；第三次，再抽象出扩展点——这时你手里有三个真实的例子，知道哪些部分真的会变。
+    在那之前，保留一个<strong>内部的</strong>接缝就够了：比如把创建逻辑集中在一个工厂方法里，以后要开放时只改一处，而不是一开始就对外公开一个接口。
+  </p>
+</div>
+
+<h2 id="java17">Java 17：一个有四种扩展点的发布器</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/design/ch30/</code><code>Publisher.java</code><code>ExtensionDemo.java</code><code>spi/</code><code>builtin/</code><code>plugins/WebhookChannel.java</code><code>design/kit/PluginClassLoader.java</code><code>resources/META-INF/services/…Channel</code></div>
+
+<p>
+  <code>Publisher</code> 是一个消息发布器：把消息通过某个「渠道」（控制台、短信、Webhook）发出去。它身上集中了四种扩展点，每一种都对应 Tomcat 的同类机制：
+</p>
+
+<div class="code" data-lang="java" data-file="java17/.../design/ch30/Publisher.java（节选）">
+<pre>
+public final class Publisher extends LifecycleBase {
+
+    private final Map&lt;String, Channel&gt; channels = new ConcurrentHashMap&lt;&gt;();            // ④ 发现机制填充
+    private final List&lt;Consumer&lt;PublishEvent&gt;&gt; listeners = new CopyOnWriteArrayList&lt;&gt;(); // ② 事件监听
+    private final Pipeline&lt;Message&gt; pipeline = new Pipeline&lt;&gt;(this::deliver);         // ① 拦截链
+    private volatile Formatter formatter = new PlainFormatter();                       // ③ 策略插槽 + 默认值
+
+    /** ③ 按类名创建策略（server.xml 里 className 属性的做法） */
+    public void setFormatterClass(String className) throws ReflectiveOperationException {
+        if (className != null &amp;&amp; !className.isBlank()) {
+            setFormatter((Formatter) Class.forName(className.trim()).getConstructor().newInstance());
+        }
+    }
+
+    /** ④ 只接受「由这个加载器自己定义」的实现，避免把宿主的服务重复发现一遍 */
+    public void discoverChannels(ClassLoader loader, String source) {
+        ServiceLoader.load(Channel.class, loader).stream()
+                .filter(p -&gt; p.type().getClassLoader() == loader)
+                .map(ServiceLoader.Provider::get)
+                .forEach(c -&gt; channels.putIfAbsent(c.name(), c));
+    }
+
+    /** 标准 4：策略自己有生命周期，就跟着启停 */
+    @Override protected void startInternal() { if (formatter instanceof Lifecycle l) l.start(); }
+
+    /** 标准 5：监听器之间互相隔离 */
+    private void fire(PublishEvent event) {
+        for (var l : listeners) {
+            try {
+                l.accept(event);
+            } catch (RuntimeException e) {
+                System.out.println("      （监听器出错已忽略：" + e.getMessage() + "）");
+            }
+        }
+    }
+
+    /** 标准 7：可诊断 */
+    public Map&lt;String, String&gt; describe() { … }
+}
+</pre>
+</div>
+
+<p>扩展接口本身：<code>supports</code> 是「后来才加」的方法，用 <code>default</code> 实现保持老插件兼容（标准 6）：</p>
+
+<div class="code" data-lang="java" data-file="java17/.../design/ch30/spi/Channel.java">
+<pre>
+public interface Channel {
+
+    String name();
+
+    void send(Message message) throws Exception;
+
+    /** 后来才加的方法：用 default 实现保持向后兼容，老插件不用重新编译 */
+    default boolean supports(Message message) {
+        return true;
+    }
+}
+</pre>
+</div>
+
+<p>插件类加载器：</p>
+
+<div class="code" data-lang="java" data-file="java17/.../design/kit/PluginClassLoader.java（节选）">
+<pre>
+@Override
+protected Class&lt;?&gt; loadClass(String name, boolean resolve) throws ClassNotFoundException {
+    synchronized (getClassLoadingLock(name)) {
+        Class&lt;?&gt; c = findLoadedClass(name);
+        if (c == null) {
+            if (isShared(name)) {
+                c = getParent().loadClass(name);              // java.* 和 API 包：父优先
+            } else {
+                try {
+                    c = findClass(name);                      // 其余：子优先
+                } catch (ClassNotFoundException e) {
+                    c = getParent().loadClass(name);
+                }
+            }
+        }
+        if (resolve) resolveClass(c);
+        return c;
+    }
+}
+</pre>
+</div>
+
+<p>演示程序把它们组装起来：两个阀（一个改写、一个短路）、三个监听器（其中一个故意抛异常）、配置指定的格式化策略、类路径和插件目录两处来源的渠道：</p>
+
+<div class="code" data-lang="java" data-file="java17/.../design/ch30/ExtensionDemo.java（节选）">
+<pre>
+publisher.discoverChannels(ExtensionDemo.class.getClassLoader(), "应用类路径");
+try (var pluginLoader = new PluginClassLoader("webhook-plugin", new URL[] {pluginDir},
+        ExtensionDemo.class.getClassLoader(), "modern.design.ch30.spi.", "modern.design.kit.")) {
+    publisher.discoverChannels(pluginLoader, "plugins/webhook");
+    publisher.setFormatterClass(config.get("formatter.class"));
+
+    publisher.pipeline()
+            .addValve((m, next) -&gt; next.invoke(withTraceId(m)))              // 改写
+            .addValve((m, next) -&gt; {                                         // 短路
+                if (m.text().contains("内部密码")) { publisher.reject(m, "包含敏感词"); return; }
+                next.invoke(m);
+            });
+    publisher.addPublishListener(e -&gt; stats.merge(e.type(), 1, Integer::sum));
+    publisher.addPublishListener(e -&gt; { throw new IllegalStateException("有 bug 的监听器"); });
+    …
+}
+</pre>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh design.ch30.ExtensionDemo
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+① 发现扩展
+  发现渠道 console  ← 应用类路径
+  发现渠道 sms      ← 应用类路径
+  发现渠道 webhook  ← plugins/webhook
+
+③ 装上拦截链和监听器
+  channel.console  = modern.design.ch30.builtin.ConsoleChannel
+  channel.sms      = modern.design.ch30.builtin.SmsChannel
+  channel.webhook  = modern.design.ch30.plugins.WebhookChannel
+  formatter        = modern.design.ch30.builtin.SignatureFormatter
+  listeners        = 3
+
+④ 发布
+  publish(console, 构建成功)
+      [console] → alice：构建成功 ——Tomcat 教程
+      （监听器出错已忽略：有 bug 的监听器）
+  publish(sms, 验证码 123456)
+      [sms] → 13800000000：验证码 123456 ——Tomcat 教程
+      （监听器出错已忽略：有 bug 的监听器）
+  publish(sms, 这是一条很长的营销短信，这是一条很长的营…)
+      [AlertListener] 发送失败：sms 不支持这条消息             ← default 方法 supports 的作用
+      （监听器出错已忽略：有 bug 的监听器）
+  publish(sms, 测试号码)
+      [AlertListener] 发送失败：短信网关拒绝了号码 0001234
+      （监听器出错已忽略：有 bug 的监听器）
+  publish(webhook, 部署完成)
+      [webhook] POST https://hooks.example/abc {"text":"部署完成 ——Tomcat 教程"}  （由 PluginClassLoader(webhook-plugin) 加载）
+      （监听器出错已忽略：有 bug 的监听器）
+  publish(console, 内部密码是 hunter2)
+      [SensitiveWordValve] 拦截：内部密码是 hunter2              ← 短路，基础阀没有执行
+      （监听器出错已忽略：有 bug 的监听器）
+  publish(fax, 传真？)
+      [AlertListener] 发送失败：没有渠道 fax
+      （监听器出错已忽略：有 bug 的监听器）
+
+统计监听器：{PUBLISHED=3, REJECTED=1, FAILED=3}
+</pre>
+</div>
+
+<p>
+  那个有 bug 的监听器每次都抛异常，但发布照常进行，其他监听器照常收到事件——发布事件是纯通知，所以选择了隔离（标准 5）。
+  修复前的输出（普通 <code>URLClassLoader</code>）里，<code>console</code> 和 <code>sms</code> 各被发现了两次，<code>WebhookChannel</code> 由 <code>AppClassLoader</code> 加载。
+</p>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>Tomcat 的扩展点可以归为四种形态：拦截链（Valve、Filter）、事件监听（各种 Listener）、策略插槽（Realm、Manager、Loader）和发现机制（className、SCI）。</li>
+  <li>需要改变流程用拦截链，只需要知道用监听，替换整块能力用策略插槽；实现来自第三方时再加发现机制。</li>
+  <li>好扩展点的七条标准：窄接口、有默认值、调用约定明确、集成生命周期、错误隔离、为演化留余地、可诊断。</li>
+  <li>第三方插件用子优先的类加载器隔离，共享 API 必须父优先。</li>
+  <li>每个公开扩展点都是长期承诺；用三次法则决定何时开放，在那之前只保留内部接缝。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>给 <code>Publisher</code> 加一个「重试阀」：渠道抛异常时最多重试 3 次，每次间隔翻倍。思考：它应该放在敏感词阀的前面还是后面？</li>
+    <li>给拦截链加上排序：<code>Valve</code> 增加 <code>default int order() { return 0; }</code>，<code>Pipeline</code> 按它排序。这对已有的 lambda 阀有什么影响？</li>
+    <li>写一个依赖不同版本 Gson（或任意库）的插件，验证 <code>PluginClassLoader</code> 能让它和宿主使用各自的版本。</li>
+    <li>回顾你项目里的一个「扩展点」（策略接口、钩子、插件），用七条标准逐条打分，找出最需要改进的一条。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

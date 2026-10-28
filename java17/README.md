@@ -56,6 +56,7 @@ curl http://localhost:8080/SHUTDOWN       # 第 1 章的服务器靠这个 URL �
 | 27 | 虚拟线程（JDK 21+） | `ch27.VirtualThreadsDemo`（源码在 `src/main/java21`） `ch27.tomcat.EmbeddedVirtualThreads [端口] [true\|false]` |
 | 28 | 运维：调优、监控、泄漏、加固 | `ch28.tomcat.EmbeddedOps [端口] [admin IP 正则]` `ch28.leak.ClassLoaderLeakDemo` `ch28.leak.EmbeddedLeakDetection`（建议 `JAVA_OPTS="--add-opens=java.base/java.lang=ALL-UNNAMED"`） |
 | 29 | 设计篇：整体架构 | `design.ch29.ArchitectureDemo`（设计工具包在 `modern.design.kit`） |
+| 30 | 设计篇：扩展点 | `design.ch30.ExtensionDemo`（含子优先的 `modern.design.kit.PluginClassLoader`） |
 
 ## 目录结构
 
