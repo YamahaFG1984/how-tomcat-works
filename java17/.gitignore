@@ -1,0 +1,10 @@
+# Maven 输出
+target/
+# 运行时生成
+logs/
+work/
+temp.txt
+# 由 compile-servlets.sh 从 webroot/*.java 编译出来的类
+webroot/*.class
+myApp/WEB-INF/classes/
+webapps/app1/WEB-INF/classes/

@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 7 章 · 日志记录器 — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="7">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 7 章</span>
+<h1>日志记录器</h1>
+<p class="lede">
+  日志记录器（Logger）是 Catalina 中最简单的组件：它挂在容器上，负责把消息记录下来。
+  Tomcat 4 提供了三种实现——写到标准输出、写到标准错误、写到按天滚动的文件。
+  这一章很短，但它展示了一个经典的设计：<strong>抽象基类实现所有重载，子类只实现一个方法</strong>。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>理解 <code>Logger</code> 接口和「详细级别（verbosity）」的含义</li>
+    <li>理解 <code>LoggerBase</code> 如何让子类只关心「写到哪里」</li>
+    <li>读懂 <code>FileLogger</code> 按日期滚动日志文件的实现</li>
+    <li>知道现代 Tomcat 为什么换成了 JULI，以及 JULI 的 FileHandler 如何继承了 FileLogger 的设计</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="interface">Logger 接口</h2>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/Logger.java（Tomcat 4）">
+<pre>
+public interface Logger {
+    public static final int FATAL = Integer.MIN_VALUE;
+    public static final int ERROR = 1;
+    public static final int WARNING = 2;
+    public static final int INFORMATION = 3;
+    public static final int DEBUG = 4;
+
+    public Container getContainer();
+    public void setContainer(Container container);
+    public String getInfo();
+    public int getVerbosity();
+    public void setVerbosity(int verbosity);
+    public void addPropertyChangeListener(PropertyChangeListener listener);
+    public void log(String message);
+    public void log(Exception exception, String msg);
+    public void log(String message, Throwable throwable);
+    public void log(String message, int verbosity);
+    public void log(String message, Throwable throwable, int verbosity);
+    public void removePropertyChangeListener(PropertyChangeListener listener);
+}
+</pre>
+</div>
+
+<p>带 <code>verbosity</code> 参数的两个 <code>log</code> 方法会先比较级别：<strong>传入的级别不高于（数值不大于）记录器设定的级别</strong>时才真正记录。</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="详细级别：设定为 WARNING 时，FATAL、ERROR、WARNING 被记录，INFORMATION 和 DEBUG 被忽略">
+  <rect class="bx-r" x="20" y="40" width="130" height="44" rx="8"/><text class="mono" x="85" y="60" text-anchor="middle">FATAL</text><text class="sm" x="85" y="76" text-anchor="middle">MIN_VALUE</text>
+  <rect class="bx-r" x="165" y="40" width="130" height="44" rx="8"/><text class="mono" x="230" y="60" text-anchor="middle">ERROR</text><text class="sm" x="230" y="76" text-anchor="middle">1（默认）</text>
+  <rect class="bx-a" x="310" y="40" width="130" height="44" rx="8"/><text class="mono" x="375" y="60" text-anchor="middle">WARNING</text><text class="sm" x="375" y="76" text-anchor="middle">2</text>
+  <rect class="bx-d" x="455" y="40" width="130" height="44" rx="8"/><text class="mono" x="520" y="60" text-anchor="middle">INFORMATION</text><text class="sm" x="520" y="76" text-anchor="middle">3</text>
+  <rect class="bx-d" x="600" y="40" width="140" height="44" rx="8"/><text class="mono" x="670" y="60" text-anchor="middle">DEBUG</text><text class="sm" x="670" y="76" text-anchor="middle">4</text>
+  <path class="ln" d="M20 104 H740" marker-end="url(#ar)"/>
+  <text class="sm" x="380" y="122" text-anchor="middle">越往右越啰嗦</text>
+  <path class="ln-a" d="M375 30 V20 H20"/>
+  <text class="sm on-a" x="200" y="16" text-anchor="middle">setVerbosity(WARNING) 时会被记录的范围</text>
+  <text class="mono" x="380" y="160" text-anchor="middle">if (this.verbosity &gt;= verbosity) log(message);</text>
+  <text class="sm" x="380" y="184" text-anchor="middle">log("磁盘快满了", WARNING) ✓ 　　log("收到请求", DEBUG) ✗</text>
+</svg>
+<figcaption>图 7-1　verbosity：数值越大，记录得越多</figcaption>
+</figure>
+
+<h2 id="loggers">Tomcat 4 的三种 Logger</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="三种 Logger 都继承 LoggerBase，LoggerBase 实现 Logger 接口">
+  <rect class="bx-d" x="290" y="14" width="180" height="40" rx="8"/>
+  <text class="mono" x="380" y="39" text-anchor="middle">«interface» Logger</text>
+  <rect class="bx-a" x="270" y="84" width="220" height="56" rx="10"/>
+  <text class="ttl on-a" x="380" y="106" text-anchor="middle">LoggerBase（抽象）</text>
+  <text class="sm" x="380" y="126" text-anchor="middle">实现除 log(String) 外的全部方法</text>
+  <path class="ln-d" d="M380 82 V56" marker-end="url(#ar)"/>
+
+  <rect class="bx-b" x="40" y="172" width="190" height="44" rx="10"/>
+  <text class="mono" x="135" y="191" text-anchor="middle">SystemOutLogger</text>
+  <text class="sm" x="135" y="208" text-anchor="middle">System.out.println</text>
+  <rect class="bx-b" x="285" y="172" width="190" height="44" rx="10"/>
+  <text class="mono" x="380" y="191" text-anchor="middle">SystemErrLogger</text>
+  <text class="sm" x="380" y="208" text-anchor="middle">System.err.println</text>
+  <rect class="bx-g" x="530" y="172" width="190" height="44" rx="10"/>
+  <text class="mono" x="625" y="191" text-anchor="middle">FileLogger</text>
+  <text class="sm" x="625" y="208" text-anchor="middle">按天滚动的文件 + Lifecycle</text>
+  <path class="ln" d="M135 170 L320 142" marker-end="url(#ar)"/>
+  <path class="ln" d="M380 170 V142" marker-end="url(#ar)"/>
+  <path class="ln" d="M625 170 L440 142" marker-end="url(#ar)"/>
+</svg>
+<figcaption>图 7-2　Tomcat 4 的日志记录器（对应原书图 7.1）</figcaption>
+</figure>
+
+<h3>LoggerBase</h3>
+
+<p><code>LoggerBase</code> 是抽象类，默认级别 <code>ERROR</code>。它实现了所有带额外参数的 <code>log</code> 重载——它们最终都调用唯一的抽象方法 <code>log(String msg)</code>。这样每个子类只需要决定「写到哪里」：</p>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/logger/LoggerBase.java（节选）">
+<pre>
+protected int verbosity = ERROR;
+
+public abstract void log(String msg);       // 子类唯一要实现的方法
+
+public void log(String message, int verbosity) {
+    if (this.verbosity &gt;= verbosity)
+        log(message);
+}
+
+public void setVerbosityLevel(String verbosity) {
+    if ("FATAL".equalsIgnoreCase(verbosity))
+        this.verbosity = FATAL;
+    else if ("ERROR".equalsIgnoreCase(verbosity))
+        this.verbosity = ERROR;
+    ...
+}
+</pre>
+</div>
+
+<div class="code" data-lang="java" data-file="SystemOutLogger / SystemErrLogger">
+<pre>
+public class SystemOutLogger extends LoggerBase {
+    public void log(String msg) {
+        System.out.println(msg);
+    }
+}
+
+public class SystemErrLogger extends LoggerBase {
+    public void log(String msg) {
+        System.err.println(msg);
+    }
+}
+</pre>
+</div>
+
+<h3>FileLogger：按天滚动</h3>
+
+<p><code>FileLogger</code> 把消息写进文件，文件名由<strong>前缀 + 日期 + 后缀</strong>组成，比如 <code>FileLog_2004-01-05.txt</code>。每写一条日志都检查日期，日期变了就关闭旧文件、打开新文件。它还实现了 Lifecycle，<code>stop</code> 时关闭文件。</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="FileLogger 的 log 方法：生成时间戳，日期变化则关闭旧文件打开新文件，然后写入一行">
+  <rect class="bx" x="20" y="20" width="200" height="44" rx="10"/>
+  <text class="mono" x="120" y="47" text-anchor="middle">log("Context started")</text>
+  <path class="ln" d="M120 66 V84" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="20" y="86" width="200" height="54" rx="10"/>
+  <text class="sm" x="120" y="106" text-anchor="middle">Timestamp.toString()</text>
+  <text class="mono sm" x="120" y="126" text-anchor="middle">2004-01-05 13:13:33</text>
+  <path class="ln" d="M222 113 H268" marker-end="url(#ar)"/>
+  <path class="bx-a" d="M370 78 L470 113 L370 148 L270 113 Z" style="stroke-width:1.5"/>
+  <text class="sm on-a" x="370" y="109" text-anchor="middle">日期和 date</text>
+  <text class="sm on-a" x="370" y="125" text-anchor="middle">字段一样吗？</text>
+  <path class="ln-r" d="M472 113 H528" marker-end="url(#ar-r)"/>
+  <text class="sm on-r" x="500" y="105" text-anchor="middle">不一样</text>
+  <rect class="bx-r" x="530" y="80" width="210" height="66" rx="10"/>
+  <text class="mono sm" x="635" y="100" text-anchor="middle">close() 旧文件</text>
+  <text class="mono sm" x="635" y="118" text-anchor="middle">date = 新日期</text>
+  <text class="mono sm" x="635" y="136" text-anchor="middle">open() 新文件</text>
+  <path class="ln-g" d="M370 150 V196" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="380" y="176">一样</text>
+  <path class="ln" d="M635 148 V214 H472" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="270" y="198" width="200" height="44" rx="10"/>
+  <text class="mono sm" x="370" y="217" text-anchor="middle">writer.println(</text>
+  <text class="mono sm" x="370" y="233" text-anchor="middle">tsString + " " + msg)</text>
+  <rect class="bx-d" x="20" y="180" width="200" height="62" rx="10"/>
+  <text class="sm" x="120" y="200" text-anchor="middle">webroot/</text>
+  <text class="mono sm" x="120" y="218" text-anchor="middle">FileLog_2004-01-04.txt</text>
+  <text class="mono sm" x="120" y="234" text-anchor="middle">FileLog_2004-01-05.txt</text>
+</svg>
+<figcaption>图 7-3　FileLogger.log()：日期一变就换文件</figcaption>
+</figure>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/logger/FileLogger.java（节选）">
+<pre>
+public void log(String msg) {
+    Timestamp ts = new Timestamp(System.currentTimeMillis());
+    String tsString = ts.toString().substring(0, 19);   // "yyyy-mm-dd hh:mm:ss"
+    String tsDate = tsString.substring(0, 10);          // "yyyy-mm-dd"
+
+    if (!date.equals(tsDate)) {
+        synchronized (this) {
+            if (!date.equals(tsDate)) {
+                close();
+                date = tsDate;
+                open();
+            }
+        }
+    }
+    if (writer != null) {
+        if (timestamp) writer.println(tsString + " " + msg);
+        else           writer.println(msg);
+    }
+}
+
+private void open() {
+    File dir = new File(directory);
+    if (!dir.isAbsolute())
+        dir = new File(System.getProperty("catalina.base"), directory);
+    dir.mkdirs();
+    try {
+        String pathname = dir.getAbsolutePath() + File.separator + prefix + date + suffix;
+        writer = new PrintWriter(new FileWriter(pathname, true), true);   // 追加模式
+    } catch (IOException e) {
+        writer = null;
+    }
+}
+
+private void close() {
+    if (writer == null) return;
+    writer.flush();
+    writer.close();
+    writer = null;
+    date = "";
+}
+</pre>
+</div>
+
+<div class="box warn">
+  <div class="t">&#9888; 双重检查的隐患</div>
+  <p><code>date</code> 不是 <code>volatile</code>，第一次检查在锁外读它，第二次在锁内。一个线程正在换文件时，另一个线程可能在锁外看到新 date 却拿到了已被关闭（<code>null</code>）的 writer，于是这条日志被悄悄丢掉。日志丢几条通常无伤大雅，但这个模式照搬到别处就可能出大问题。Java 17 版把「检查 + 写入」整体放进了 <code>synchronized</code>。</p>
+</div>
+
+<h2 id="app">本章应用</h2>
+
+<p>应用和第 6 章几乎一样，只改了两个类：<code>SimpleContext</code> 增加了 <code>logger</code> 字段并在启动/停止时记日志；<code>Bootstrap</code> 创建一个 FileLogger 交给 Context。连接器也会通过 <code>container.getLogger()</code> 把自己的消息写到这个 Logger 里。</p>
+
+<div class="code" data-lang="java" data-file="ex07/pyrmont/startup/Bootstrap.java（节选）">
+<pre>
+// ------ add logger --------
+System.setProperty("catalina.base", System.getProperty("user.dir"));
+FileLogger logger = new FileLogger();
+logger.setPrefix("FileLog_");
+logger.setSuffix(".txt");
+logger.setTimestamp(true);
+logger.setDirectory("webroot");
+context.setLogger(logger);
+//---------------------------
+</pre>
+</div>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch07/logger/</code><code>core/SimpleContext.java</code><code>startup/Bootstrap.java</code><code>juli/JuliFileHandlerDemo.java</code></div>
+
+<h3>① 级别常量 → 枚举</h3>
+
+<div class="vs">
+  <div class="old"><div class="h">原书</div>
+<div class="code" data-lang="java">
+<pre>
+public static final int FATAL = Integer.MIN_VALUE;
+public static final int ERROR = 1;
+...
+public void setVerbosityLevel(String v) {
+    if ("FATAL".equalsIgnoreCase(v)) ...
+    else if ("ERROR".equalsIgnoreCase(v)) ...
+    // 5 个分支
+}
+</pre>
+</div>
+  </div>
+  <div class="new"><div class="h">Java 17</div>
+<div class="code" data-lang="java">
+<pre>
+enum Verbosity { FATAL, ERROR, WARNING, INFORMATION, DEBUG }
+
+public void setVerbosityLevel(String level) {
+    this.verbosity = Verbosity.valueOf(level.toUpperCase());
+}
+
+public void log(String message, Verbosity level) {
+    if (this.verbosity.compareTo(level) &gt;= 0) log(message);
+}
+</pre>
+</div>
+  </div>
+</div>
+
+<h3>② java.sql.Timestamp → java.time</h3>
+
+<div class="vs">
+  <div class="old"><div class="h">原书：借用 JDBC 的 Timestamp 再截字符串</div>
+<div class="code" data-lang="java">
+<pre>
+Timestamp ts = new Timestamp(System.currentTimeMillis());
+String tsString = ts.toString().substring(0, 19);
+String tsDate = tsString.substring(0, 10);
+if (!date.equals(tsDate)) { ... }
+</pre>
+</div>
+  </div>
+  <div class="new"><div class="h">Java 17：LocalDateTime</div>
+<div class="code" data-lang="java">
+<pre>
+@Override
+public synchronized void log(String message) {
+    LocalDateTime now = LocalDateTime.now();
+    if (!now.toLocalDate().equals(date)) {
+        close();
+        date = now.toLocalDate();
+        open();
+    }
+    writer.println(timestamp
+        ? TIMESTAMP.format(now) + " " + message
+        : message);
+}
+</pre>
+</div>
+  </div>
+</div>
+
+<div class="code" data-lang="java" data-file="java17/.../ch07/logger/FileLogger.java（open 方法）">
+<pre>
+private void open() {
+    try {
+        Path file = currentFile();                      // catalina.base/logs/FileLog_2026-10-28.txt
+        Files.createDirectories(file.getParent());
+        writer = new PrintWriter(Files.newBufferedWriter(file, StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.APPEND), true);
+    } catch (IOException e) {
+        throw new UncheckedIOException(e);              // 原书吞掉异常，导致日志静默丢失
+    }
+}
+</pre>
+</div>
+
+<p>Java 17 版的 <code>SimpleContext</code> 继承第 6 章的版本，只增加了 Logger 的启停和 <code>log()</code> 方法；启动类还用一个 lambda 阀把每个请求记进同一个日志文件——这就是 Tomcat <code>AccessLogValve</code> 的雏形。</p>
+
+<h3>③ 现代 Tomcat：JULI</h3>
+
+<p>Tomcat 5.5 删掉了 <code>org.apache.catalina.Logger</code> 这一整套，改用 <strong>JULI</strong>（Java Util Logging Implementation）：一个基于 JDK 自带 <code>java.util.logging</code> 的实现，能为每个 Web 应用单独配置日志。组件里通过 <code>org.apache.juli.logging.Log</code> 取日志对象，配置写在 <code>conf/logging.properties</code>。</p>
+
+<div class="tw">
+<table>
+  <tr><th>Tomcat 4 FileLogger</th><th>Tomcat 11 <code>org.apache.juli.FileHandler</code></th></tr>
+  <tr><td><code>directory</code> / <code>prefix</code> / <code>suffix</code></td><td>同名属性，含义相同</td></tr>
+  <tr><td>按天滚动</td><td>按天滚动（<code>rotatable=true</code>）</td></tr>
+  <tr><td>verbosity</td><td>JUL 的 <code>Level</code>：SEVERE、WARNING、INFO、FINE…</td></tr>
+  <tr><td>—</td><td><code>maxDays</code>：自动删除 N 天前的日志</td></tr>
+  <tr><td>同步写入</td><td><code>AsyncFileHandler</code>：后台线程异步写</td></tr>
+</table>
+</div>
+
+<div class="code" data-lang="java" data-file="java17/.../ch07/juli/JuliFileHandlerDemo.java（节选）">
+<pre>
+var handler = new FileHandler("logs", "juli-demo.", ".log", 7);   // 目录、前缀、后缀、保留 7 天
+handler.setFormatter(new OneLineFormatter());                      // Tomcat 默认的单行格式
+
+Logger logger = Logger.getLogger("modern.ch07");                   // java.util.logging.Logger
+logger.setUseParentHandlers(false);
+logger.addHandler(handler);
+logger.setLevel(Level.FINE);
+
+logger.info("starting Context");
+logger.fine("一条调试消息（FINE 级别）");
+logger.finest("FINEST 低于设定级别，不会被记录");
+logger.log(Level.SEVERE, "出错了", new IllegalStateException("示例异常"));
+</pre>
+</div>
+
+<div class="code" data-lang="properties" data-file="Tomcat 11 conf/logging.properties（节选）">
+<pre>
+handlers = 1catalina.org.apache.juli.AsyncFileHandler, 2localhost.org.apache.juli.AsyncFileHandler, ..., java.util.logging.ConsoleHandler
+
+1catalina.org.apache.juli.AsyncFileHandler.directory = ${catalina.base}/logs
+1catalina.org.apache.juli.AsyncFileHandler.prefix = catalina.
+1catalina.org.apache.juli.AsyncFileHandler.maxDays = 90
+</pre>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch07.startup.Bootstrap         # 访问几次 /Primitive，按回车停止
+cat logs/FileLog_*.txt
+./run.sh ch07.juli.JuliFileHandlerDemo
+cat logs/juli-demo.*.log
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+$ cat logs/FileLog_2026-10-28.txt
+2026-10-28 01:04:32 starting Context
+2026-10-28 01:04:32 Context started
+2026-10-28 01:04:32 GET /Primitive -&gt; 200
+2026-10-28 01:04:32 GET /nope -&gt; 404
+2026-10-28 01:04:34 stopping Context
+2026-10-28 01:04:34 Context stopped
+
+$ cat logs/juli-demo.2026-10-28.log
+28-Oct-2026 01:04:40.528 INFO [main] modern.ch07.juli.JuliFileHandlerDemo.main starting Context
+28-Oct-2026 01:04:40.572 FINE [main] modern.ch07.juli.JuliFileHandlerDemo.main 一条调试消息（FINE 级别）
+28-Oct-2026 01:04:40.573 SEVERE [main] modern.ch07.juli.JuliFileHandlerDemo.main 出错了
+	java.lang.IllegalStateException: 示例异常
+		at modern.ch07.juli.JuliFileHandlerDemo.main(JuliFileHandlerDemo.java:31)
+</pre>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>Logger 挂在容器上；带级别的 <code>log</code> 只在级别足够时才记录。</li>
+  <li><code>LoggerBase</code> 实现所有重载，子类只实现 <code>log(String)</code>：SystemOut、SystemErr、File 三种。</li>
+  <li><code>FileLogger</code> 用「前缀 + 日期 + 后缀」命名文件，日期变化时自动换文件，<code>stop</code> 时关闭文件。</li>
+  <li>现代 Tomcat 用基于 <code>java.util.logging</code> 的 JULI，FileHandler 延续了 FileLogger 的设计并增加了过期清理和异步写入。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>给 Java 17 版的 <code>FileLogger</code> 加一个 <code>maxDays</code> 属性：每次换文件时删除 N 天前的日志文件（提示：<code>Files.list</code> + 解析文件名中的日期）。</li>
+    <li>为了测试跨天滚动，把 <code>LocalDateTime.now()</code> 换成 <code>LocalDateTime.now(clock)</code>，注入一个可控的 <code>java.time.Clock</code>，写一个测试验证换天后产生了新文件。</li>
+    <li>把 <code>FileLogger</code> 改成异步：<code>log()</code> 只把消息放进 <code>BlockingQueue</code>，由一个后台线程负责写文件。想一想 <code>stop()</code> 时要注意什么。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

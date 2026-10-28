@@ -1,0 +1,663 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 2 章 · 一个简单的 Servlet 容器 — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="2">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 2 章</span>
+<h1>一个简单的 Servlet 容器</h1>
+<p class="lede">
+  第 1 章的服务器只会发文件。这一章让它学会「运行代码」：遇到 <code>/servlet/XXX</code> 这样的地址，
+  就去加载名为 XXX 的类，创建请求对象和响应对象，调用它的 <code>service</code> 方法。
+  这就是 Servlet 容器最核心的工作。我们会写两个版本，第二个版本用<strong>外观模式</strong>堵上第一个版本的安全漏洞。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>掌握 <code>Servlet</code> 接口的五个方法，以及 init → service → destroy 的生命周期</li>
+    <li>理解一个 Servlet 容器为每个请求要做的四件事</li>
+    <li>学会用 <code>URLClassLoader</code> 从指定目录动态加载类</li>
+    <li>理解为什么要用外观类（Facade）包装请求和响应对象</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="servlet">Servlet 接口</h2>
+
+<p>Servlet 编程靠的是 <code>javax.servlet</code> 和 <code>javax.servlet.http</code> 两个包（从 Jakarta EE 9 起改名为 <code>jakarta.servlet</code>，见本章末尾）。其中最重要的就是 <code>Servlet</code> 接口，所有 Servlet 都必须直接或间接实现它。它只有五个方法：</p>
+
+<div class="code" data-lang="java">
+<pre>
+public void init(ServletConfig config) throws ServletException
+public void service(ServletRequest request, ServletResponse response)
+    throws ServletException, java.io.IOException
+public void destroy()
+public ServletConfig getServletConfig()
+public java.lang.String getServletInfo()
+</pre>
+</div>
+
+<p>其中 <code>init</code>、<code>service</code>、<code>destroy</code> 是<strong>生命周期方法</strong>，由容器在不同时刻调用：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="Servlet 生命周期：加载实例化、init 一次、service 多次、destroy 一次">
+  <rect class="bx" x="20" y="70" width="140" height="64" rx="10"/>
+  <text class="ttl" x="90" y="96" text-anchor="middle">加载并实例化</text>
+  <text class="sm" x="90" y="116" text-anchor="middle">loadClass + new</text>
+
+  <rect class="bx-b" x="210" y="70" width="140" height="64" rx="10"/>
+  <text class="ttl on-b" x="280" y="96" text-anchor="middle">init(config)</text>
+  <text class="sm" x="280" y="116" text-anchor="middle">只调用一次</text>
+
+  <rect class="bx-a" x="400" y="70" width="160" height="64" rx="10"/>
+  <text class="ttl on-a" x="480" y="96" text-anchor="middle">service(req, res)</text>
+  <text class="sm" x="480" y="116" text-anchor="middle">每个请求调用一次</text>
+
+  <rect class="bx-r" x="610" y="70" width="130" height="64" rx="10"/>
+  <text class="ttl on-r" x="675" y="96" text-anchor="middle">destroy()</text>
+  <text class="sm" x="675" y="116" text-anchor="middle">只调用一次</text>
+
+  <path class="ln" d="M162 102 H206" marker-end="url(#ar)"/>
+  <path class="ln" d="M352 102 H396" marker-end="url(#ar)"/>
+  <path class="ln" d="M562 102 H606" marker-end="url(#ar)"/>
+  <path class="ln-a" d="M450 68 C450 20 510 20 510 66" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="480" y="30" text-anchor="middle">请求 1、2、3 …（可能多个线程同时进来）</text>
+
+  <text class="sm" x="280" y="164" text-anchor="middle">读配置、连数据库</text>
+  <text class="sm" x="280" y="182" text-anchor="middle">必须成功完成才能接收请求</text>
+  <text class="sm" x="480" y="164" text-anchor="middle">从 request 读输入</text>
+  <text class="sm" x="480" y="182" text-anchor="middle">往 response 写输出</text>
+  <text class="sm" x="675" y="164" text-anchor="middle">容器关闭或回收内存时</text>
+  <text class="sm" x="675" y="182" text-anchor="middle">释放资源、保存状态</text>
+  <text class="sm" x="380" y="216" text-anchor="middle">destroy 之后，容器不会再对这个实例调用 service</text>
+</svg>
+<figcaption>图 2-1　Servlet 的生命周期</figcaption>
+</figure>
+
+<p>本章用来测试的 <code>PrimitiveServlet</code> 极其简单：每个生命周期方法被调用时往控制台打一行字，<code>service</code> 再往浏览器写两行。</p>
+
+<div class="code" data-lang="java" data-file="webroot/PrimitiveServlet.java（原书）">
+<pre>
+import javax.servlet.*;
+import java.io.IOException;
+import java.io.PrintWriter;
+
+public class PrimitiveServlet implements Servlet {
+    public void init(ServletConfig config) throws ServletException {
+        System.out.println("init");
+    }
+    public void service(ServletRequest request, ServletResponse response)
+            throws ServletException, IOException {
+        System.out.println("from service");
+        PrintWriter out = response.getWriter();
+        out.println("Hello. Roses are red.");
+        out.print("Violets are blue.");
+    }
+    public void destroy() { System.out.println("destroy"); }
+    public String getServletInfo() { return null; }
+    public ServletConfig getServletConfig() { return null; }
+}
+</pre>
+</div>
+
+<h2 id="container">容器要为 Servlet 做什么</h2>
+
+<p>站在容器的角度，一个功能完整的 Servlet 容器对每个 Servlet 请求要做这些事：</p>
+
+<ol class="steps">
+  <li>Servlet 第一次被请求时，<strong>加载 Servlet 类</strong>并调用它的 <code>init</code>（只做一次）。</li>
+  <li>为每个请求创建一个 <code>ServletRequest</code> 实例和一个 <code>ServletResponse</code> 实例。</li>
+  <li>调用 Servlet 的 <code>service</code> 方法，把这两个对象传进去。</li>
+  <li>容器关闭时调用 Servlet 的 <code>destroy</code>，并卸载 Servlet 类。</li>
+</ol>
+
+<p>本章的容器是简化版：它<strong>每次请求都重新加载一次 Servlet 类</strong>，也不调用 <code>init</code> 和 <code>destroy</code>，只完成第 2、3 步。</p>
+
+<h2 id="app1">应用 1：最简单的 Servlet 容器</h2>
+
+<p>原书 <code>ex02.pyrmont</code> 包里的应用 1 由六个类组成：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="应用 1 的类图：HttpServer1 依赖 Request、Response、StaticResourceProcessor、ServletProcessor1">
+  <rect class="bx-a" x="290" y="20" width="180" height="56" rx="10"/>
+  <text class="ttl on-a" x="380" y="44" text-anchor="middle">HttpServer1</text>
+  <text class="sm" x="380" y="62" text-anchor="middle">main() / await()</text>
+
+  <rect class="bx-b" x="20" y="130" width="170" height="70" rx="10"/>
+  <text class="ttl on-b" x="105" y="154" text-anchor="middle">Request</text>
+  <text class="sm" x="105" y="172" text-anchor="middle">implements</text>
+  <text class="sm mono" x="105" y="188" text-anchor="middle">ServletRequest</text>
+
+  <rect class="bx-b" x="210" y="130" width="170" height="70" rx="10"/>
+  <text class="ttl on-b" x="295" y="154" text-anchor="middle">Response</text>
+  <text class="sm" x="295" y="172" text-anchor="middle">implements</text>
+  <text class="sm mono" x="295" y="188" text-anchor="middle">ServletResponse</text>
+
+  <rect class="bx-g" x="400" y="130" width="170" height="70" rx="10"/>
+  <text class="ttl on-g" x="485" y="158" text-anchor="middle">StaticResource</text>
+  <text class="ttl on-g" x="485" y="176" text-anchor="middle">Processor</text>
+
+  <rect class="bx-p" x="590" y="130" width="150" height="70" rx="10"/>
+  <text class="ttl on-p" x="665" y="158" text-anchor="middle">Servlet</text>
+  <text class="ttl on-p" x="665" y="176" text-anchor="middle">Processor1</text>
+
+  <path class="ln" d="M330 78 L120 128" marker-end="url(#ar)"/>
+  <path class="ln" d="M360 78 L300 128" marker-end="url(#ar)"/>
+  <path class="ln" d="M400 78 L480 128" marker-end="url(#ar)"/>
+  <path class="ln" d="M430 78 L660 128" marker-end="url(#ar)"/>
+
+  <rect class="bx-d" x="290" y="250" width="180" height="50" rx="10"/>
+  <text class="ttl" x="380" y="272" text-anchor="middle">Constants</text>
+  <text class="sm mono" x="380" y="290" text-anchor="middle">WEB_ROOT</text>
+  <path class="ln-d" d="M485 202 L420 248" marker-end="url(#ar)"/>
+  <path class="ln-d" d="M665 202 L470 268" marker-end="url(#ar)"/>
+
+  <rect class="bx" x="590" y="250" width="150" height="50" rx="10"/>
+  <text class="mono" x="665" y="280" text-anchor="middle">PrimitiveServlet</text>
+  <path class="ln-p" d="M665 202 V248" marker-end="url(#ar-p)"/>
+  <text class="sm on-p" x="672" y="230">加载并调用</text>
+</svg>
+<figcaption>图 2-2　应用 1 的结构（对应原书图 2.1 的 UML 图）</figcaption>
+</figure>
+
+<h3>HttpServer1：多了一个分支</h3>
+
+<p>和第 1 章的 <code>HttpServer</code> 几乎一样，唯一的区别是 URI 以 <code>/servlet/</code> 开头时，把请求交给 Servlet 处理器：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 170" role="img" aria-label="根据 URI 前缀分发到静态资源处理器或 Servlet 处理器">
+  <rect class="bx" x="20" y="60" width="150" height="50" rx="10"/>
+  <text class="mono" x="95" y="90" text-anchor="middle">Request.parse()</text>
+  <path class="ln" d="M172 85 H230" marker-end="url(#ar)"/>
+  <path class="bx-a" d="M300 40 L370 85 L300 130 L230 85 Z" style="stroke-width:1.5"/>
+  <text class="sm on-a" x="300" y="82" text-anchor="middle">以 /servlet/</text>
+  <text class="sm on-a" x="300" y="98" text-anchor="middle">开头？</text>
+  <path class="ln-p" d="M330 60 L460 35" marker-end="url(#ar-p)"/>
+  <text class="sm on-p" x="390" y="38">是</text>
+  <rect class="bx-p" x="462" y="12" width="280" height="48" rx="10"/>
+  <text class="mono" x="602" y="34" text-anchor="middle">ServletProcessor1.process()</text>
+  <text class="sm" x="602" y="51" text-anchor="middle">/servlet/PrimitiveServlet</text>
+  <path class="ln-g" d="M330 110 L460 135" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="390" y="138">否</text>
+  <rect class="bx-g" x="462" y="110" width="280" height="48" rx="10"/>
+  <text class="mono" x="602" y="132" text-anchor="middle">StaticResourceProcessor.process()</text>
+  <text class="sm" x="602" y="149" text-anchor="middle">/index.html</text>
+</svg>
+<figcaption>图 2-3　HttpServer1 的分发逻辑</figcaption>
+</figure>
+
+<div class="code" data-lang="java" data-file="ex02/pyrmont/HttpServer1.java（原书，节选）">
+<pre>
+Request request = new Request(input);
+request.parse();
+Response response = new Response(output);
+response.setRequest(request);
+
+// 以 "/servlet/" 开头的请求交给 Servlet 处理器
+if (request.getUri().startsWith("/servlet/")) {
+    ServletProcessor1 processor = new ServletProcessor1();
+    processor.process(request, response);
+} else {
+    StaticResourceProcessor processor = new StaticResourceProcessor();
+    processor.process(request, response);
+}
+socket.close();
+shutdown = request.getUri().equals(SHUTDOWN_COMMAND);
+</pre>
+</div>
+
+<h3>Request 与 Response：实现接口，但大部分是空的</h3>
+
+<p>因为 <code>service</code> 方法要求传入 <code>ServletRequest</code> 和 <code>ServletResponse</code>，容器自己的 <code>Request</code>、<code>Response</code> 必须实现这两个接口。可接口里有几十个方法，本章根本用不上，原书的做法是把它们全部写成「空实现」：</p>
+
+<div class="code" data-lang="java" data-file="ex02/pyrmont/Request.java（原书，节选）">
+<pre>
+public class Request implements ServletRequest {
+    private InputStream input;
+    private String uri;
+
+    public void parse() { ... }        // 和第 1 章一样
+    public String getUri() { return uri; }
+
+    /* ServletRequest 的实现：几乎全是 return null */
+    public Object getAttribute(String attribute) { return null; }
+    public Enumeration getAttributeNames() { return null; }
+    public String getParameter(String name) { return null; }
+    public String getProtocol() { return null; }
+    ... // 还有二十多个
+}
+</pre>
+</div>
+
+<p><code>Response</code> 唯一认真实现的是 <code>getWriter</code>：</p>
+
+<div class="code" data-lang="java" data-file="ex02/pyrmont/Response.java（原书，节选）">
+<pre>
+public PrintWriter getWriter() throws IOException {
+    // autoflush 为 true：println() 会刷新，但 print() 不会
+    writer = new PrintWriter(output, true);
+    return writer;
+}
+</pre>
+</div>
+
+<div class="box warn">
+  <div class="t">&#9888; 最后一行丢了</div>
+  <p>正因为 <code>print()</code> 不会自动刷新，PrimitiveServlet 的最后一句 <code>out.print("Violets are blue.")</code> 留在 PrintWriter 的缓冲区里，socket 就被关掉了。所以浏览器里<strong>只能看到 “Hello. Roses are red.”</strong>。原书说这个问题第 3 章再修；Java 17 版本在本章就修好了（见下文）。</p>
+</div>
+
+<h3>ServletProcessor1：用类加载器载入 Servlet</h3>
+
+<p>这是本章最关键的类。它要做三件事：从 URI 中取出 Servlet 类名、创建一个能在 <code>webroot</code> 里找类的类加载器、加载类并调用 <code>service</code>。</p>
+
+<div class="code" data-lang="java" data-file="ex02/pyrmont/ServletProcessor1.java（原书）">
+<pre>
+public void process(Request request, Response response) {
+    String uri = request.getUri();
+    String servletName = uri.substring(uri.lastIndexOf("/") + 1);
+    URLClassLoader loader = null;
+    try {
+        URL[] urls = new URL[1];
+        URLStreamHandler streamHandler = null;
+        File classPath = new File(Constants.WEB_ROOT);
+        String repository = (new URL("file", null,
+            classPath.getCanonicalPath() + File.separator)).toString();
+        urls[0] = new URL(null, repository, streamHandler);
+        loader = new URLClassLoader(urls);
+    } catch (IOException e) {
+        System.out.println(e.toString());
+    }
+    Class myClass = null;
+    try {
+        myClass = loader.loadClass(servletName);
+    } catch (ClassNotFoundException e) {
+        System.out.println(e.toString());
+    }
+    Servlet servlet = null;
+    try {
+        servlet = (Servlet) myClass.newInstance();
+        servlet.service((ServletRequest) request, (ServletResponse) response);
+    } catch (Throwable e) {
+        System.out.println(e.toString());
+    }
+}
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="URLClassLoader 在 webroot 目录中查找 PrimitiveServlet.class">
+  <rect class="bx" x="20" y="30" width="230" height="44" rx="10"/>
+  <text class="mono" x="135" y="57" text-anchor="middle">/servlet/PrimitiveServlet</text>
+  <path class="ln" d="M135 76 V108" marker-end="url(#ar)"/>
+  <text class="sm" x="145" y="96">lastIndexOf("/") + 1</text>
+  <rect class="bx-a" x="20" y="110" width="230" height="44" rx="10"/>
+  <text class="mono on-a" x="135" y="137" text-anchor="middle">"PrimitiveServlet"</text>
+
+  <rect class="bx-p" x="300" y="30" width="200" height="124" rx="12"/>
+  <text class="ttl on-p" x="400" y="56" text-anchor="middle">URLClassLoader</text>
+  <text class="sm" x="400" y="80" text-anchor="middle">仓库（repository）：</text>
+  <text class="mono" x="400" y="100" text-anchor="middle">file:/…/webroot/</text>
+  <text class="sm" x="400" y="124" text-anchor="middle">以 / 结尾 = 目录</text>
+  <text class="sm" x="400" y="142" text-anchor="middle">否则当作 JAR 文件</text>
+  <path class="ln-a" d="M252 132 H296" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="274" y="124" text-anchor="middle">loadClass</text>
+
+  <rect class="bx-d" x="550" y="30" width="190" height="124" rx="12"/>
+  <text class="lbl" x="645" y="56" text-anchor="middle">webroot/</text>
+  <text class="mono" x="570" y="84">PrimitiveServlet.class</text>
+  <text class="mono" x="570" y="106">ModernServlet.class</text>
+  <text class="mono" x="570" y="128">index.html</text>
+  <path class="ln-p" d="M502 92 H546" marker-end="url(#ar-p)"/>
+
+  <rect class="bx-g" x="300" y="190" width="200" height="44" rx="10"/>
+  <text class="mono on-g" x="400" y="217" text-anchor="middle">newInstance() → service()</text>
+  <path class="ln" d="M400 156 V186" marker-end="url(#ar)"/>
+</svg>
+<figcaption>图 2-4　从 URI 到 Servlet 实例</figcaption>
+</figure>
+
+<div class="box note">
+  <div class="t">&#9432; 两个 URL 构造器的小坑</div>
+  <p><code>URL</code> 有 <code>URL(URL context, String spec, URLStreamHandler h)</code> 和 <code>URL(String protocol, String host, String file)</code> 两个三参数构造器。直接写 <code>new URL(null, s, null)</code> 编译器不知道该选哪个，所以原书先声明了一个 <code>URLStreamHandler streamHandler = null</code> 来消除歧义。这段代码是从 Tomcat 的 <code>ClassLoaderFactory</code> 和 <code>StandardClassLoader</code> 里抄来的。类加载器在第 8 章会详细讲。</p>
+</div>
+
+<p>运行原书应用 1：</p>
+
+<div class="code" data-lang="bash">
+<pre>
+java -classpath ./lib/servlet.jar:./ ex02.pyrmont.HttpServer1
+# 浏览器访问 http://localhost:8080/index.html 或 http://localhost:8080/servlet/PrimitiveServlet
+</pre>
+</div>
+
+<p>这个容器只能运行 PrimitiveServlet；访问 ModernServlet 会抛异常，因为它继承的 <code>HttpServlet</code> 要求请求对象是 <code>HttpServletRequest</code>，而我们的 Request 只实现了 <code>ServletRequest</code>。</p>
+
+<h2 id="app2">应用 2：用外观类堵住漏洞</h2>
+
+<p>应用 1 有个严重的问题：它把 <code>Request</code> 向上转型成 <code>ServletRequest</code> 交给 Servlet。一个了解容器内部的 Servlet 程序员完全可以<strong>再向下转型回来</strong>：</p>
+
+<div class="code" data-lang="java">
+<pre>
+public void service(ServletRequest req, ServletResponse res) {
+    ex02.pyrmont.Request internal = (ex02.pyrmont.Request) req;   // 转回去！
+    internal.parse();                // 调用了只有容器才该调用的方法
+    ((ex02.pyrmont.Response) res).sendStaticResource();
+}
+</pre>
+</div>
+
+<p><code>parse</code> 和 <code>sendStaticResource</code> 不能设成 <code>private</code>，因为容器的其他类要调用它们。把类设成包级私有也是个办法，但更优雅的方法是<strong>外观模式（Facade）</strong>：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="外观模式：Servlet 只拿到 RequestFacade，facade 内部私有地持有真正的 Request">
+  <rect class="bx-p" x="20" y="90" width="170" height="110" rx="12"/>
+  <text class="ttl on-p" x="105" y="118" text-anchor="middle">Servlet</text>
+  <text class="sm" x="105" y="142" text-anchor="middle">只能看见</text>
+  <text class="sm mono" x="105" y="160" text-anchor="middle">ServletRequest</text>
+  <text class="sm" x="105" y="178" text-anchor="middle">接口里的方法</text>
+
+  <rect class="bx-g" x="260" y="60" width="220" height="170" rx="12"/>
+  <text class="ttl on-g" x="370" y="86" text-anchor="middle">RequestFacade</text>
+  <text class="sm" x="370" y="104" text-anchor="middle">implements ServletRequest</text>
+  <rect class="bx" x="280" y="118" width="180" height="96" rx="8"/>
+  <text class="mono" x="370" y="138" text-anchor="middle">private ServletRequest</text>
+  <text class="mono" x="370" y="156" text-anchor="middle">request;</text>
+  <text class="sm" x="370" y="180" text-anchor="middle">getParameter(n) {</text>
+  <text class="sm" x="370" y="198" text-anchor="middle">return request.getParameter(n); }</text>
+
+  <rect class="bx-b" x="550" y="60" width="190" height="170" rx="12"/>
+  <text class="ttl on-b" x="645" y="86" text-anchor="middle">Request（容器内部）</text>
+  <text class="mono" x="645" y="120" text-anchor="middle">getParameter()</text>
+  <text class="mono" x="645" y="142" text-anchor="middle">getAttribute()</text>
+  <text class="mono" x="645" y="164" text-anchor="middle">…</text>
+  <text class="mono on-r" x="645" y="196" text-anchor="middle">parse()</text>
+  <text class="mono on-r" x="645" y="216" text-anchor="middle">getUri()</text>
+
+  <path class="ln-g" d="M192 145 H256" marker-end="url(#ar-g)"/>
+  <path class="ln-b" d="M462 166 H546" marker-end="url(#ar-b)"/>
+  <text class="sm on-b" x="504" y="158" text-anchor="middle">转发</text>
+
+  <path class="ln-r" d="M105 202 C105 270 645 280 645 232" stroke-dasharray="6 5" marker-end="url(#ar-r)"/>
+  <text class="ttl on-r" x="375" y="250" text-anchor="middle">✗ (Request) req 向下转型失败：拿到的根本不是 Request</text>
+</svg>
+<figcaption>图 2-5　外观类只暴露接口方法，真正的 Request 被藏在私有字段里</figcaption>
+</figure>
+
+<div class="code" data-lang="java" data-file="ex02/pyrmont/RequestFacade.java（原书，节选）">
+<pre>
+public class RequestFacade implements ServletRequest {
+    private ServletRequest request = null;
+
+    public RequestFacade(Request request) {
+        this.request = request;          // 拿到 Request，但只以接口类型保存
+    }
+
+    public Object getAttribute(String attribute) {
+        return request.getAttribute(attribute);
+    }
+    public Enumeration getAttributeNames() {
+        return request.getAttributeNames();
+    }
+    ... // 每个接口方法都转发一次
+}
+</pre>
+</div>
+
+<p><code>ServletProcessor2</code> 和 <code>ServletProcessor1</code> 唯一的区别，就是把外观对象传给 Servlet：</p>
+
+<div class="code" data-lang="java" data-file="ex02/pyrmont/ServletProcessor2.java（原书，节选）">
+<pre>
+Servlet servlet = null;
+RequestFacade requestFacade = new RequestFacade(request);
+ResponseFacade responseFacade = new ResponseFacade(response);
+servlet = (Servlet) myClass.newInstance();
+servlet.service((ServletRequest) requestFacade, (ServletResponse) responseFacade);
+</pre>
+</div>
+
+<div class="box key">
+  <div class="t">&#128273; 真实的 Tomcat 也这样做</div>
+  <p>直到今天的 Tomcat 11，<code>org.apache.catalina.connector.Request</code> 交给你的 Servlet 之前，依然会先包一层 <code>RequestFacade</code>。你在 Servlet 里打印 <code>request.getClass()</code>，看到的就是 <code>org.apache.catalina.connector.RequestFacade</code>。</p>
+</div>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch02/</code><code>modern/common/Facade.java</code><code>modern/common/ServletRequestStub.java</code><code>java17/webroot/*.java</code></div>
+
+<p>Java 17 版保留了原书的全部结构（两个服务器、两个处理器、静态资源处理器、从 webroot 动态加载 Servlet），同时做了四处现代化改造。</p>
+
+<h3>① javax.servlet → jakarta.servlet</h3>
+
+<p>2017 年 Oracle 把 Java EE 交给 Eclipse 基金会，改名 Jakarta EE，但不允许继续使用 <code>javax</code> 这个包名。从 Jakarta EE 9（Tomcat 10）开始，所有 Servlet API 都搬到了 <code>jakarta.servlet</code>。<strong>代码逻辑不变，只改 import。</strong></p>
+
+<div class="vs">
+  <div class="old"><div class="h">原书（Servlet 2.3 / Tomcat 4）</div>
+<div class="code" data-lang="java">
+<pre>
+import javax.servlet.*;
+
+public class PrimitiveServlet implements Servlet {
+    public void init(ServletConfig config) ...
+}
+</pre>
+</div>
+  </div>
+  <div class="new"><div class="h">Java 17（Servlet 6.1 / Tomcat 11）</div>
+<div class="code" data-lang="java">
+<pre>
+import jakarta.servlet.*;
+
+public class PrimitiveServlet implements Servlet {
+    @Override
+    public void init(ServletConfig config) ...
+}
+</pre>
+</div>
+  </div>
+</div>
+
+<h3>② 接口默认方法代替几十个空方法</h3>
+
+<p>jakarta 版 <code>ServletRequest</code> 已经有 39 个抽象方法了。与其在 Request 里手写 39 个 <code>return null</code>，不如写一个继承它的接口，用 <code>default</code> 方法统一抛出「不支持」异常——<code>modern.common.ServletRequestStub</code> 就是这样一个接口（由脚本生成）。容器的 Request 只覆盖真正支持的方法：</p>
+
+<div class="code" data-lang="java" data-file="java17/.../common/ServletRequestStub.java（节选）">
+<pre>
+public interface ServletRequestStub extends ServletRequest {
+    @Override default Object getAttribute(String arg0) { throw unsupported("getAttribute"); }
+    @Override default String getParameter(String arg0) { throw unsupported("getParameter"); }
+    @Override default String getProtocol() { throw unsupported("getProtocol"); }
+    ... // 共 39 个
+}
+</pre>
+</div>
+
+<div class="code" data-lang="java" data-file="java17/.../ch02/Request.java（节选）">
+<pre>
+public class Request implements ServletRequestStub {
+    private final String uri;
+    private final String protocol;
+    private final Map&lt;String, Object&gt; attributes = new HashMap&lt;&gt;();
+
+    public static Request parse(InputStream input) throws IOException { ... }
+    public String uri() { return uri; }                     // 容器内部方法
+
+    @Override public String getProtocol() { return protocol; }
+    @Override public Object getAttribute(String name) { return attributes.get(name); }
+    @Override public void setAttribute(String name, Object value) { attributes.put(name, value); }
+    ...
+}
+</pre>
+</div>
+
+<div class="box tip">
+  <div class="t">&#128161; 抛异常比 return null 更好</div>
+  <p>返回 <code>null</code> 的空方法会让调用者在很远的地方碰到 <code>NullPointerException</code>，很难追查。直接抛 <code>UnsupportedOperationException("本章的简化实现不支持 getParameter()")</code>，一眼就知道问题出在哪。</p>
+</div>
+
+<h3>③ 动态代理自动生成外观</h3>
+
+<p>手写外观类要给每个接口方法写一个转发方法。JDK 的 <code>java.lang.reflect.Proxy</code> 可以在运行时生成一个<strong>只实现指定接口</strong>的类，效果完全一样：</p>
+
+<div class="code" data-lang="java" data-file="java17/.../common/Facade.java">
+<pre>
+public static &lt;T&gt; T of(Class&lt;T&gt; iface, T target) {
+    Object proxy = Proxy.newProxyInstance(iface.getClassLoader(), new Class&lt;?&gt;[] {iface},
+            (self, method, args) -&gt; {
+                if (method.getDeclaringClass() == Object.class) {
+                    return switch (method.getName()) {            // Java 14 switch 表达式
+                        case "equals" -&gt; self == args[0];
+                        case "hashCode" -&gt; System.identityHashCode(self);
+                        default -&gt; iface.getSimpleName() + "Facade";
+                    };
+                }
+                try {
+                    return method.invoke(target, args);           // 其余调用一律转发
+                } catch (InvocationTargetException e) {
+                    throw e.getCause();
+                }
+            });
+    return iface.cast(proxy);
+}
+</pre>
+</div>
+
+<div class="vs">
+  <div class="old"><div class="h">原书 ServletProcessor2</div>
+<div class="code" data-lang="java">
+<pre>
+RequestFacade requestFacade =
+    new RequestFacade(request);
+ResponseFacade responseFacade =
+    new ResponseFacade(response);
+servlet.service((ServletRequest) requestFacade,
+                (ServletResponse) responseFacade);
+</pre>
+</div>
+  </div>
+  <div class="new"><div class="h">Java 17 ServletProcessor2</div>
+<div class="code" data-lang="java">
+<pre>
+ServletRequest requestFacade =
+    Facade.of(ServletRequest.class, request);
+ServletResponse responseFacade =
+    Facade.of(ServletResponse.class, response);
+servlet.service(requestFacade, responseFacade);
+response.finish(200, "OK");
+</pre>
+</div>
+  </div>
+</div>
+
+<p>为了亲眼看到外观的作用，<code>java17/webroot/</code> 里多放了一个「捣蛋」Servlet——<code>PeekServlet</code>，它用 Java 16 的模式匹配 <code>instanceof</code> 尝试把请求转回容器内部类型：</p>
+
+<div class="code" data-lang="java" data-file="java17/webroot/PeekServlet.java（节选）">
+<pre>
+out.println("request 的真实类型: " + request.getClass().getName());
+if (request instanceof modern.ch02.Request internal) {
+    out.println("得手了！可以直接调用容器内部方法，例如 uri() = " + internal.uri());
+} else {
+    out.println("转型失败：拿到的只是一个外观（facade）");
+}
+</pre>
+</div>
+
+<h3>④ 缓冲输出，修好「最后一行丢失」</h3>
+
+<p>Java 17 版的 <code>getWriter()</code> 不再直接写 socket，而是写进内存缓冲区。<code>service()</code> 返回后，处理器调用 <code>response.finish()</code>，一次性写出状态行、<code>Content-Length</code> 和正文：</p>
+
+<div class="code" data-lang="java" data-file="java17/.../ch02/Response.java（节选）">
+<pre>
+private final ByteArrayOutputStream body = new ByteArrayOutputStream();
+
+@Override
+public PrintWriter getWriter() {
+    if (writer == null) {
+        writer = new PrintWriter(new OutputStreamWriter(body, StandardCharsets.UTF_8));
+    }
+    return writer;
+}
+
+public void finish(int status, String reason) throws IOException {
+    if (writer != null) writer.flush();        // print() 留在缓冲区里的内容也会被写出
+    String head = "HTTP/1.1 " + status + " " + reason + "\r\n"
+            + "Content-Type: " + (contentType != null ? contentType : "text/plain; charset=UTF-8") + "\r\n"
+            + "Content-Length: " + body.size() + "\r\n"
+            + "Connection: close\r\n\r\n";
+    output.write(head.getBytes(StandardCharsets.ISO_8859_1));
+    body.writeTo(output);
+}
+</pre>
+</div>
+
+<p>其他小改动：<code>Class.newInstance()</code>（Java 9 起废弃）换成 <code>getDeclaredConstructor().newInstance()</code>；<code>URLClassLoader</code> 的父加载器显式设为应用类加载器，这样 webroot 里的 Servlet 能找到 <code>jakarta.servlet</code> 的类；两个服务器的主循环合并为一个，通过 <code>Processor</code> 函数式接口注入不同的 Servlet 处理器。</p>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch02.HttpServer1        # 应用 1（无外观）
+./run.sh ch02.HttpServer2        # 应用 2（有外观）
+</pre>
+</div>
+
+<p><code>run.sh</code> 会顺便把 <code>webroot/*.java</code> 编译成 <code>.class</code> 放在 webroot 里，让容器在运行时加载。下面是两次运行的真实输出：</p>
+
+<div class="code" data-lang="out">
+<pre>
+$ curl -i http://localhost:8080/servlet/PrimitiveServlet
+HTTP/1.1 200 OK
+Content-Type: text/plain; charset=UTF-8
+Content-Length: 39
+Connection: close
+
+Hello. Roses are red.
+Violets are blue.                       ← 原书看不到这一行
+
+# HttpServer1
+$ curl http://localhost:8080/servlet/PeekServlet
+request 的真实类型: modern.ch02.Request
+得手了！可以直接调用容器内部方法，例如 uri() = /servlet/PeekServlet
+
+# HttpServer2
+$ curl http://localhost:8080/servlet/PeekServlet
+request 的真实类型: jdk.proxy1.$Proxy0
+转型失败：拿到的只是一个外观（facade），只能用 ServletRequest 接口里的方法。
+</pre>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li><code>Servlet</code> 接口有五个方法，其中 <code>init</code>、<code>service</code>、<code>destroy</code> 是生命周期方法。</li>
+  <li>Servlet 容器的核心工作：加载 Servlet 类、为每个请求创建请求/响应对象、调用 <code>service</code>。</li>
+  <li><code>URLClassLoader</code> 可以从指定目录或 JAR 动态加载类；以 <code>/</code> 结尾的 URL 表示目录。</li>
+  <li>直接把内部对象交给用户代码有安全风险；外观类只暴露接口方法，Tomcat 至今在用这个模式。</li>
+  <li>现代 Java：<code>jakarta.servlet</code> 包名、接口默认方法、动态代理、<code>instanceof</code> 模式匹配、switch 表达式。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>在 Java 17 版里给 <code>Request</code> 实现 <code>getParameter</code>：解析 URI 里 <code>?</code> 后面的查询串。然后写个 Servlet 打印 <code>?name=tom</code> 的值。</li>
+    <li>现在每次请求都会新建类加载器、重新加载 Servlet 类。改成用一个 <code>ConcurrentHashMap&lt;String, Servlet&gt;</code> 缓存实例，并在第一次加载时调用 <code>init(null)</code>。观察控制台的 “init” 现在只打印一次。</li>
+    <li>给 <code>HttpServer</code> 加一个关闭钩子（第 16 章会讲），退出前对缓存里的所有 Servlet 调用 <code>destroy()</code>。</li>
+    <li>访问 <code>/servlet/ModernServlet</code>，阅读控制台里的异常信息，说说它为什么在本章的容器里跑不起来。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

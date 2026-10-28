@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 13 章 · Host 与 Engine — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="13">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 13 章</span>
+<h1>Host 与 Engine</h1>
+<p class="lede">
+  一个 Tomcat 里要跑多个 Web 应用，就需要 <strong>Host</strong>（虚拟主机）把请求按上下文路径分给不同的 Context；
+  一台服务器要服务多个域名，就需要 <strong>Engine</strong>（引擎）按 <code>Host</code> 请求头把请求分给不同的 Host。
+  至此，四种容器全部登场。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>理解 Host 如何用「最长上下文路径前缀」选择 Context</li>
+    <li>理解 Engine 如何按主机名选择 Host，以及默认主机的作用</li>
+    <li>知道为什么实际部署中「离不开 Host」</li>
+    <li>亲手搭一个支持虚拟主机的服务器</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="picture">全景：一个请求如何找到它的 Servlet</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 380" role="img" aria-label="Engine 按 Host 头选择 Host，Host 按上下文路径选择 Context，Context 按 Servlet 映射选择 Wrapper">
+  <rect class="bx" x="20" y="14" width="720" height="40" rx="8"/>
+  <text class="mono sm" x="380" y="32" text-anchor="middle">GET /app1/Primitive HTTP/1.1</text>
+  <text class="mono sm" x="380" y="48" text-anchor="middle">Host: www.example.com</text>
+
+  <rect class="bx-p" x="20" y="74" width="720" height="290" rx="14"/>
+  <text class="ttl on-p" x="40" y="98">StandardEngine（defaultHost = localhost）</text>
+  <text class="sm" x="40" y="116">① 看 Host 头：www.example.com → 选同名 Host（或别名、或默认主机）</text>
+
+  <rect class="bx-b" x="40" y="130" width="330" height="220" rx="12"/>
+  <text class="ttl on-b" x="56" y="152">StandardHost "localhost"</text>
+  <rect class="bx-g" x="56" y="166" width="140" height="56" rx="8"/><text class="mono sm" x="126" y="190" text-anchor="middle">Context ""</text><text class="sm" x="126" y="208" text-anchor="middle">ROOT 应用</text>
+  <rect class="bx-g" x="210" y="166" width="140" height="56" rx="8"/><text class="mono sm" x="280" y="190" text-anchor="middle">Context /app1</text><text class="sm" x="280" y="208" text-anchor="middle">webapps/app1</text>
+
+  <rect class="bx-a" x="390" y="130" width="330" height="220" rx="12"/>
+  <text class="ttl on-a" x="406" y="152">StandardHost "www.example.com"</text>
+  <text class="sm" x="406" y="170">别名：example.com</text>
+  <rect class="bx-g" x="406" y="184" width="140" height="56" rx="8"/><text class="mono sm" x="476" y="208" text-anchor="middle">Context ""</text><text class="sm" x="476" y="226" text-anchor="middle">ROOT 应用</text>
+  <rect class="bx-g" x="560" y="184" width="140" height="56" rx="8"/><text class="mono sm" x="630" y="208" text-anchor="middle">Context /app1</text><text class="sm" x="630" y="226" text-anchor="middle">② 最长前缀匹配</text>
+  <rect class="bx" x="560" y="260" width="140" height="40" rx="8"/><text class="mono sm" x="630" y="284" text-anchor="middle">Wrapper Primitive</text>
+  <path class="ln-g" d="M630 242 V256" marker-end="url(#ar-g)"/>
+  <text class="sm" x="555" y="322" text-anchor="middle">③ Context 按 Servlet 映射找 Wrapper（第 12 章）</text>
+  <path class="ln-a" d="M380 56 C520 70 560 100 560 128" marker-end="url(#ar-a)"/>
+</svg>
+<figcaption>图 13-1　三级分派：主机名 → 上下文路径 → Servlet 映射</figcaption>
+</figure>
+
+<h2 id="host">Host 接口与 StandardHost</h2>
+
+<p>如果只有一个 Context，理论上可以不要 Host——Context 接口的文档说它的父容器「通常是 Host，但也可以是别的实现，甚至省略」。但实际部署中总是需要 Host，原因见下文。</p>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/Host.java（节选）">
+<pre>
+public interface Host extends Container {
+    public String getAppBase();                 // 应用根目录，例如 webapps
+    public void setAppBase(String appBase);
+    public boolean getAutoDeploy();             // 是否自动发现并部署 appBase 下的应用（第 18 章）
+    public void setAutoDeploy(boolean autoDeploy);
+    public String getName();                    // 虚拟主机的完整域名
+    public void addAlias(String alias);         // 别名，也映射到这个 Host
+    public String[] findAliases();
+    public Context map(String uri);             // ★ 找处理这个 URI 的 Context
+    ...
+}
+</pre>
+</div>
+
+<p>StandardHost 继承 ContainerBase，构造器设置基础阀 <code>StandardHostValve</code>；<code>start()</code> 时额外往管道里加两个阀：<code>ErrorReportValve</code>（生成错误页面）和 <code>ErrorDispatcherValve</code>（转发到 web.xml 里配置的错误页）。</p>
+
+<h3>map()：最长上下文路径前缀</h3>
+
+<div class="code" data-lang="java" data-file="StandardHost.map()（对应原书 Listing 13.3）">
+<pre>
+public Context map(String uri) {
+    if (uri == null)
+        return (null);
+    Context context = null;
+    String mapuri = uri;
+    while (true) {
+        context = (Context) findChild(mapuri);      // 子容器的名字就是上下文路径
+        if (context != null)
+            break;
+        int slash = mapuri.lastIndexOf('/');
+        if (slash &lt; 0)
+            break;
+        mapuri = mapuri.substring(0, slash);        // 去掉最后一段再试
+    }
+    if (context == null)
+        context = (Context) findChild("");          // 默认 Context（ROOT）
+    return (context);
+}
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 170" role="img" aria-label="Host.map 逐段缩短 URI 查找 Context">
+  <rect class="bx-r" x="20" y="20" width="230" height="36" rx="6"/><text class="mono sm" x="135" y="43" text-anchor="middle">/app1/admin/Primitive  ✗</text>
+  <rect class="bx-r" x="265" y="20" width="160" height="36" rx="6"/><text class="mono sm" x="345" y="43" text-anchor="middle">/app1/admin  ✗</text>
+  <rect class="bx-g" x="440" y="20" width="110" height="36" rx="6"/><text class="mono sm" x="495" y="43" text-anchor="middle">/app1  ✓</text>
+  <path class="ln" d="M252 38 H261" marker-end="url(#ar)"/>
+  <path class="ln" d="M427 38 H436" marker-end="url(#ar)"/>
+  <text class="sm" x="380" y="82" text-anchor="middle">一直缩短到第一个能 findChild 成功的路径；都不行就用名为 "" 的 ROOT 应用</text>
+  <text class="sm" x="380" y="104" text-anchor="middle">选中后：request.setContextPath("/app1")，Context 内部再用 /admin/Primitive 做 Servlet 映射</text>
+  <text class="sm" x="380" y="140" text-anchor="middle">这和第 12 章「前缀匹配」的算法一模一样，只是作用的层级不同</text>
+</svg>
+<figcaption>图 13-2　Host 选择 Context</figcaption>
+</figure>
+
+<p>Tomcat 4 中还有一个 <code>StandardHostMapper</code>（由 ContainerBase 的 <code>addDefaultMapper</code> 创建），它的 <code>map(request, update)</code> 只是调用 <code>host.map(uri)</code>，并在 <code>update</code> 为 true 时把 Context 和上下文路径写回请求。Tomcat 5 去掉了 Mapper，Context 直接从请求对象中取得。</p>
+
+<h3>StandardHostValve</h3>
+
+<div class="code" data-lang="java" data-file="StandardHostValve.invoke()（对应原书 Listing 13.4）">
+<pre>
+StandardHost host = (StandardHost) getContainer();
+Context context = (Context) host.map(request, true);
+if (context == null) {
+    ((HttpServletResponse) response.getResponse()).sendError(
+        HttpServletResponse.SC_INTERNAL_SERVER_ERROR, sm.getString("standardHost.noContext"));
+    return;
+}
+// 把这个 Web 应用的类加载器绑定到当前线程
+Thread.currentThread().setContextClassLoader(context.getLoader().getClassLoader());
+
+// 更新会话的最后访问时间
+String sessionId = hreq.getRequestedSessionId();
+if (sessionId != null) {
+    Manager manager = context.getManager();
+    if (manager != null) {
+        Session session = manager.findSession(sessionId);
+        if ((session != null) &amp;&amp; session.isValid())
+            session.access();
+    }
+}
+context.invoke(request, response);
+</pre>
+</div>
+
+<div class="code" data-lang="java" data-file="StandardSession.access()">
+<pre>
+public void access() {
+    this.isNew = false;
+    this.lastAccessedTime = this.thisAccessedTime;
+    this.thisAccessedTime = System.currentTimeMillis();
+}
+</pre>
+</div>
+
+<h2 id="needhost">为什么离不开 Host</h2>
+
+<p>只要 Context 由 <code>ContextConfig</code> 配置（正式部署都是这样），就必须有 Host。ContextConfig 要读 <code>/WEB-INF/web.xml</code>，它调用 <code>servletContext.getResource()</code>，而 <code>ApplicationContext.getResource()</code> 里有这样一行：</p>
+
+<div class="code" data-lang="java" data-file="ApplicationContext.getResource()（节选）">
+<pre>
+DirContext resources = context.getResources();
+if (resources != null) {
+    String fullPath = context.getName() + path;
+    // this is the problem. Host must not be null
+    String hostName = context.getParent().getName();
+</pre>
+</div>
+
+<p>没有父容器，<code>getParent()</code> 返回 null，直接 NullPointerException。所以除非你自己写 ContextConfig，否则必须有 Host。</p>
+
+<h2 id="engine">Engine 接口与 StandardEngine</h2>
+
+<p>Engine 代表整个 Catalina Servlet 引擎，<strong>如果有，它一定是顶层容器</strong>。要支持多个虚拟主机就需要它；默认的 Tomcat 部署也总是用 Engine，里面至少有一个默认主机。</p>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/Engine.java（节选）">
+<pre>
+public interface Engine extends Container {
+    public String getDefaultHost();              // 找不到匹配的 Host 时使用
+    public void setDefaultHost(String defaultHost);
+    public String getJvmRoute();                 // 集群中区分节点（会话 ID 后缀）
+    public void setJvmRoute(String jvmRouteId);
+    public Service getService();                 // 所属的 Service（第 14 章）
+    public void setService(Service service);
+    ...
+}
+</pre>
+</div>
+
+<div class="code" data-lang="java" data-file="StandardEngine（节选）">
+<pre>
+public StandardEngine() {
+    super();
+    pipeline.setBasic(new StandardEngineValve());
+}
+
+public void addChild(Container child) {
+    if (!(child instanceof Host))                          // 子容器只能是 Host
+        throw new IllegalArgumentException(sm.getString("standardEngine.notHost"));
+    super.addChild(child);
+}
+
+public void setParent(Container container) {                // 顶层容器没有父容器
+    throw new IllegalArgumentException(sm.getString("standardEngine.notParent"));
+}
+</pre>
+</div>
+
+<h3>StandardEngineValve</h3>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="StandardEngineValve：HTTP/1.1 必须有 Host 头，否则 400；按主机名找 Host，找不到 400，找到则调用 host.invoke">
+  <path class="bx-a" d="M120 30 L220 66 L120 102 L20 66 Z" style="stroke-width:1.5"/>
+  <text class="sm on-a" x="120" y="62" text-anchor="middle">HTTP/1.1 且</text>
+  <text class="sm on-a" x="120" y="78" text-anchor="middle">没有 Host 头？</text>
+  <path class="ln-r" d="M120 104 V150" marker-end="url(#ar-r)"/>
+  <rect class="bx-r" x="40" y="152" width="160" height="36" rx="8"/><text class="mono sm" x="120" y="175" text-anchor="middle">400 Bad Request</text>
+  <text class="sm on-r" x="130" y="130">是</text>
+  <path class="ln" d="M222 66 H290" marker-end="url(#ar)"/>
+  <text class="sm" x="256" y="58" text-anchor="middle">否</text>
+  <path class="bx-a" d="M400 30 L510 66 L400 102 L290 66 Z" style="stroke-width:1.5"/>
+  <text class="sm on-a" x="400" y="62" text-anchor="middle">engine.map()</text>
+  <text class="sm on-a" x="400" y="78" text-anchor="middle">找到 Host？</text>
+  <path class="ln-r" d="M400 104 V150" marker-end="url(#ar-r)"/>
+  <rect class="bx-r" x="320" y="152" width="160" height="36" rx="8"/><text class="mono sm" x="400" y="175" text-anchor="middle">400 Bad Request</text>
+  <text class="sm on-r" x="410" y="130">否</text>
+  <path class="ln-g" d="M512 66 H580" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="546" y="58" text-anchor="middle">是</text>
+  <rect class="bx-g" x="584" y="46" width="160" height="40" rx="8"/><text class="mono sm" x="664" y="71" text-anchor="middle">host.invoke()</text>
+</svg>
+<figcaption>图 13-3　StandardEngineValve 的逻辑（对应原书 Listing 13.7）</figcaption>
+</figure>
+
+<div class="box note">
+  <div class="t">&#9432; Host 请求头是虚拟主机的基础</div>
+  <p>HTTP/1.1 强制要求请求带 <code>Host</code> 头，正是为了让一个 IP 地址上可以托管多个网站。HTTPS 时代还多了一个难题：TLS 握手发生在 HTTP 请求之前，服务器在握手时就得知道用哪个域名的证书——这由 TLS 扩展 SNI 解决，Tomcat 8.5 起支持在一个连接器上为多个主机名配置不同证书。</p>
+</div>
+
+<h2 id="apps">本章应用</h2>
+
+<p>两个应用都部署 <code>webapps/app1</code>（上下文路径 <code>/app1</code>，包含 Primitive 和 Modern）：</p>
+
+<div class="vs">
+  <div class="old"><div class="h">应用 1：Host 是顶层容器</div>
+<div class="code" data-lang="java">
+<pre>
+Context context = new StandardContext();
+context.setPath("/app1");
+context.setDocBase("app1");
+context.addChild(wrapper1);
+context.addChild(wrapper2);
+...
+Host host = new StandardHost();
+host.addChild(context);
+host.setName("localhost");
+host.setAppBase("webapps");
+connector.setContainer(host);
+((Lifecycle) host).start();
+</pre>
+</div>
+  </div>
+  <div class="new"><div class="h">应用 2：Engine 是顶层容器</div>
+<div class="code" data-lang="java">
+<pre>
+Host host = new StandardHost();
+host.addChild(context);
+host.setName("localhost");
+host.setAppBase("webapps");
+...
+Engine engine = new StandardEngine();
+engine.addChild(host);
+engine.setDefaultHost("localhost");
+connector.setContainer(engine);
+((Lifecycle) engine).start();
+</pre>
+</div>
+  </div>
+</div>
+
+<p>两个应用都通过 <code>http://localhost:8080/app1/Primitive</code> 和 <code>/app1/Modern</code> 访问。</p>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch13/core/</code><code>startup/Bootstrap1.java</code><code>startup/Bootstrap2.java</code><code>tomcat/EmbeddedVirtualHosts.java</code><code>java17/webapps/app1/</code></div>
+
+<p>Java 17 版在迷你容器中实现了 StandardHost、StandardEngine 及其基础阀。为了让虚拟主机真正可用，第 3 章的 <code>HttpRequest</code> 增加了两处：<code>getServerName()</code> 改为解析 <code>Host</code> 请求头，<code>getContextPath()</code> 由 Host 在映射时设置。<code>Bootstrap2</code> 比原书多了一个虚拟主机 <code>www.example.com</code>（别名 <code>example.com</code>）。</p>
+
+<h3>① Engine 的主机选择：名字 → 别名 → 默认主机</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch13/core/StandardEngine.java（节选）">
+<pre>
+public StandardHost map(String serverName) {
+    if (serverName != null) {
+        String name = serverName.toLowerCase();            // 主机名大小写不敏感
+        Container host = findChild(name);
+        if (host != null) return (StandardHost) host;
+        for (Container child : findChildren()) {
+            if (((StandardHost) child).findAliases().contains(name)) {
+                return (StandardHost) child;
+            }
+        }
+    }
+    return defaultHost == null ? null : (StandardHost) findChild(defaultHost);
+}
+</pre>
+</div>
+
+<h3>② Host 阀：记得恢复上下文类加载器</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch13/core/StandardHostValve.java（节选）">
+<pre>
+StandardContext context = host.map(request.getRequestURI());
+if (context == null) {
+    response.sendError(HttpServletResponse.SC_NOT_FOUND, "No context for " + request.getRequestURI());
+    return;
+}
+request.setContextPath(context.getPath());
+
+Thread thread = Thread.currentThread();
+ClassLoader original = thread.getContextClassLoader();
+thread.setContextClassLoader(context.getLoader().getClassLoader());
+try {
+    context.invoke(request, response);
+} finally {
+    thread.setContextClassLoader(original);     // 原书没有恢复：线程池里的线程下次可能带着别的应用的类加载器
+}
+</pre>
+</div>
+
+<div class="box warn">
+  <div class="t">&#9888; 线程上下文类加载器要「谁设置谁恢复」</div>
+  <p>连接器的处理器线程是复用的。如果 Host 阀设置了 A 应用的类加载器却不恢复，下一个请求在进入 B 应用之前就带着 A 的类加载器，可能导致类加载错乱、甚至让 A 应用的类加载器在重载后无法被回收（内存泄漏）。Tomcat 后来的版本都用 try/finally 恢复。</p>
+</div>
+
+<h3>③ Host 启动时加一个错误报告阀</h3>
+
+<p>对应 Tomcat 的 <code>ErrorReportValve</code>：后面的组件抛异常时，返回一个 500 页面，而不是让异常冒泡到连接器。</p>
+
+<h3>④ Tomcat 11：两个虚拟主机</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch13/tomcat/EmbeddedVirtualHosts.java（节选）">
+<pre>
+// 默认主机 localhost：tomcat.getHost() 自动创建并设为 Engine 的 defaultHost
+Context app1 = tomcat.addContext(tomcat.getHost(), "/app1", Path.of("webapps/app1").toAbsolutePath().toString());
+Tomcat.addServlet(app1, "Primitive", "PrimitiveServlet");
+app1.addServletMappingDecoded("/Primitive", "Primitive");
+
+// 第二个虚拟主机
+var example = new StandardHost();
+example.setName("www.example.com");
+example.addAlias("example.com");
+tomcat.getEngine().addChild(example);
+Context root = tomcat.addContext(example, "", Path.of("myApp").toAbsolutePath().toString());   // ROOT 应用
+Tomcat.addServlet(root, "Hello", "HelloServlet");
+root.addServletMappingDecoded("/Hello", "Hello");
+</pre>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch13.startup.Bootstrap1               # Host 为顶层
+./run.sh ch13.startup.Bootstrap2               # Engine 为顶层 + 两个虚拟主机
+./run.sh ch13.tomcat.EmbeddedVirtualHosts      # Tomcat 11
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+$ curl http://localhost:8080/app1/Primitive
+Hello. Roses are red.
+Violets are blue.
+
+$ curl -H 'Host: example.com' http://localhost:8080/Hello              # 别名 → www.example.com
+Hello, version 1
+
+$ curl -H 'Host: www.example.com:8080' http://localhost:8080/Mapping   # 端口会被去掉
+requestURI   = /Mapping
+servletPath  = /Mapping
+
+$ curl -H 'Host: other.org' http://localhost:8080/app1/Primitive       # 不认识的主机 → 默认主机
+Hello. Roses are red.
+
+$ printf 'GET /app1/Primitive HTTP/1.1\r\nConnection: close\r\n\r\n' | nc localhost 8080
+HTTP/1.1 400 HTTP/1.1 request without Host header
+
+$ curl -o /dev/null -w '%{http_code}\n' http://localhost:8080/nope       # 没有 ROOT 应用
+404
+</pre>
+</div>
+
+<div class="box tip">
+  <div class="t">&#128161; 本地测试虚拟主机的两种方法</div>
+  <p>一是像上面那样用 <code>curl -H 'Host: ...'</code> 手动指定请求头；二是在 <code>/etc/hosts</code>（Windows 是 <code>C:\Windows\System32\drivers\etc\hosts</code>）里加一行 <code>127.0.0.1 www.example.com</code>，然后浏览器访问 <code>http://www.example.com:8080/Hello</code>。</p>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>Host 用最长上下文路径前缀选择 Context，找不到就用路径为 <code>""</code> 的 ROOT 应用。</li>
+  <li>StandardHostValve 选定 Context、绑定其类加载器、更新会话访问时间，再调用 Context。</li>
+  <li>ContextConfig 依赖 Host（<code>context.getParent().getName()</code>），所以实际部署离不开 Host。</li>
+  <li>Engine 是顶层容器，子容器只能是 Host；StandardEngineValve 检查 Host 头并选择 Host，找不到就用默认主机。</li>
+  <li>至此四种容器的分派链完整：Engine（主机名）→ Host（上下文路径）→ Context（Servlet 映射）→ Wrapper。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>在 Java 17 版的 <code>StandardHost</code> 里支持通配符别名 <code>*.example.com</code>（现代 Tomcat 的 Host 名和别名也支持这种通配写法）。</li>
+    <li>给 <code>www.example.com</code> 再部署一个 <code>/blog</code> 应用，验证 <code>/blog/Hello</code> 和 <code>/Hello</code> 分别进入不同的 Context。</li>
+    <li>故意让 HelloServlet 抛出 <code>RuntimeException</code>，观察 ErrorReportValve 返回的 500 页面；再把这个阀从 Host 的管道里移除，比较两种结果。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

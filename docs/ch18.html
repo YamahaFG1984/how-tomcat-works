@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 18 章 · 部署器 — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="18">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 18 章</span>
+<h1>部署器</h1>
+<p class="lede">
+  到上一章为止，每个 Context 都是在代码里或 server.xml 里写死的。可我们用 Tomcat 时，
+  只要把一个目录或者 WAR 包丢进 <code>webapps</code>，它就自动跑起来了——甚至不用重启。
+  这一章揭开这个「自动部署」的机制：Host 的监听器 <code>HostConfig</code> 负责发现应用，
+  <code>Deployer</code>（<code>StandardHostDeployer</code>）负责把它们装进 Host。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>理解 HostConfig 如何在 Host 启动时扫描 appBase 并部署应用</li>
+    <li>区分三种部署形式：描述符、WAR、目录，并理解它们的处理顺序</li>
+    <li>理解「热部署」（live deploy）在 Tomcat 4 和 Tomcat 5 中的不同实现</li>
+    <li>理解 Deployer 接口：install / remove / start / stop</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="hostconfig">谁把 Context 加进了 Host？</h2>
+
+<p>第 15 章的代码是这样「部署」应用的：<code>new StandardContext()</code>、<code>setPath</code>、<code>setDocBase</code>、<code>host.addChild(context)</code>。真实的 Tomcat 里没有这样的代码。答案在 Catalina 的 Digester 规则里——<code>HostRuleSet</code> 在创建 Host 的同时，给它加了一个生命周期监听器：</p>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/startup/HostRuleSet.java（节选）">
+<pre>
+digester.addObjectCreate(prefix + "Host", "org.apache.catalina.core.StandardHost", "className");
+digester.addSetProperties(prefix + "Host");
+digester.addRule(prefix + "Host", new CopyParentClassLoaderRule(digester));
+digester.addRule(prefix + "Host",
+    new LifecycleListenerRule(digester, "org.apache.catalina.startup.HostConfig", "hostConfigClass"));
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="Host 启动时触发 START 事件，HostConfig 收到后扫描 appBase 并通过 Deployer 安装 Context">
+  <rect class="bx-b" x="20" y="30" width="190" height="60" rx="10"/>
+  <text class="ttl on-b" x="115" y="56" text-anchor="middle">StandardHost</text>
+  <text class="mono sm" x="115" y="76" text-anchor="middle">start() → fire(START)</text>
+  <path class="ln-b" d="M212 60 H266" marker-end="url(#ar-b)"/>
+  <rect class="bx-a" x="270" y="20" width="220" height="80" rx="10"/>
+  <text class="ttl on-a" x="380" y="44" text-anchor="middle">HostConfig（监听器）</text>
+  <text class="mono sm" x="380" y="66" text-anchor="middle">start() → deployApps()</text>
+  <text class="sm" x="380" y="86" text-anchor="middle">liveDeploy → 后台线程</text>
+  <path class="ln-a" d="M492 60 H546" marker-end="url(#ar-a)"/>
+  <rect class="bx-g" x="550" y="20" width="190" height="80" rx="10"/>
+  <text class="ttl on-g" x="645" y="44" text-anchor="middle">Deployer</text>
+  <text class="mono sm" x="645" y="66" text-anchor="middle">host.install(path, url)</text>
+  <text class="sm" x="645" y="86" text-anchor="middle">StandardHostDeployer</text>
+
+  <rect class="bx-d" x="20" y="130" width="470" height="110" rx="12"/>
+  <text class="ttl" x="40" y="154">appBase（默认 webapps/）</text>
+  <text class="mono sm" x="40" y="180">manager.xml        ← ① 描述符</text>
+  <text class="mono sm" x="40" y="202">shop.war           ← ② WAR 包</text>
+  <text class="mono sm" x="40" y="224">app1/WEB-INF/…     ← ③ 目录（必须有 WEB-INF）</text>
+  <path class="ln-d" d="M380 102 V126" marker-end="url(#ar)"/>
+
+  <rect class="bx" x="550" y="130" width="190" height="110" rx="12"/>
+  <text class="sm" x="645" y="156" text-anchor="middle">新建 StandardContext</text>
+  <text class="sm" x="645" y="178" text-anchor="middle">setPath / setDocBase</text>
+  <text class="sm" x="645" y="200" text-anchor="middle">加 ContextConfig 监听器</text>
+  <text class="mono sm" x="645" y="222" text-anchor="middle">host.addChild(ctx)</text>
+  <path class="ln-g" d="M645 102 V126" marker-end="url(#ar-g)"/>
+</svg>
+<figcaption>图 18-1　HostConfig 发现应用，Deployer 安装应用</figcaption>
+</figure>
+
+<div class="code" data-lang="java" data-file="HostConfig.lifecycleEvent() / start()（对应原书 Listing 18.1、18.2）">
+<pre>
+public void lifecycleEvent(LifecycleEvent event) {
+    host = (Host) event.getLifecycle();
+    if (host instanceof StandardHost) {
+        setDeployXML(((StandardHost) host).isDeployXML());     // 是否部署描述符（默认 true）
+        setLiveDeploy(((StandardHost) host).getLiveDeploy());  // 是否定期检查新应用（默认 true）
+        setUnpackWARs(((StandardHost) host).isUnpackWARs());   // WAR 是否解压
+    }
+    if (event.getType().equals(Lifecycle.START_EVENT))
+        start();
+    else if (event.getType().equals(Lifecycle.STOP_EVENT))
+        stop();
+}
+
+protected void start() {
+    if (host.getAutoDeploy()) {
+        deployApps();
+    }
+    if (isLiveDeploy()) {
+        threadStart();          // Tomcat 4：每 checkInterval（15）秒再扫描一次
+    }
+}
+</pre>
+</div>
+
+<h2 id="deployapps">三种部署形式</h2>
+
+<div class="code" data-lang="java" data-file="HostConfig.deployApps()（对应原书 Listing 18.3）">
+<pre>
+protected void deployApps() {
+    if (!(host instanceof Deployer))
+        return;
+    File appBase = appBase();
+    if (!appBase.exists() || !appBase.isDirectory())
+        return;
+    String files[] = appBase.list();
+    deployDescriptors(appBase, files);   // ① *.xml
+    deployWARs(appBase, files);          // ② *.war
+    deployDirectories(appBase, files);   // ③ 子目录
+}
+</pre>
+</div>
+
+<p>每个已处理的条目都记在 <code>deployed</code> 列表里，三个方法都会跳过 <code>META-INF</code>、<code>WEB-INF</code>、已部署过的条目，以及上下文路径已被占用的应用。上下文路径由文件名推出：</p>
+
+<div class="tw">
+<table>
+  <tr><th>形式</th><th>文件</th><th>上下文路径</th><th>说明</th></tr>
+  <tr><td>① 描述符</td><td><code>manager.xml</code></td><td><code>/manager</code></td><td>文件里是一个 <code>&lt;Context docBase="..."/&gt;</code> 元素，应用可以放在 appBase 之外；<code>ROOT.xml</code> → <code>""</code></td></tr>
+  <tr><td>② WAR</td><td><code>shop.war</code></td><td><code>/shop</code></td><td><code>unpackWARs</code> 为 true 时先解压成 <code>shop/</code> 目录再部署，否则直接以 <code>jar:file:…!/</code> 部署</td></tr>
+  <tr><td>③ 目录</td><td><code>app1/</code></td><td><code>/app1</code></td><td>必须包含可读的 <code>WEB-INF</code> 目录，否则视为普通目录跳过；<code>ROOT/</code> → <code>""</code></td></tr>
+</table>
+</div>
+
+<div class="box key">
+  <div class="t">&#128273; 为什么顺序很重要？</div>
+  <p>原书留了一个问题：三个方法的调用顺序重要吗？答案是重要。描述符优先，可以覆盖同名的 WAR 或目录（例如给它加 <code>privileged="true"</code> 或换 docBase）；WAR 先于目录处理，并把解压出的目录记为已部署，否则 <code>shop.war</code> 解压出的 <code>shop/</code> 会被当作另一个应用再部署一次。</p>
+</div>
+
+<div class="code" data-lang="xml" data-file="Tomcat 4 自带的 manager.xml 描述符（原书 Listing 18.5）">
+<pre>
+&lt;Context path="/manager" docBase="../server/webapps/manager" debug="0" privileged="true"&gt;
+  &lt;!-- Link to the user database we will get roles from --&gt;
+  &lt;ResourceLink name="users" global="UserDatabase" type="org.apache.catalina.UserDatabase"/&gt;
+&lt;/Context&gt;
+</pre>
+</div>
+
+<p>Manager 和 Admin 应用的文件不在 webapps 下（Tomcat 4 中位于 <code>server/webapps</code>），而是通过描述符的 docBase 指过去，并标记为 <code>privileged</code>（第 19 章会用到这个属性）。</p>
+
+<div class="code" data-lang="java" data-file="HostConfig.deployDirectories()（对应原书 Listing 18.8，节选）">
+<pre>
+for (int i = 0; i &lt; files.length; i++) {
+    if (files[i].equalsIgnoreCase("META-INF") || files[i].equalsIgnoreCase("WEB-INF")) continue;
+    if (deployed.contains(files[i])) continue;
+    File dir = new File(appBase, files[i]);
+    if (dir.isDirectory()) {
+        deployed.add(files[i]);
+        File webInf = new File(dir, "/WEB-INF");
+        if (!webInf.exists() || !webInf.isDirectory() || !webInf.canRead())
+            continue;                                 // 不是 Web 应用
+        String contextPath = "/" + files[i];
+        if (files[i].equals("ROOT"))
+            contextPath = "";
+        if (host.findChild(contextPath) != null)
+            continue;
+        URL url = new URL("file", null, dir.getCanonicalPath());
+        ((Deployer) host).install(contextPath, url);
+    }
+}
+</pre>
+</div>
+
+<h2 id="live">热部署</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="Tomcat 4 中 HostConfig 自带线程定期检查；Tomcat 5 中 StandardHost 的 backgroundProcess 发出 check 事件">
+  <rect class="bx-b" x="20" y="20" width="340" height="190" rx="12"/>
+  <text class="ttl on-b" x="190" y="44" text-anchor="middle">Tomcat 4：HostConfig 自己的线程</text>
+  <text class="mono sm" x="40" y="74">while (!threadDone) {</text>
+  <text class="mono sm" x="60" y="96">threadSleep();       // 15 秒</text>
+  <text class="mono sm" x="60" y="118">deployApps();        // 新应用</text>
+  <text class="mono sm" x="60" y="140">checkWebXmlLastModified();</text>
+  <text class="mono sm" x="40" y="162">}</text>
+  <text class="sm" x="190" y="192" text-anchor="middle">web.xml 被修改 → 重启这个 Context</text>
+
+  <rect class="bx-a" x="400" y="20" width="340" height="190" rx="12"/>
+  <text class="ttl on-a" x="570" y="44" text-anchor="middle">Tomcat 5：共享后台线程（第 12 章）</text>
+  <text class="mono sm" x="420" y="74">StandardHost.backgroundProcess() {</text>
+  <text class="mono sm" x="440" y="96">fireLifecycleEvent("check", null);</text>
+  <text class="mono sm" x="420" y="118">}</text>
+  <text class="mono sm" x="420" y="146">HostConfig.check() {</text>
+  <text class="mono sm" x="440" y="168">deployApps(); checkContextLastModified();</text>
+  <text class="mono sm" x="420" y="190">}</text>
+</svg>
+<figcaption>图 18-2　热部署的两种实现</figcaption>
+</figure>
+
+<p>Tomcat 5 的 <code>checkContextLastModified()</code> 检查每个已部署应用的 web.xml、WEB-INF 内容以及 WAR 文件的时间戳，有变化就重启或重新部署该应用。</p>
+
+<h2 id="deployer">Deployer 接口</h2>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/Deployer.java（对应原书 Listing 18.11，节选）">
+<pre>
+public interface Deployer {
+    public static final String PRE_INSTALL_EVENT = "pre-install";
+    public static final String INSTALL_EVENT = "install";
+    public static final String REMOVE_EVENT = "remove";
+
+    public void install(String contextPath, URL war) throws IOException;   // 目录或 WAR
+    public void install(URL config, URL war) throws IOException;           // 描述符
+    public Context findDeployedApp(String contextPath);
+    public String[] findDeployedApps();
+    public void remove(String contextPath) throws IOException;
+    public void start(String contextPath) throws IOException;
+    public void stop(String contextPath) throws IOException;
+}
+</pre>
+</div>
+
+<p>StandardHost 实现了 Deployer，但它把所有工作委托给一个辅助对象：<code>private Deployer deployer = new StandardHostDeployer(this);</code></p>
+
+<div class="code" data-lang="java" data-file="StandardHostDeployer.install(contextPath, war)（对应原书 Listing 18.13，节选）">
+<pre>
+if (!contextPath.equals("") &amp;&amp; !contextPath.startsWith("/"))
+    throw new IllegalArgumentException(sm.getString("standardHost.pathFormat", contextPath));
+if (findDeployedApp(contextPath) != null)
+    throw new IllegalStateException(sm.getString("standardHost.pathUsed", contextPath));
+...
+Class clazz = Class.forName(host.getContextClass());          // 默认 StandardContext
+Context context = (Context) clazz.newInstance();
+context.setPath(contextPath);
+context.setDocBase(docBase);
+if (context instanceof Lifecycle) {
+    clazz = Class.forName(host.getConfigClass());             // 默认 ContextConfig
+    LifecycleListener listener = (LifecycleListener) clazz.newInstance();
+    ((Lifecycle) context).addLifecycleListener(listener);
+}
+host.fireContainerEvent(PRE_INSTALL_EVENT, context);
+host.addChild(context);                                       // Host 已启动时，addChild 会启动 Context
+host.fireContainerEvent(INSTALL_EVENT, context);
+</pre>
+</div>
+
+<p>安装描述符的 <code>install(URL config, URL war)</code> 则用一个 Digester 解析描述符里的 <code>&lt;Context&gt;</code> 元素（Deployer 自己压在栈底）；<code>start</code> / <code>stop</code> 找到 Context 后调用它的生命周期方法，可以单独启停某一个应用而不影响其他应用。</p>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch18/startup/HostConfig.java</code><code>startup/StandardHostDeployer.java</code><code>startup/Bootstrap.java</code><code>tomcat/EmbeddedHostConfig.java</code></div>
+
+<p>Java 17 版的 Bootstrap 在 <code>target/ch18-webapps</code> 里准备了三种形式的应用——目录 <code>app1/</code>、WAR <code>app2.war</code>、描述符 <code>hello.xml</code>——Host 上没有手写任何 Context。</p>
+
+<h3>① HostConfig：Stream + NIO</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch18/startup/HostConfig.java（节选）">
+<pre>
+synchronized void deployApps() {
+    List&lt;Path&gt; files = list();
+    files.stream().filter(p -&gt; p.toString().endsWith(".xml")).forEach(this::deployDescriptor);
+    files.stream().filter(p -&gt; p.toString().endsWith(".war")).forEach(this::deployWAR);
+    list().stream().filter(Files::isDirectory).forEach(this::deployDirectory);   // WAR 可能刚解压出新目录
+}
+
+/** live deploy：部署新应用、卸载已删除的应用、重载 web.xml 被修改的应用 */
+synchronized void check() {
+    deployApps();
+    deployed.entrySet().removeIf(entry -&gt; {
+        if (Files.exists(appBase.resolve(entry.getKey()))) return false;
+        deployer.remove(entry.getValue());               // 文件没了：卸载
+        return true;
+    });
+    webXmlTimes.forEach((contextPath, time) -&gt; { ... context.reload(); });
+}
+</pre>
+</div>
+
+<h3>② 解压 WAR 时防止 zip slip</h3>
+
+<p>WAR 就是 ZIP。恶意构造的 WAR 可以包含名为 <code>../../etc/cron.d/evil</code> 的条目，天真的解压代码会把文件写到目标目录之外——这就是著名的「zip slip」漏洞。和第 1 章防路径穿越的套路一样：先规范化，再检查是否仍在目标目录里。</p>
+
+<div class="code" data-lang="java" data-file="java17/.../ch18/startup/HostConfig.java（节选）">
+<pre>
+try (var zip = new ZipFile(war.toFile())) {
+    for (ZipEntry entry : zip.stream().toList()) {               // Java 16 Stream.toList()
+        Path target = dir.resolve(entry.getName()).normalize();
+        if (!target.startsWith(dir)) {
+            throw new IOException("非法的 WAR 条目: " + entry.getName());
+        }
+        ...
+        Files.copy(in, target, StandardCopyOption.REPLACE_EXISTING);
+    }
+}
+</pre>
+</div>
+
+<h3>③ StandardHostDeployer</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch18/startup/StandardHostDeployer.java（节选）">
+<pre>
+public synchronized StandardContext install(String contextPath, Path docBase) throws LifecycleException {
+    if (!contextPath.isEmpty() &amp;&amp; !contextPath.startsWith("/"))
+        throw new IllegalArgumentException("上下文路径必须是 \"\" 或以 / 开头: " + contextPath);
+    if (findDeployedApp(contextPath) != null)
+        throw new IllegalStateException("上下文路径已被占用: " + contextPath);
+    var context = new StandardContext();
+    context.setPath(contextPath);
+    context.setDocBase(docBase.toString());
+    context.addLifecycleListener(new ContextConfig());                          // 第 15 章
+    context.setLoader(new WebappLoader(context.getDocBase(), context::reload));  // 第 8 章
+    host.addChild(context);
+    if (host.isStarted()) {
+        context.start();                                  // Host 已经在运行：立即启动
+    }
+    return context;
+}
+</pre>
+</div>
+
+<h3>④ Tomcat 11 的 HostConfig</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch18/tomcat/EmbeddedHostConfig.java（节选）">
+<pre>
+tomcat.getEngine().setBackgroundProcessorDelay(1);   // 每秒一次 periodic 事件 → HostConfig.check()
+Host host = tomcat.getHost();
+host.setAppBase(appBase.toString());
+host.setAutoDeploy(true);
+host.addLifecycleListener(new HostConfig());         // 嵌入式 Tomcat 默认不加，需要手动加
+
+// 描述符放在 $CATALINA_BASE/conf/&lt;Engine 名&gt;/&lt;Host 名&gt;/，不在 appBase 里
+Path xmlBase = base.resolve("conf").resolve(tomcat.getEngine().getName()).resolve(host.getName());
+Files.writeString(xmlBase.resolve("hello.xml"), "&lt;Context docBase=\"" + myApp + "\"/&gt;\n");
+</pre>
+</div>
+
+<div class="box tip">
+  <div class="t">&#128161; 一个实际踩到的坑</div>
+  <p>第一次运行时 <code>hello.xml</code> 没有被部署。原因：描述符目录是 <code>conf/&lt;Engine 名&gt;/&lt;Host 名&gt;</code>，独立部署的 Tomcat 中 Engine 叫 <code>Catalina</code>，而嵌入式 <code>Tomcat</code> 类创建的 Engine 叫 <code>Tomcat</code>。把路径改成用 <code>tomcat.getEngine().getName()</code> 计算后就好了。</p>
+</div>
+
+<div class="box note">
+  <div class="t">&#9432; 原书之后的变化</div>
+  <ul>
+    <li>Tomcat 5 起，描述符从 appBase 移到了 <code>conf/Catalina/localhost/</code>（<code>xmlBase</code>）；应用内也可以放 <code>META-INF/context.xml</code>。</li>
+    <li><code>Deployer</code> 接口和 <code>StandardHostDeployer</code> 后来被移除（Tomcat 6 中已不存在），部署逻辑全部收进 HostConfig；Manager 应用通过 HostConfig 的 JMX 操作来部署/卸载（第 19、20 章）。</li>
+    <li>Tomcat 7 增加了「并行部署」：<code>shop##002.war</code> 与 <code>shop##001.war</code> 共享 <code>/shop</code>，新会话进入新版本，老会话继续留在旧版本直到结束。</li>
+    <li>Host 的 <code>deployOnStartup</code>、<code>autoDeploy</code>、<code>unpackWARs</code> 仍是 server.xml 里最常配置的属性；生产环境通常关闭 autoDeploy。</li>
+  </ul>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch18.startup.Bootstrap
+curl http://localhost:8080/app1/Primitive          # 目录
+curl http://localhost:8080/app2/Primitive          # WAR（已解压）
+curl http://localhost:8080/hello/Hello             # 描述符
+cp -r target/ch18-webapps/app1 target/ch18-webapps/app3    # 热部署
+rm -rf target/ch18-webapps/app3                            # 热卸载
+touch target/ch18-webapps/app1/WEB-INF/web.xml             # web.xml 变化 → 重载
+
+./run.sh ch18.tomcat.EmbeddedHostConfig            # Tomcat 11
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+HostConfig: 部署描述符 hello.xml
+StandardHostDeployer: 安装 /hello ← /…/java17/myApp
+HostConfig: 部署 WAR app2.war（解压到 app2/）
+StandardHostDeployer: 安装 /app2 ← /…/target/ch18-webapps/app2
+HostConfig: 部署目录 app1/
+StandardHostDeployer: 安装 /app1 ← /…/target/ch18-webapps/app1
+已部署的应用：[/app1, /app2, /hello]
+HostConfig: 部署目录 app3/                         ← cp -r 之后几秒
+StandardHostDeployer: 安装 /app3 ← …/app3
+destroy
+StandardHostDeployer: 移除 /app3                    ← rm -rf 之后
+HostConfig: /app1 的 web.xml 被修改，重载            ← touch 之后
+
+（Tomcat 11）
+Deploying deployment descriptor [/tmp/…/conf/Tomcat/localhost/hello.xml]
+Deploying web application archive [/tmp/…/webapps/app2.war]
+Deploying web application directory [/tmp/…/webapps/app1]
+Tomcat 11 已部署： [/app2] [/app1] [/hello]
+Deploying web application directory [/tmp/…/webapps/app3]
+Undeploying context [/app3]
+</pre>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>HostRuleSet 给每个 Host 加上 HostConfig 监听器；Host 启动时 HostConfig 扫描 appBase 部署应用。</li>
+  <li>部署顺序：描述符 → WAR → 目录；上下文路径由文件名决定，<code>ROOT</code> 对应 <code>""</code>。</li>
+  <li>热部署：Tomcat 4 用 HostConfig 自己的线程，Tomcat 5 用 Host 的 <code>backgroundProcess()</code> 发出 check 事件。</li>
+  <li>Deployer 的 install 创建 StandardContext、挂上 ContextConfig、加入 Host；start / stop / remove 可以单独管理某个应用。</li>
+  <li>解压 WAR 时要防范 zip slip。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>在 Java 17 版里支持 <code>ROOT</code>：把 <code>webapps/app1</code> 复制成 <code>target/ch18-webapps/ROOT</code>，验证 <code>/Primitive</code> 可以访问。</li>
+    <li>给 HostConfig 增加对 WAR 文件更新的检测：<code>app2.war</code> 的修改时间变了，就卸载 <code>/app2</code>、删除解压目录、重新部署。</li>
+    <li>构造一个包含 <code>../evil.txt</code> 条目的 WAR（用 <code>ZipOutputStream</code> 手写条目名），放进 appBase，验证 zip slip 防护生效。</li>
+    <li>实现简化版的并行部署：<code>app##2.war</code> 部署到 <code>/app</code>，并把原来的 <code>/app</code> 停掉。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

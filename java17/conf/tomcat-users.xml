@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  第 10 章 Bootstrap2 和 Tomcat 11 示例使用的用户库（与原书 conf/tomcat-users.xml 相同的用户）。
+  生产环境请不要存明文密码：Tomcat 可以配置 CredentialHandler 存储加盐哈希。
+-->
+<tomcat-users xmlns="http://tomcat.apache.org/xml"
+              xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+              xsi:schemaLocation="http://tomcat.apache.org/xml tomcat-users.xsd"
+              version="1.0">
+  <role rolename="tomcat"/>
+  <role rolename="role1"/>
+  <role rolename="manager"/>
+  <role rolename="admin"/>
+  <user username="tomcat" password="tomcat" roles="tomcat"/>
+  <user username="role1" password="tomcat" roles="role1"/>
+  <user username="both" password="tomcat" roles="tomcat,role1"/>
+  <user username="admin" password="password" roles="admin,manager"/>
+</tomcat-users>

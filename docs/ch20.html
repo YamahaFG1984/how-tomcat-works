@@ -1,0 +1,530 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 20 章 · 基于 JMX 的管理 — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="20">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 20 章</span>
+<h1>基于 JMX 的管理</h1>
+<p class="lede">
+  第 19 章的 ContainerServlet 能管理 Tomcat，但它把管理能力绑死在一个 Servlet 上。
+  <strong>JMX（Java Management Extensions）</strong>是一个更通用的标准：把需要管理的对象包装成 MBean，
+  注册到一个 MBean 服务器里，任何遵循标准的管理工具（JConsole、VisualVM、监控系统）都能查看属性、调用操作。
+  Tomcat 的 Server、Host、Context、连接器、线程池……全都以 MBean 的形式暴露出来。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>理解 JMX 的基本概念：MBean、MBean 服务器、ObjectName、三层架构</li>
+    <li>会写标准 MBean 和模型 MBean，理解两者的取舍</li>
+    <li>理解 Commons Modeler 如何用 XML 描述文件省去模型 MBean 的样板代码</li>
+    <li>了解 Catalina 如何为所有组件创建 MBean，以及如何用 JMX 写一个管理应用</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="intro">JMX 入门</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="JMX 架构：管理程序通过 MBean 服务器访问 MBean，MBean 管理 Java 对象；类比浏览器、Servlet 容器、Servlet">
+  <rect class="bx-b" x="20" y="40" width="170" height="100" rx="12"/>
+  <text class="ttl on-b" x="105" y="66" text-anchor="middle">管理程序</text>
+  <text class="sm" x="105" y="90" text-anchor="middle">JConsole、VisualVM、</text>
+  <text class="sm" x="105" y="108" text-anchor="middle">监控系统、Admin 应用</text>
+  <text class="sm on-b" x="105" y="128" text-anchor="middle">≈ 浏览器</text>
+
+  <rect class="bx-a" x="260" y="20" width="240" height="140" rx="12"/>
+  <text class="ttl on-a" x="380" y="46" text-anchor="middle">MBean 服务器</text>
+  <text class="sm" x="380" y="70" text-anchor="middle">所有 MBean 的注册中心</text>
+  <text class="mono sm" x="380" y="94" text-anchor="middle">getAttribute / setAttribute</text>
+  <text class="mono sm" x="380" y="114" text-anchor="middle">invoke / queryNames</text>
+  <text class="sm on-a" x="380" y="140" text-anchor="middle">≈ Servlet 容器（代理层 agent level）</text>
+
+  <rect class="bx-g" x="570" y="20" width="170" height="60" rx="10"/>
+  <text class="mono sm" x="655" y="44" text-anchor="middle">Catalina:type=Server</text>
+  <text class="sm" x="655" y="64" text-anchor="middle">MBean</text>
+  <rect class="bx-g" x="570" y="96" width="170" height="60" rx="10"/>
+  <text class="mono sm" x="655" y="120" text-anchor="middle">…type=Context,…</text>
+  <text class="sm" x="655" y="140" text-anchor="middle">MBean ≈ Servlet</text>
+  <path class="ln-b" d="M192 90 H256" marker-end="url(#ar-b)"/>
+  <path class="ln-a" d="M502 60 H566" marker-end="url(#ar-a)"/>
+  <path class="ln-a" d="M502 120 H566" marker-end="url(#ar-a)"/>
+
+  <rect class="bx-d" x="570" y="200" width="170" height="70" rx="10"/>
+  <text class="sm" x="655" y="224" text-anchor="middle">被管理的资源</text>
+  <text class="mono sm" x="655" y="246" text-anchor="middle">StandardServer</text>
+  <text class="mono sm" x="655" y="262" text-anchor="middle">StandardContext …</text>
+  <path class="ln-g" d="M655 158 V196" marker-end="url(#ar-g)"/>
+  <text class="sm" x="380" y="210" text-anchor="middle">管理程序从不直接接触被管理的对象，只通过 MBean 服务器</text>
+  <text class="sm" x="380" y="232" text-anchor="middle">MBean 决定暴露哪些属性和方法：可以只读、可以隐藏、可以额外加一些</text>
+  <text class="sm" x="380" y="262" text-anchor="middle">规范的三层：工具层（MBean）· 代理层（MBean 服务器）· 分布式服务层（远程访问）</text>
+</svg>
+<figcaption>图 20-1　JMX 的三方关系</figcaption>
+</figure>
+
+<p>要让一个 Java 对象可以被 JMX 管理，需要为它准备一个<strong>托管 Bean（Managed Bean，MBean）</strong>。MBean 有四种：标准、动态、开放、模型。标准 MBean 最简单、最不灵活；Catalina 使用的是模型 MBean。原书时代 JMX 还需要单独下载实现（Sun 的参考实现、MX4J）；<strong>Java 5 起 JMX 已经内置在 JDK 中</strong>。</p>
+
+<h3>MBeanServer 与 ObjectName</h3>
+
+<div class="code" data-lang="java">
+<pre>
+MBeanServer server = MBeanServerFactory.createMBeanServer();             // 原书
+MBeanServer server = ManagementFactory.getPlatformMBeanServer();         // Java 5+ 平台服务器
+
+ObjectInstance registerMBean(Object mbean, ObjectName name);             // 注册
+Set queryNames(ObjectName pattern, QueryExp query);                      // 按模式查找
+Object getAttribute(ObjectName name, String attribute);
+void setAttribute(ObjectName name, Attribute attribute);
+Object invoke(ObjectName name, String operation, Object[] params, String[] signature);
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 150" role="img" aria-label="ObjectName 由域和键值对组成">
+  <text class="mono" x="380" y="44" text-anchor="middle" style="font-size:20px"><tspan class="on-a">Catalina</tspan>:<tspan class="on-b">type=Context</tspan>,<tspan class="on-g">path=/app1</tspan>,<tspan class="on-p">host=localhost</tspan></text>
+  <path class="ln-a" d="M140 60 H232"/>
+  <text class="ttl on-a" x="186" y="84" text-anchor="middle">域</text>
+  <path class="ln-b" d="M252 60 H388"/>
+  <text class="sm on-b" x="320" y="84" text-anchor="middle">键=值</text>
+  <path class="ln-g" d="M400 60 H514"/>
+  <text class="sm on-g" x="457" y="84" text-anchor="middle">键=值</text>
+  <path class="ln-p" d="M526 60 H640"/>
+  <text class="sm on-p" x="583" y="84" text-anchor="middle">键=值</text>
+  <text class="sm" x="380" y="118" text-anchor="middle">像 HashMap 的键一样唯一标识一个 MBean；键值对无顺序，同一个键只能出现一次</text>
+  <text class="mono sm" x="380" y="140" text-anchor="middle">模式：Catalina:type=Context,*　　*:j2eeType=WebModule,*</text>
+</svg>
+<figcaption>图 20-2　ObjectName 的结构</figcaption>
+</figure>
+
+<h2 id="standard">标准 MBean</h2>
+
+<p>步骤：① 写一个「类名 + <code>MBean</code>」的接口，列出要暴露的方法；② 让类实现它；③ 创建 ObjectName，注册到 MBean 服务器。</p>
+
+<div class="vs">
+  <div class="old"><div class="h">CarMBean 接口 + Car 类</div>
+<div class="code" data-lang="java">
+<pre>
+public interface CarMBean {
+    public String getColor();
+    public void setColor(String color);
+    public void drive();
+}
+
+public class Car implements CarMBean {
+    private String color = "red";
+    public String getColor() { return color; }
+    public void setColor(String color) { this.color = color; }
+    public void drive() {
+        System.out.println("Baby you can drive my car.");
+    }
+}
+</pre>
+</div>
+  </div>
+  <div class="new"><div class="h">StandardAgent（原书 Listing 20.3，节选）</div>
+<div class="code" data-lang="java">
+<pre>
+MBeanServer mBeanServer =
+    MBeanServerFactory.createMBeanServer();
+String domain = mBeanServer.getDefaultDomain();
+ObjectName objectName = new ObjectName(
+    domain + ":type=ex20.pyrmont.standardmbeantest.Car");
+mBeanServer.createMBean(
+    "ex20.pyrmont.standardmbeantest.Car", objectName);
+
+mBeanServer.setAttribute(objectName,
+    new Attribute("Color", "blue"));
+System.out.println(
+    mBeanServer.getAttribute(objectName, "Color"));
+mBeanServer.invoke(objectName, "drive", null, null);
+</pre>
+</div>
+  </div>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+blue
+Baby you can drive my car.
+</pre>
+</div>
+
+<p>getter/setter 成对出现的 <code>getColor</code>/<code>setColor</code> 被识别为可读写属性 <code>Color</code>，其余方法是操作。从接口中删掉 <code>drive</code>，管理程序就再也调用不到它——这就是「选择暴露什么」。缺点也很明显：<strong>必须修改被管理的类</strong>，让它实现接口。</p>
+
+<h2 id="model">模型 MBean</h2>
+
+<p>模型 MBean 不需要修改被管理的类。你使用 JMX 提供的 <code>ModelMBean</code> 实现（默认是 <code>RequiredModelMBean</code>），再用一个 <code>ModelMBeanInfo</code> 对象「描述」要暴露的属性和操作，最后用 <code>setManagedResource(car, "ObjectReference")</code> 告诉它管理哪个对象。</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="模型 MBean：RequiredModelMBean 根据 ModelMBeanInfo 的描述，把调用转发给被管理的 Car 对象">
+  <rect class="bx-a" x="20" y="40" width="220" height="130" rx="12"/>
+  <text class="ttl on-a" x="130" y="64" text-anchor="middle">ModelMBeanInfoSupport</text>
+  <text class="sm" x="130" y="90" text-anchor="middle">属性：ModelMBeanAttributeInfo</text>
+  <text class="sm" x="130" y="110" text-anchor="middle">操作：ModelMBeanOperationInfo</text>
+  <text class="sm" x="130" y="130" text-anchor="middle">构造器、通知……</text>
+  <text class="sm on-a" x="130" y="154" text-anchor="middle">写起来很繁琐</text>
+  <rect class="bx-p" x="290" y="60" width="200" height="90" rx="12"/>
+  <text class="ttl on-p" x="390" y="86" text-anchor="middle">RequiredModelMBean</text>
+  <text class="mono sm" x="390" y="110" text-anchor="middle">setManagedResource(car,</text>
+  <text class="mono sm" x="390" y="128" text-anchor="middle">"ObjectReference")</text>
+  <rect class="bx-g" x="540" y="70" width="200" height="70" rx="12"/>
+  <text class="ttl on-g" x="640" y="98" text-anchor="middle">Car</text>
+  <text class="sm" x="640" y="120" text-anchor="middle">普通的类，不实现任何接口</text>
+  <path class="ln-a" d="M242 105 H286" marker-end="url(#ar-a)"/>
+  <path class="ln-p" d="M492 105 H536" marker-end="url(#ar-p)"/>
+  <text class="sm" x="264" y="96" text-anchor="middle">描述</text>
+  <text class="sm" x="514" y="96" text-anchor="middle">转发</text>
+</svg>
+<figcaption>图 20-3　模型 MBean：描述与实现分离</figcaption>
+</figure>
+
+<div class="code" data-lang="java" data-file="ex20/pyrmont/modelmbeantest1/ModelAgent.java（节选）">
+<pre>
+attributes[0] = new ModelMBeanAttributeInfo("Color", "java.lang.String",
+    "the color.", true, true, false, null);
+operations[0] = new ModelMBeanOperationInfo("drive", "the drive method",
+    null, "void", MBeanOperationInfo.ACTION, null);
+...
+mBeanInfo = new ModelMBeanInfoSupport(MANAGED_CLASS_NAME, null, attributes, null, operations, null);
+
+RequiredModelMBean modelMBean = new RequiredModelMBean(mBeanInfo);
+modelMBean.setManagedResource(car, "ObjectReference");
+mBeanServer.registerMBean(modelMBean, objectName);
+</pre>
+</div>
+
+<h2 id="modeler">Commons Modeler</h2>
+
+<p>手写 ModelMBeanInfo 太繁琐。Commons Modeler 让你用 XML 描述文件代替代码：</p>
+
+<div class="code" data-lang="xml" data-file="car-mbean-descriptor.xml（原书 Listing 20.8）">
+<pre>
+&lt;mbeans-descriptors&gt;
+  &lt;mbean name="myMBean"
+         className="javax.management.modelmbean.RequiredModelMBean"
+         description="The ModelMBean that manages our Car object"
+         type="ex20.pyrmont.modelmbeantest.Car"&gt;
+    &lt;attribute name="Color" description="The car color" type="java.lang.String"/&gt;
+    &lt;operation name="drive" description="drive method" impact="ACTION" returnType="void"&gt;
+      &lt;parameter name="driver" description="the driver parameter" type="java.lang.String"/&gt;
+    &lt;/operation&gt;
+  &lt;/mbean&gt;
+&lt;/mbeans-descriptors&gt;
+</pre>
+</div>
+
+<div class="tw">
+<table>
+  <tr><th>类 / 元素</th><th>作用</th></tr>
+  <tr><td><code>&lt;mbean&gt;</code></td><td><code>name</code> 唯一名字；<code>className</code> 模型 MBean 的实现类（默认 BaseModelMBean）；<code>type</code> 被管理资源的类；<code>domain</code>、<code>group</code></td></tr>
+  <tr><td><code>&lt;attribute&gt;</code> / <code>&lt;operation&gt;</code> / <code>&lt;parameter&gt;</code></td><td>属性（可读写、getMethod/setMethod）、操作（impact：ACTION、INFO…）、参数</td></tr>
+  <tr><td><code>Registry</code></td><td>读描述文件（<code>loadRegistry</code>），提供 MBeanServer，查找 ManagedBean</td></tr>
+  <tr><td><code>ManagedBean</code></td><td>代替 MBeanInfo，<code>createMBean()</code> 直接生成模型 MBean</td></tr>
+  <tr><td><code>BaseModelMBean</code></td><td>Modeler 自己的 ModelMBean 实现，<code>resource</code> 字段指向被管理的对象；可以继承它来覆盖或增加属性、操作</td></tr>
+</table>
+</div>
+
+<h2 id="catalina">Catalina 的 MBean</h2>
+
+<p>Catalina 的所有组件都在 <code>org.apache.catalina.mbeans</code> 包的 <code>mbeans-descriptors.xml</code> 中声明，例如 StandardServer：</p>
+
+<div class="code" data-lang="xml" data-file="mbeans-descriptors.xml（原书 Listing 20.6）">
+<pre>
+&lt;mbean name="StandardServer"
+       className="org.apache.catalina.mbeans.StandardServerMBean"
+       description="Standard Server Component"
+       domain="Catalina" group="Server"
+       type="org.apache.catalina.core.StandardServer"&gt;
+  &lt;attribute name="port" description="TCP port for shutdown messages" type="int"/&gt;
+  &lt;attribute name="shutdown" description="Shutdown password" type="java.lang.String"/&gt;
+  &lt;operation name="store" description="Save current state to server.xml file"
+             impact="ACTION" returnType="void"/&gt;
+&lt;/mbean&gt;
+</pre>
+</div>
+
+<div class="cards">
+  <div class="card"><span class="ic">&#127991;</span><h4>ClassNameMBean</h4><p>继承 BaseModelMBean，额外提供只读属性 <code>className</code>——被管理资源本身没有这个属性。</p></div>
+  <div class="card"><span class="ic">&#128190;</span><h4>StandardServerMBean</h4><p>覆盖 <code>store()</code> 操作：把当前配置写回 server.xml。</p></div>
+  <div class="card"><span class="ic">&#127981;</span><h4>MBeanFactory</h4><p>工厂 MBean：<code>createStandardContext(parent, path, docBase)</code>、<code>removeContext(name)</code> 等，让管理程序增删组件。</p></div>
+  <div class="card"><span class="ic">&#128295;</span><h4>MBeanUtils</h4><p>静态工具：为 Server、Service、Context… 创建 MBean、生成 ObjectName、销毁 MBean。</p></div>
+</div>
+
+<h3>这些 MBean 是什么时候创建的？</h3>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="ServerLifecycleListener 在 Server 启动时递归为 Server、Service、Connector、Engine、Host、Context 创建 MBean">
+  <rect class="bx-d" x="20" y="16" width="330" height="56" rx="10"/>
+  <text class="mono sm" x="185" y="38" text-anchor="middle">&lt;Server&gt;&lt;Listener className=</text>
+  <text class="mono sm" x="185" y="58" text-anchor="middle">"…mbeans.ServerLifecycleListener"/&gt;</text>
+  <rect class="bx-a" x="400" y="16" width="340" height="56" rx="10"/>
+  <text class="ttl on-a" x="570" y="38" text-anchor="middle">Server START 事件</text>
+  <text class="mono sm" x="570" y="58" text-anchor="middle">loadMBeanDescriptors(); createMBeans();</text>
+  <path class="ln" d="M352 44 H396" marker-end="url(#ar)"/>
+
+  <rect class="bx-p" x="20" y="110" width="160" height="40" rx="8"/><text class="mono sm" x="100" y="135" text-anchor="middle">MBeanFactory</text>
+  <rect class="bx-b" x="200" y="110" width="140" height="40" rx="8"/><text class="mono sm" x="270" y="135" text-anchor="middle">Server</text>
+  <rect class="bx-b" x="360" y="110" width="140" height="40" rx="8"/><text class="mono sm" x="430" y="135" text-anchor="middle">Service</text>
+  <rect class="bx-b" x="520" y="96" width="220" height="30" rx="8"/><text class="mono sm" x="630" y="116" text-anchor="middle">Connector × N</text>
+  <rect class="bx-b" x="520" y="134" width="220" height="30" rx="8"/><text class="mono sm" x="630" y="154" text-anchor="middle">Engine</text>
+  <rect class="bx-b" x="520" y="180" width="220" height="30" rx="8"/><text class="mono sm" x="630" y="200" text-anchor="middle">Host × N</text>
+  <rect class="bx-b" x="520" y="226" width="220" height="30" rx="8"/><text class="mono sm" x="630" y="246" text-anchor="middle">Context × N（含 Manager…）</text>
+  <path class="ln" d="M570 74 L120 106" marker-end="url(#ar)"/>
+  <path class="ln" d="M342 130 H356" marker-end="url(#ar)"/>
+  <path class="ln" d="M502 130 L516 113" marker-end="url(#ar)"/>
+  <path class="ln" d="M502 130 L516 148" marker-end="url(#ar)"/>
+  <path class="ln" d="M630 166 V176" marker-end="url(#ar)"/>
+  <path class="ln" d="M630 212 V222" marker-end="url(#ar)"/>
+  <path class="ln" d="M570 74 L272 106" marker-end="url(#ar)"/>
+  <text class="sm" x="260" y="200" text-anchor="middle">createMBeans(server) → createMBeans(service)</text>
+  <text class="sm" x="260" y="220" text-anchor="middle">→ connectors、engine → hosts → contexts</text>
+  <text class="sm" x="260" y="250" text-anchor="middle">privileged 的 Context 还会在 ServletContext 属性里</text>
+  <text class="sm" x="260" y="268" text-anchor="middle">拿到 Registry 和 MBeanServer</text>
+</svg>
+<figcaption>图 20-4　ServerLifecycleListener 递归创建 MBean（Tomcat 4）</figcaption>
+</figure>
+
+<div class="code" data-lang="java" data-file="ServerLifecycleListener.createMBeans(Context)（节选）">
+<pre>
+MBeanUtils.createMBean(context);
+context.addContainerListener(this);
+...
+// If the context is privileged, give a reference to it in a servlet context attribute
+if (context.getPrivileged()) {
+    context.getServletContext().setAttribute(Globals.MBEAN_REGISTRY_ATTR, MBeanUtils.createRegistry());
+    context.getServletContext().setAttribute(Globals.MBEAN_SERVER_ATTR, MBeanUtils.createServer());
+}
+</pre>
+</div>
+
+<h2 id="app">本章应用：MyAdmin</h2>
+
+<p>原书写了一个特权应用 <code>/myadmin</code>（描述符里 <code>privileged="true"</code>），它的 Servlet 从 ServletContext 属性里取出 Registry 和 MBeanServer，然后：</p>
+
+<div class="code" data-lang="java" data-file="myadmin/MyAdminServlet.java（节选）">
+<pre>
+public void init() throws ServletException {
+    registry = (Registry) getServletContext().getAttribute("org.apache.catalina.Registry");
+    mBeanServer = (MBeanServer) getServletContext().getAttribute("org.apache.catalina.MBeanServer");
+}
+
+private void listAllContexts(PrintWriter out) throws Exception {
+    ObjectName objName = new ObjectName("Catalina:type=Context,*");      // 模式查询
+    Set set = mBeanServer.queryNames(objName, null);
+    for (Object obj : set) {
+        out.print(obj + " &lt;a href=?action=removeContext&amp;contextObjectName="
+                  + URLEncoder.encode(obj.toString(), "UTF-8") + "&gt;remove&lt;/a&gt;&lt;br/&gt;");
+    }
+}
+
+private void removeContext(String contextObjectName, PrintWriter out) throws Exception {
+    ObjectName factory = new ObjectName("Catalina:type=MBeanFactory");
+    mBeanServer.invoke(factory, "removeContext",
+        new String[] { contextObjectName }, new String[] { "java.lang.String" });
+}
+</pre>
+</div>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch20/standardmbeantest/</code><code>modelmbeantest1/</code><code>modelmbeantest2/</code><code>startup/MiniJmxServer.java</code><code>tomcat/EmbeddedJmx.java</code><code>webroot/JmxAdminServlet.java</code></div>
+
+<h3>① 平台 MBean 服务器</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch20/standardmbeantest/StandardAgent.java（节选）">
+<pre>
+MBeanServer mBeanServer = ManagementFactory.getPlatformMBeanServer();   // JDK 内置，JConsole 能直接看到
+var objectName = new ObjectName("modern.ch20:type=" + Car.class.getName());
+mBeanServer.registerMBean(new Car(), objectName);
+mBeanServer.setAttribute(objectName, new Attribute("Color", "blue"));
+</pre>
+</div>
+
+<h3>② 模型 MBean：别忘了 getMethod / setMethod</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch20/modelmbeantest1/ModelAgent.java（节选）">
+<pre>
+Descriptor colorDesc = new DescriptorSupport(
+        "name=Color", "descriptorType=attribute", "displayName=Color",
+        "getMethod=getColor", "setMethod=setColor");          // 告诉 RequiredModelMBean 怎样读写属性
+new ModelMBeanAttributeInfo("Color", String.class.getName(), "the color.", true, true, false, colorDesc);
+</pre>
+</div>
+
+<div class="box warn">
+  <div class="t">&#9888; 原书示例里的两个小问题</div>
+  <ul>
+    <li>Listing 20.5 没有给属性描述符指定 <code>getMethod</code>/<code>setMethod</code>；按 JMX 规范，RequiredModelMBean 是靠这两个字段找到读写方法的。</li>
+    <li>Listing 20.8 给 <code>drive</code> 操作声明了一个 <code>driver</code> 参数，但调用时却是 <code>invoke(objectName, "drive", null, null)</code>——签名对不上。Java 17 版的描述文件去掉了这个参数。</li>
+  </ul>
+</div>
+
+<h3>③ Commons Modeler → Tomcat 内置的 modeler</h3>
+
+<p>和 Digester 一样，Tomcat 把 Commons Modeler 也并入了自己的代码：<code>org.apache.tomcat.util.modeler</code>。描述文件格式不变，Tomcat 每个包里的 <code>mbeans-descriptors.xml</code> 依然用它。</p>
+
+<div class="code" data-lang="java" data-file="java17/.../ch20/modelmbeantest2/ModelAgent.java（节选）">
+<pre>
+Registry registry = Registry.getRegistry(null);
+registry.loadDescriptors("modern.ch20.modelmbeantest2", ModelAgent.class.getClassLoader());   // 读 mbeans-descriptors.xml
+MBeanServer mBeanServer = registry.getMBeanServer();
+
+ManagedBean managed = registry.findManagedBean("myMBean");
+DynamicMBean mbean = managed.createMBean(car);                 // 一行生成模型 MBean
+mBeanServer.registerMBean(mbean, objectName);
+</pre>
+</div>
+
+<h3>④ 让迷你容器也能被 JMX 管理：MXBean</h3>
+
+<p>Java 6 引入了 <strong>MXBean</strong>：接口名以 <code>MXBean</code> 结尾，只使用「开放类型」（基本类型、String、集合等），任何 JMX 客户端不需要我们的类也能显示。配合一个适配器 record，不用修改 StandardContext 本身，又比手写 ModelMBeanInfo 简单得多：</p>
+
+<div class="code" data-lang="java" data-file="java17/.../ch20/startup/ContextAdmin.java">
+<pre>
+public interface ContextMXBean {
+    String getPath();
+    String getDocBase();
+    boolean isRunning();
+    int getActiveSessions();
+    void start() throws Exception;
+    void stop() throws Exception;
+    void reload();
+}
+
+public record ContextAdmin(StandardContext context) implements ContextMXBean {
+    @Override public boolean isRunning() { return context.isRunning(); }
+    @Override public void stop() throws Exception { context.stop(); }
+    ...
+}
+
+// MiniJmxServer：为第 18 章自动部署出的每个 Context 注册一个 MBean
+mbs.registerMBean(new ContextAdmin(context),
+        new ObjectName("Mini:type=Context,path=" + ObjectName.quote(context.getPath())));
+mbs.invoke(app1, "stop", null, null);              // 只通过 MBeanServer 操作
+</pre>
+</div>
+
+<h3>⑤ Tomcat 11 的 MBean 与 MyAdmin</h3>
+
+<p>Tomcat 7 起，组件继承 <code>LifecycleMBeanBase</code>，在 <code>init()</code> 阶段自己把自己注册到平台 MBean 服务器（不再需要 ServerLifecycleListener）。<code>EmbeddedJmx</code> 启动后列出的部分 MBean：</p>
+
+<div class="code" data-lang="out">
+<pre>
+Tomcat 注册的 MBean 数量：38
+  Tomcat:type=Server
+  Tomcat:type=Service
+  Tomcat:type=Engine
+  Tomcat:type=Host,host=localhost
+  Tomcat:type=Connector,port=8080,address="127.0.0.1"
+  Tomcat:type=Manager,host=localhost,context=/app1
+  Tomcat:type=ThreadPool,name="http-nio-127.0.0.1-8080"
+serverInfo = Apache Tomcat/11.0.21
+</pre>
+</div>
+
+<p>Context 的 MBean 名字遵循 JSR-77 风格：<code>Tomcat:j2eeType=WebModule,name=//localhost/app1,J2EEApplication=none,J2EEServer=none</code>（独立部署时域名是 <code>Catalina</code>）。<code>JmxAdminServlet</code> 是原书 MyAdminServlet 的现代版：</p>
+
+<div class="code" data-lang="java" data-file="java17/webroot/JmxAdminServlet.java（节选）">
+<pre>
+MBeanServer server = ManagementFactory.getPlatformMBeanServer();   // 不再需要 ServletContext 属性
+switch (action) {
+    case "listAllContexts" -&gt; {
+        for (ObjectName name : new TreeSet&lt;&gt;(server.queryNames(new ObjectName("*:j2eeType=WebModule,*"), null))) {
+            out.println(name + "  state=" + server.getAttribute(name, "stateName"));
+        }
+    }
+    case "stopContext", "startContext" -&gt; {
+        var name = new ObjectName(request.getParameter("name"));
+        server.invoke(name, action.equals("stopContext") ? "stop" : "start", null, null);
+    }
+    ...
+}
+</pre>
+</div>
+
+<div class="box warn">
+  <div class="t">&#9888; JMX 等于远程控制</div>
+  <p>能连上 JMX 的人可以停止应用、修改配置，甚至通过某些 MBean 执行任意代码。用 <code>-Dcom.sun.management.jmxremote.port=…</code> 开放远程 JMX 时，一定要启用认证（<code>jmxremote.password</code>）和 TLS，或者只绑定本机、通过 SSH 隧道访问。原书要求 MyAdmin 是 privileged 应用，而现在任何代码都能调用 <code>getPlatformMBeanServer()</code>——这也是 Tomcat 不再推荐在同一个实例里跑不受信任应用的原因之一。</p>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch20.standardmbeantest.StandardAgent
+./run.sh ch20.modelmbeantest1.ModelAgent
+./run.sh ch20.modelmbeantest2.ModelAgent
+./run.sh ch20.startup.MiniJmxServer           # 迷你容器 + MXBean，可以用 jconsole 连接
+./run.sh ch20.tomcat.EmbeddedJmx              # Tomcat 11 的 MBean + MyAdmin
+curl 'http://localhost:8080/myadmin/admin?action=listAllContexts'
+curl 'http://localhost:8080/myadmin/admin?action=listDomains'
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+$ ./run.sh ch20.modelmbeantest2.ModelAgent
+Car constructor
+Creating ObjectName
+Color:green
+Color:blue
+Baby you can drive my car.
+
+$ ./run.sh ch20.startup.MiniJmxServer
+注册 MBean Mini:type=Context,path="/app1"
+注册 MBean Mini:type=Context,path="/app2"
+注册 MBean Mini:type=Context,path="/hello"
+app1 running = true
+通过 JMX 调用 stop 之后，app1 running = false
+再调用 start，app1 running = true
+
+$ curl 'http://localhost:8080/myadmin/admin?action=listAllContexts'
+Tomcat:j2eeType=WebModule,name=//localhost/app1,J2EEApplication=none,J2EEServer=none  state=STARTED
+Tomcat:j2eeType=WebModule,name=//localhost/myadmin,J2EEApplication=none,J2EEServer=none  state=STARTED
+$ curl 'http://localhost:8080/myadmin/admin?action=stopContext&amp;name=Tomcat%3Aj2eeType%3DWebModule%2C…'
+stopContext OK: Tomcat:j2eeType=WebModule,name=//localhost/app1,…  state=STOPPED
+$ curl 'http://localhost:8080/myadmin/admin?action=listDomains'
+JMImplementation  (1 个 MBean)
+Tomcat  (38 个 MBean)
+com.sun.management  (2 个 MBean)
+java.lang  (19 个 MBean)
+…
+</pre>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>JMX 通过 MBean 服务器把被管理对象暴露给管理程序；每个 MBean 由 ObjectName（域 + 键值对）唯一标识。</li>
+  <li>标准 MBean 要求类实现「类名 + MBean」接口；模型 MBean 不修改类，用 ModelMBeanInfo 描述属性和操作。</li>
+  <li>Commons Modeler（现在是 Tomcat 内置的 modeler）用 XML 描述文件代替手写 ModelMBeanInfo。</li>
+  <li>Tomcat 4 由 ServerLifecycleListener 在 Server 启动时递归创建 MBean；Tomcat 7 起由各组件在 init 阶段自行注册。</li>
+  <li>现代 Java：JMX 内置于 JDK，用平台 MBean 服务器；MXBean 是让自己的组件可管理的最简单方式；远程 JMX 必须做好安全防护。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>运行 <code>MiniJmxServer</code>，打开 <code>jconsole</code> 连接它，在 MBeans 页签里找到 <code>Mini</code> 域，用界面调用 <code>/app1</code> 的 stop 操作，然后 curl 验证返回 503。</li>
+    <li>给 Tomcat 11 版本查询线程池 MBean 的 <code>currentThreadsBusy</code> 和 <code>maxThreads</code> 属性，用一个循环每秒打印一次，再用 <code>ab</code> 压测观察变化。</li>
+    <li>给迷你容器的 <code>StandardServer</code> 也写一个 MXBean，暴露 <code>port</code> 和一个 <code>shutdown()</code> 操作——你就得到了一个比关闭端口更安全（可以加认证）的远程关闭方式。</li>
+    <li>让 ContextAdmin 在应用启动、停止时发出 JMX 通知（<code>NotificationBroadcasterSupport</code>），在 JConsole 中订阅它。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

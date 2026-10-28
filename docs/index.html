@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>How Tomcat Works 图解教程 · 从 Socket 到 Catalina</title>
+<meta name="description" content="《How Tomcat Works》20 章的中文图解教程，每章附带可运行的 Java 17 + Tomcat 11 对照代码。">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="0">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<div class="hero">
+  <span class="chapter-eyebrow">面向初学者的 20 章图解教程</span>
+  <h1>How Tomcat Works：从 Socket 到 Catalina</h1>
+  <p class="sub">
+    这套教程整理自 Budi Kurniawan 与 Paul Deck 的经典著作《How Tomcat Works》。原书从一个三个类的 Web 服务器开始，
+    一章加一个零件，最后拼出完整的 Tomcat 4/5 Servlet 容器（代号 Catalina）。
+    这里保留原书的全部主线和关键源码，配上大量示意图，并为<strong>每一章</strong>提供一份可以直接运行的
+    <strong>Java 17 + Tomcat 11</strong> 对照代码，让你看清二十年前的设计在今天变成了什么样。
+  </p>
+  <p style="margin-top:14px">
+    <span class="pill">Socket / HTTP</span><span class="pill">Servlet 6.1（jakarta）</span><span class="pill">连接器</span>
+    <span class="pill">Pipeline &amp; Valve</span><span class="pill">Lifecycle</span><span class="pill">类加载器</span>
+    <span class="pill">Session</span><span class="pill">Realm</span><span class="pill">Digester</span><span class="pill">JMX</span>
+    <span class="pill">Java 17</span><span class="pill">嵌入式 Tomcat 11</span>
+  </p>
+</div>
+
+<h2 id="what">Servlet 容器到底做什么</h2>
+
+<p>不管多复杂，一个 Servlet 容器为每个 Servlet 请求做的事情只有三件：</p>
+
+<div class="cards">
+  <div class="card"><span class="ic">&#128229;</span><h4>① 创建请求对象</h4><p>把 HTTP 报文解析成 <code>HttpServletRequest</code>：参数、请求头、Cookie、查询串、URI……</p></div>
+  <div class="card"><span class="ic">&#128228;</span><h4>② 创建响应对象</h4><p>准备一个 <code>HttpServletResponse</code>，Servlet 往里写的内容最终变成 HTTP 响应。</p></div>
+  <div class="card"><span class="ic">&#9881;</span><h4>③ 调用 service</h4><p>找到对应的 Servlet，调用它的 <code>service(request, response)</code>。</p></div>
+</div>
+
+<p>Catalina 据此分成两大模块：<strong>连接器</strong>负责前两件事，<strong>容器</strong>负责第三件事——当然，「调用 service」之前它还要加载 Servlet、认证用户、更新会话……这些工作又分给了载入器、Realm、管理器等一系列组件。</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 384" role="img" aria-label="Catalina 的整体结构：Server、Service、连接器、Engine、Host、Context、Wrapper 以及各种辅助组件">
+  <rect class="bx-r" x="10" y="10" width="740" height="364" rx="16"/>
+  <text class="ttl on-r" x="28" y="34">Server（第 14 章）· 关闭端口 8005 · 关闭钩子（第 16 章）· 由 Catalina/Bootstrap 启动（第 17 章）</text>
+  <rect class="bx-p" x="26" y="48" width="708" height="312" rx="14"/>
+  <text class="ttl on-p" x="42" y="70">Service</text>
+
+  <rect class="bx-b" x="42" y="86" width="170" height="250" rx="12"/>
+  <text class="ttl on-b" x="127" y="110" text-anchor="middle">连接器</text>
+  <text class="sm" x="127" y="130" text-anchor="middle">第 1–4 章</text>
+  <rect class="bx" x="56" y="144" width="142" height="34" rx="6"/><text class="mono sm" x="127" y="166" text-anchor="middle">HttpConnector</text>
+  <rect class="bx" x="56" y="186" width="142" height="34" rx="6"/><text class="mono sm" x="127" y="208" text-anchor="middle">HttpProcessor 池</text>
+  <rect class="bx" x="56" y="228" width="142" height="34" rx="6"/><text class="mono sm" x="127" y="250" text-anchor="middle">Request/Response</text>
+  <text class="sm" x="127" y="290" text-anchor="middle">解析 HTTP</text>
+  <text class="sm" x="127" y="308" text-anchor="middle">→ container.invoke()</text>
+  <path class="ln-a" d="M214 210 H240" marker-end="url(#ar-a)"/>
+
+  <rect class="bx-a" x="244" y="86" width="476" height="250" rx="12"/>
+  <text class="ttl on-a" x="260" y="110">Engine（第 13 章）</text>
+  <rect class="bx-g" x="258" y="122" width="448" height="200" rx="10"/>
+  <text class="ttl on-g" x="272" y="144">Host（第 13 章）· HostConfig 部署器（第 18 章）</text>
+  <rect class="bx" x="272" y="156" width="420" height="152" rx="10"/>
+  <text class="ttl" x="286" y="178">Context（第 12 章）· ContextConfig + Digester（第 15 章）</text>
+  <rect class="bx-d" x="286" y="190" width="120" height="44" rx="6"/><text class="sm" x="346" y="208" text-anchor="middle">Pipeline/Valve</text><text class="sm" x="346" y="224" text-anchor="middle">第 5 章</text>
+  <rect class="bx-d" x="414" y="190" width="132" height="44" rx="6"/><text class="sm" x="480" y="208" text-anchor="middle">Lifecycle · Logger</text><text class="sm" x="480" y="224" text-anchor="middle">第 6、7 章</text>
+  <rect class="bx-d" x="554" y="190" width="124" height="44" rx="6"/><text class="sm" x="616" y="208" text-anchor="middle">Loader</text><text class="sm" x="616" y="224" text-anchor="middle">第 8 章</text>
+  <rect class="bx-d" x="286" y="242" width="120" height="44" rx="6"/><text class="sm" x="346" y="260" text-anchor="middle">Manager</text><text class="sm" x="346" y="276" text-anchor="middle">第 9 章</text>
+  <rect class="bx-d" x="414" y="242" width="132" height="44" rx="6"/><text class="sm" x="480" y="260" text-anchor="middle">Realm/认证器</text><text class="sm" x="480" y="276" text-anchor="middle">第 10 章</text>
+  <rect class="bx-g" x="554" y="242" width="124" height="44" rx="6"/><text class="sm" x="616" y="260" text-anchor="middle">Wrapper</text><text class="sm" x="616" y="276" text-anchor="middle">第 11 章</text>
+  <text class="sm" x="482" y="349" text-anchor="middle">管理：Manager Servlet（第 19 章）· JMX（第 20 章）</text>
+</svg>
+<figcaption>图 0-1　Catalina 全景图：每个方框后面都标注了讲解它的章节</figcaption>
+</figure>
+
+<h2 id="toc">章节目录</h2>
+
+<p>原书 20 章可以分为五个部分：先从零写一个 Web 服务器和最简单的 Servlet 容器，再做出 Tomcat 4 的默认连接器，然后逐个讲解容器用到的组件，接着是四种标准容器的实现，最后是启动、部署和管理。</p>
+
+<div id="toc-grid"></div>
+
+<h2 id="how">每一章怎么读</h2>
+
+<p>每一章都按同样的结构组织：</p>
+
+<ol class="steps">
+  <li><strong>原理与原书代码</strong>：用图解释这一章的组件是做什么的、为什么这样设计，并摘录原书和 Tomcat 4/5 的关键源码。</li>
+  <li><strong>Java 17 对照版</strong>：同一功能的现代写法。通常包含两部分——一个和原书类一一对应的「迷你 Catalina」实现（接在前几章的代码上逐步长大），以及用<strong>嵌入式 Tomcat 11</strong> 真实 API 写出的同等程序。</li>
+  <li><strong>运行与验证</strong>：所有输出都来自真实运行，你可以照着命令复现。</li>
+  <li><strong>小结与动手练习</strong>。</li>
+</ol>
+
+<div class="box note">
+  <div class="t">&#9432; 需要什么前置知识</div>
+  <p>会写 Java、知道类和接口、听说过 Servlet 就够了。每章开头都会补充需要的背景知识（HTTP、类加载器、线程交接、XML 解析……）。Java 17 对照代码会顺带介绍用到的新语法：<code>record</code>、<code>var</code>、switch 表达式、模式匹配 <code>instanceof</code>、文本块、<code>java.time</code>、<code>java.util.concurrent</code> 等。</p>
+</div>
+
+<h2 id="java17">运行 Java 17 对照代码</h2>
+
+<p>对照代码位于仓库的 <code>java17/</code> 目录，是一个普通的 Maven 工程，唯一的依赖是 <code>tomcat-embed-core</code>（它自带 jakarta.servlet 6.1 API、Catalina、Digester、JULI、modeler）。</p>
+
+<div class="code" data-lang="bash">
+<pre>
+# 需要 JDK 17 或更高版本、Maven 3.6+
+cd java17
+./run.sh ch01.HttpServer                 # 第 1 章：最简单的 Web 服务器
+./run.sh ch05.startup.Bootstrap2         # 第 5 章：迷你容器（Context + 两个 Wrapper）
+./run.sh ch05.tomcat.EmbeddedBootstrap   # 第 5 章：同样的结构跑在 Tomcat 11 上
+bin/startup.sh &amp;&amp; bin/shutdown.sh        # 第 17 章：用脚本启停整个迷你 Tomcat
+</pre>
+</div>
+
+<div class="tw">
+<table>
+  <tr><th>目录</th><th>内容</th></tr>
+  <tr><td><code>src/main/java/modern/chNN/</code></td><td>第 NN 章的代码；<code>startup/</code> 是启动类，<code>tomcat/</code> 是 Tomcat 11 版本</td></tr>
+  <tr><td><code>src/main/java/modern/common/</code></td><td>各章共用的工具：动态代理外观、Servlet 接口的默认实现等</td></tr>
+  <tr><td><code>webroot/</code></td><td>示例 Servlet 的源码（jakarta 版），由 <code>compile-servlets.sh</code> 编译</td></tr>
+  <tr><td><code>myApp/</code>、<code>webapps/app1/</code></td><td>按标准目录结构组织的 Web 应用（第 8 章起使用）</td></tr>
+  <tr><td><code>conf/</code>、<code>bin/</code>、<code>etc/</code></td><td>server.xml、tomcat-users.xml、启动脚本、Digester 示例 XML</td></tr>
+</table>
+</div>
+
+<h2 id="then-now">二十年间变了什么</h2>
+
+<p>原书基于 J2SE 1.4、Servlet 2.3/2.4 和 Tomcat 4.1/5.0。下表是读这本书时最值得留意的变化，各章正文中还有更详细的说明：</p>
+
+<div class="tw">
+<table>
+  <tr><th>主题</th><th>原书（2004）</th><th>今天（Java 17 / Tomcat 11）</th></tr>
+  <tr><td>Servlet API 包名</td><td><code>javax.servlet</code></td><td><code>jakarta.servlet</code>（Jakarta EE 9 / Tomcat 10 起）</td></tr>
+  <tr><td>连接器线程模型</td><td>阻塞 IO，一个连接一个处理器线程（第 4 章）</td><td>NIO/NIO2；Java 21 可用虚拟线程</td></tr>
+  <tr><td>管道</td><td><code>ValveContext.invokeNext()</code></td><td>阀组成链表，<code>getNext().invoke()</code>（第 5 章）</td></tr>
+  <tr><td>生命周期</td><td>每个组件自己维护 <code>started</code></td><td><code>LifecycleBase</code> + <code>LifecycleState</code> 状态机（第 6 章）</td></tr>
+  <tr><td>日志</td><td><code>Logger</code> / <code>FileLogger</code></td><td>JULI（基于 java.util.logging）（第 7 章）</td></tr>
+  <tr><td>后台任务</td><td>每个组件一个线程</td><td>共享后台线程 → 工具线程池（第 12 章）</td></tr>
+  <tr><td>SingleThreadModel</td><td>容器要维护实例池</td><td>Servlet 6.0 已删除（第 11 章）</td></tr>
+  <tr><td>Mapper / Deployer 接口</td><td>容器级的 Mapper，Host 实现 Deployer</td><td>连接器阶段统一映射；部署逻辑全部在 HostConfig（第 12、18 章）</td></tr>
+  <tr><td>Digester、Modeler</td><td>Commons Digester / Commons Modeler</td><td>并入 Tomcat：<code>org.apache.tomcat.util.digester</code> / <code>.modeler</code>（第 15、20 章）</td></tr>
+  <tr><td>JMX</td><td>需要单独的实现（MX4J）</td><td>JDK 内置，平台 MBean 服务器（第 20 章）</td></tr>
+  <tr><td>安全管理器</td><td>可选的沙箱</td><td>Java 17 废弃，Tomcat 11 已移除支持</td></tr>
+</table>
+</div>
+
+<h2 id="credits">关于本教程</h2>
+
+<p>本教程是对原书的学习笔记与再创作：章节结构、示例程序和讲解主线来自原书；示意图、Java 17 / Tomcat 11 对照代码、「原书之后的变化」以及练习为新增内容。原书配套源码（<code>HowTomcatWorks/</code> 目录）中包含 Tomcat 4.1.12 的源代码，其版权归 Apache 软件基金会所有。建议配合原书一起阅读。</p>
+
+<div class="box tip">
+  <div class="t">&#128161; 推荐的阅读顺序</div>
+  <p>第 1–5 章是基础，务必按顺序读并亲手跑一遍代码；第 6–10 章是容器的各个组件，彼此相对独立；第 11–14 章把组件拼成标准容器；第 15–20 章讲配置、启动、部署和管理。读完第 17 章后，再回头看一遍首页的全景图，你会发现每个方框你都亲手写过一个。</p>
+</div>
+
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

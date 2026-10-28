@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  第 17 章：交给真正的 Tomcat 11 Catalina 类解析的 server.xml（精简版）。
+  ${...} 会被替换成同名的系统属性，由 modern.ch17.tomcat.RealCatalina 设置。
+  Host 上没有写 Context：HostConfig 会自动部署 appBase 下的应用（第 18 章）。
+-->
+<Server port="${demo.shutdownPort}" shutdown="SHUTDOWN">
+  <Service name="Catalina">
+    <Connector port="${demo.port}" address="127.0.0.1" protocol="HTTP/1.1" connectionTimeout="20000"/>
+    <Engine name="Catalina" defaultHost="localhost">
+      <Host name="localhost" appBase="${demo.appBase}" autoDeploy="true" unpackWARs="true"/>
+    </Engine>
+  </Service>
+</Server>

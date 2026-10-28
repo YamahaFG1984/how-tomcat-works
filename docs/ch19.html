@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 19 章 · Manager Servlet — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="19">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 19 章</span>
+<h1>Manager Servlet</h1>
+<p class="lede">
+  Tomcat 自带一个 Manager 应用，可以通过浏览器或 HTTP 请求列出、启动、停止、重载、卸载其他 Web 应用。
+  可是普通的 Servlet 只能看到 Servlet API，凭什么它能操作容器内部？秘密在于一个特殊的接口：
+  <code>ContainerServlet</code>。这一章看 Tomcat 如何「开一扇后门」给受信任的 Servlet，又如何守住这扇门。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>了解 Manager 应用的部署方式、安全约束和可用命令</li>
+    <li>理解 <code>ContainerServlet</code> 接口，以及 StandardWrapper 何时调用 <code>setWrapper</code></li>
+    <li>看懂 ManagerServlet 如何顺着 Wrapper → Context → Host 完成 list、start、stop</li>
+    <li>理解 <code>privileged</code> 属性的意义</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="manager">Manager 应用</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="Manager 应用通过描述符部署在 /manager，受 BASIC 认证保护，ManagerServlet 映射到 /*">
+  <rect class="bx-d" x="20" y="20" width="300" height="100" rx="10"/>
+  <text class="ttl" x="170" y="44" text-anchor="middle">manager.xml（描述符，第 18 章）</text>
+  <text class="mono sm" x="36" y="70">&lt;Context path="/manager"</text>
+  <text class="mono sm" x="52" y="90">docBase="../server/webapps/manager"</text>
+  <text class="mono sm" x="52" y="110">privileged="true"&gt;</text>
+
+  <rect class="bx-d" x="20" y="140" width="300" height="130" rx="10"/>
+  <text class="ttl" x="170" y="164" text-anchor="middle">manager 的 web.xml</text>
+  <text class="mono sm" x="36" y="190">ManagerServlet      → /*</text>
+  <text class="mono sm" x="36" y="210">HTMLManagerServlet  → /html/*</text>
+  <text class="mono sm" x="36" y="234">security-constraint: role manager</text>
+  <text class="mono sm" x="36" y="256">login-config: BASIC</text>
+
+  <rect class="bx-a" x="400" y="20" width="340" height="250" rx="12"/>
+  <text class="ttl on-a" x="570" y="44" text-anchor="middle">StandardContext /manager</text>
+  <rect class="bx-r" x="420" y="60" width="300" height="40" rx="8"/>
+  <text class="sm" x="570" y="85" text-anchor="middle">BasicAuthenticator：需要 manager 角色</text>
+  <rect class="bx-p" x="420" y="116" width="300" height="70" rx="8"/>
+  <text class="ttl on-p" x="570" y="140" text-anchor="middle">ManagerServlet</text>
+  <text class="sm" x="570" y="160" text-anchor="middle">implements ContainerServlet</text>
+  <text class="sm" x="570" y="178" text-anchor="middle">list · start · stop · reload · undeploy …</text>
+  <rect class="bx-g" x="420" y="202" width="300" height="52" rx="8"/>
+  <text class="mono sm" x="570" y="224" text-anchor="middle">wrapper → context → host（Deployer）</text>
+  <text class="sm" x="570" y="242" text-anchor="middle">通过 setWrapper 拿到的「后门」</text>
+  <path class="ln" d="M322 80 H396" marker-end="url(#ar)"/>
+  <path class="ln" d="M322 200 H396" marker-end="url(#ar)"/>
+  <path class="ln-p" d="M570 188 V198" marker-end="url(#ar-p)"/>
+</svg>
+<figcaption>图 19-1　Manager 应用的构成（Tomcat 4）</figcaption>
+</figure>
+
+<p>Manager 应用的文件不在默认的 <code>webapps</code> 目录，而在 <code>%CATALINA_HOME%/server/webapps/manager</code>，靠描述符 <code>manager.xml</code> 部署。它有两个 Servlet：处理纯文本命令的 <code>ManagerServlet</code>（本章重点）和提供网页界面的 <code>HTMLManagerServlet</code>。整个应用受 BASIC 认证保护，只有 <code>manager</code> 角色的用户才能访问，所以要先在 <code>tomcat-users.xml</code> 里加一个用户：</p>
+
+<div class="code" data-lang="xml">
+<pre>
+&lt;tomcat-users&gt;
+  &lt;role rolename="manager"/&gt;
+  &lt;user username="tomcat" password="tomcat" roles="manager"/&gt;
+&lt;/tomcat-users&gt;
+</pre>
+</div>
+
+<div class="tw">
+<table>
+  <tr><th>URL</th><th>作用</th></tr>
+  <tr><td><code>/manager/list</code></td><td>列出所有应用：路径、状态、会话数、docBase</td></tr>
+  <tr><td><code>/manager/start?path=/app1</code></td><td>启动应用</td></tr>
+  <tr><td><code>/manager/stop?path=/app1</code></td><td>停止应用（不能停止 Manager 自己）</td></tr>
+  <tr><td><code>/manager/reload?path=/app1</code></td><td>重载应用</td></tr>
+  <tr><td><code>/manager/remove</code>、<code>/manager/undeploy</code></td><td>移除 / 卸载应用</td></tr>
+  <tr><td><code>/manager/sessions?path=/app1</code></td><td>会话信息</td></tr>
+  <tr><td><code>/manager/resources</code>、<code>/manager/roles</code></td><td>全局 JNDI 资源、安全角色</td></tr>
+</table>
+</div>
+
+<h2 id="containerservlet">ContainerServlet 接口</h2>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/ContainerServlet.java">
+<pre>
+public interface ContainerServlet {
+    public Wrapper getWrapper();
+    public void setWrapper(Wrapper wrapper);
+}
+</pre>
+</div>
+
+<p>实现了它的 Servlet，在加载时会收到代表自己的 StandardWrapper。有了 Wrapper，就能拿到它所在的 Context、Context 所在的 Host（也就是 Deployer），进而操作所有应用。</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="StandardWrapper.loadServlet 判断容器提供的 Servlet，调用 setWrapper，ManagerServlet 顺着父容器拿到 Context 和 Deployer">
+  <rect class="bx-a" x="20" y="20" width="330" height="260" rx="12"/>
+  <text class="ttl on-a" x="185" y="44" text-anchor="middle">StandardWrapper.loadServlet()</text>
+  <rect class="bx" x="40" y="60" width="290" height="40" rx="8"/>
+  <text class="sm" x="185" y="85" text-anchor="middle">isContainerProvidedServlet(类名)?</text>
+  <rect class="bx" x="40" y="110" width="290" height="40" rx="8"/>
+  <text class="sm" x="185" y="128" text-anchor="middle">是：用 Catalina 自己的类加载器</text>
+  <text class="sm" x="185" y="144" text-anchor="middle">（Web 应用加载器看不到容器类）</text>
+  <rect class="bx-p" x="40" y="160" width="290" height="50" rx="8"/>
+  <text class="mono sm" x="185" y="180" text-anchor="middle">if (servlet instanceof ContainerServlet</text>
+  <text class="mono sm" x="185" y="198" text-anchor="middle">  &amp;&amp; …) servlet.setWrapper(this)</text>
+  <rect class="bx" x="40" y="220" width="290" height="40" rx="8"/>
+  <text class="mono sm" x="185" y="245" text-anchor="middle">servlet.init(facade)</text>
+  <path class="ln" d="M185 102 V106"/><path class="ln" d="M185 152 V156"/><path class="ln" d="M185 212 V216"/>
+
+  <rect class="bx-g" x="420" y="20" width="320" height="260" rx="12"/>
+  <text class="ttl on-g" x="580" y="44" text-anchor="middle">ManagerServlet.setWrapper(w)</text>
+  <rect class="bx" x="440" y="64" width="280" height="40" rx="8"/>
+  <text class="mono sm" x="580" y="89" text-anchor="middle">this.wrapper = w</text>
+  <rect class="bx" x="440" y="124" width="280" height="40" rx="8"/>
+  <text class="mono sm" x="580" y="149" text-anchor="middle">context = (Context) w.getParent()</text>
+  <rect class="bx" x="440" y="184" width="280" height="40" rx="8"/>
+  <text class="mono sm" x="580" y="209" text-anchor="middle" style="font-size:10.5px">deployer = (Deployer) context.getParent()</text>
+  <text class="sm" x="580" y="250" text-anchor="middle">StandardHost 实现了 Deployer（第 18 章）</text>
+  <path class="ln" d="M580 106 V120" marker-end="url(#ar)"/>
+  <path class="ln" d="M580 166 V180" marker-end="url(#ar)"/>
+  <path class="ln-p" d="M332 185 H416" marker-end="url(#ar-p)"/>
+</svg>
+<figcaption>图 19-2　ManagerServlet 如何拿到容器内部对象</figcaption>
+</figure>
+
+<div class="code" data-lang="java" data-file="StandardWrapper（节选）">
+<pre>
+// loadServlet() 里
+if ((servlet instanceof ContainerServlet) &amp;&amp; isContainerProvidedServlet(actualClass)) {
+    ((ContainerServlet) servlet).setWrapper(this);
+}
+servlet.init(facade);
+
+// 对应原书 Listing 19.2
+private boolean isContainerProvidedServlet(String classname) {
+    if (classname.startsWith("org.apache.catalina.")) {
+        return (true);
+    }
+    try {
+        Class clazz = this.getClass().getClassLoader().loadClass(classname);
+        return (ContainerServlet.class.isAssignableFrom(clazz));
+    } catch (Throwable t) {
+        return (false);
+    }
+}
+</pre>
+</div>
+
+<div class="code" data-lang="java" data-file="ManagerServlet.setWrapper()">
+<pre>
+public void setWrapper(Wrapper wrapper) {
+    this.wrapper = wrapper;
+    if (wrapper == null) {
+        context = null;
+        deployer = null;
+    } else {
+        context = (Context) wrapper.getParent();
+        deployer = (Deployer) context.getParent();
+    }
+}
+</pre>
+</div>
+
+<h2 id="commands">list、start、stop</h2>
+
+<div class="code" data-lang="java" data-file="ManagerServlet.list()（对应原书 Listing 19.3）">
+<pre>
+protected void list(PrintWriter writer) {
+    writer.println(sm.getString("managerServlet.listed", deployer.getName()));
+    String contextPaths[] = deployer.findDeployedApps();
+    for (int i = 0; i &lt; contextPaths.length; i++) {
+        Context context = deployer.findDeployedApp(contextPaths[i]);
+        String displayPath = contextPaths[i];
+        if (displayPath.equals("")) displayPath = "/";
+        if (context != null) {
+            if (context.getAvailable()) {
+                writer.println(sm.getString("managerServlet.listitem", displayPath, "running",
+                    "" + context.getManager().findSessions().length, context.getDocBase()));
+            } else {
+                writer.println(sm.getString("managerServlet.listitem", displayPath, "stopped",
+                    "0", context.getDocBase()));
+            }
+        }
+    }
+}
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+OK - Listed applications for virtual host localhost
+/admin:stopped:0:../server/webapps/admin
+/app1:running:0:C:\123data\JavaProjects\Pyrmont\webapps\app1
+/manager:running:0:../server/webapps/manager
+</pre>
+</div>
+
+<div class="code" data-lang="java" data-file="ManagerServlet.stop()（对应原书 Listing 19.5，节选）">
+<pre>
+Context context = deployer.findDeployedApp(path);
+if (context == null) {
+    writer.println(sm.getString("managerServlet.noContext", displayPath));
+    return;
+}
+// It isn't possible for the manager to stop itself
+if (context.getPath().equals(this.context.getPath())) {
+    writer.println(sm.getString("managerServlet.noSelf"));
+    return;
+}
+deployer.stop(path);
+writer.println(sm.getString("managerServlet.stopped", displayPath));
+</pre>
+</div>
+
+<div class="box warn">
+  <div class="t">&#9888; 这是一扇后门</div>
+  <p>能拿到 Wrapper 的 Servlet 几乎可以对容器做任何事。如果随便一个应用都能声明自己是 ContainerServlet，后果不堪设想。所以：① Tomcat 4 只给 <code>org.apache.catalina.</code> 包下、或容器类加载器能加载的 Servlet 调用 <code>setWrapper</code>；② Tomcat 5 起还要求所在 Context 设置了 <code>privileged="true"</code>，只有特权应用才能使用容器内部的类。</p>
+</div>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch19/core/</code><code>manager/ManagerServlet.java</code><code>startup/Bootstrap.java</code><code>tomcat/EmbeddedManager.java</code></div>
+
+<p>Java 17 版在第 18 章自动部署的基础上，手动加了一个 privileged 的 <code>/manager</code> 应用，用 BASIC 认证保护（<code>conf/tomcat-users.xml</code> 中的 admin / password），并实现了 list、start、stop、reload、sessions、undeploy 六个命令。</p>
+
+<h3>① 加载容器提供的 Servlet</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch19/core/ContainerServletWrapper.java（节选）">
+<pre>
+private Servlet loadServlet() throws ServletException {
+    String className = getServletClass();
+    boolean privileged = getParent() instanceof StandardContext ctx &amp;&amp; ctx.isPrivileged();
+    ClassLoader loader = isContainerProvidedServlet(className) &amp;&amp; privileged
+            ? getClass().getClassLoader()                  // 容器的类加载器
+            : getLoader().getClassLoader();                // Web 应用的类加载器
+    var servlet = (Servlet) loader.loadClass(className).getDeclaredConstructor().newInstance();
+    if (servlet instanceof ContainerServlet cs) {
+        if (!privileged) {
+            throw new SecurityException("Servlet " + className + " 需要 privileged=\"true\" 的 Context");
+        }
+        cs.setWrapper(this);
+    }
+    servlet.init(new SimpleServletConfig(name));
+    return servlet;
+}
+</pre>
+</div>
+
+<div class="box key">
+  <div class="t">&#128273; 为什么必须换类加载器？</div>
+  <p>第 8 章我们让 Web 应用的类加载器<strong>看不到</strong>容器类。ManagerServlet 却要用 StandardContext、StandardHost 这些容器类——如果由 Web 应用的类加载器加载它，连 <code>ContainerServlet</code> 接口都找不到。所以容器提供的 Servlet 必须用容器自己的类加载器加载：隔离和特权，是同一个机制的两面。</p>
+</div>
+
+<h3>② switch 表达式分派命令</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch19/manager/ManagerServlet.java（节选）">
+<pre>
+String command = request.getPathInfo() == null ? "/list" : request.getPathInfo();   // 映射 /* → pathInfo
+String path = request.getParameter("path");
+switch (command) {
+    case "/list" -&gt; list(writer);
+    case "/start" -&gt; manage(writer, path, "started", StandardContext::start);
+    case "/stop" -&gt; manage(writer, path, "stopped", StandardContext::stop);
+    case "/reload" -&gt; manage(writer, path, "reloaded", StandardContext::reload);
+    case "/sessions" -&gt; sessions(writer, path);
+    case "/undeploy" -&gt; undeploy(writer, path);
+    default -&gt; writer.println("FAIL - Unknown command " + command);
+}
+</pre>
+</div>
+
+<p>start / stop / reload 的检查逻辑完全相同（路径合法、应用存在、不是自己），所以抽成一个 <code>manage(writer, path, done, action)</code>，用方法引用 <code>StandardContext::start</code> 传入不同的动作。同时第 13 章的 Host 阀增加了一项检查：应用被停止后返回 <code>503 Service Unavailable</code>。</p>
+
+<h3>③ Tomcat 11 自带的 ManagerServlet</h3>
+
+<p><code>org.apache.catalina.manager.ManagerServlet</code> 就在 <code>tomcat-embed-core</code> 里，可以直接部署到一个 privileged 的 Context 上：</p>
+
+<div class="code" data-lang="java" data-file="java17/.../ch19/tomcat/EmbeddedManager.java（节选）">
+<pre>
+Context manager = tomcat.addContext("/manager", managerDocBase);
+manager.setPrivileged(true);                       // 没有它，ManagerServlet 拿不到 Wrapper
+Wrapper servlet = Tomcat.addServlet(manager, "Manager", "org.apache.catalina.manager.ManagerServlet");
+manager.addServletMappingDecoded("/text/*", servlet.getName());
+
+constraint.addAuthRole("manager-script");          // 现代 Manager 把角色拆分得更细
+...
+var users = """
+        &lt;tomcat-users&gt;
+          &lt;role rolename="manager-script"/&gt;
+          &lt;user username="script" password="script" roles="manager-script"/&gt;
+        &lt;/tomcat-users&gt;
+        """;                                       // Java 15 文本块
+</pre>
+</div>
+
+<div class="tw">
+<table>
+  <tr><th>Tomcat 4（原书）</th><th>Tomcat 11</th></tr>
+  <tr><td><code>org.apache.catalina.servlets.ManagerServlet</code></td><td><code>org.apache.catalina.manager.ManagerServlet</code></td></tr>
+  <tr><td>命令：<code>/manager/list</code></td><td>文本接口：<code>/manager/text/list</code>；网页：<code>/manager/html</code>；JMX 代理：<code>/manager/jmxproxy</code></td></tr>
+  <tr><td>一个 <code>manager</code> 角色</td><td><code>manager-gui</code>、<code>manager-script</code>、<code>manager-jmx</code>、<code>manager-status</code> 分开授权</td></tr>
+  <tr><td>通过 Deployer 接口操作</td><td>通过 Host、Context 以及 HostConfig 的 JMX 操作</td></tr>
+  <tr><td>—</td><td>默认带 <code>RemoteAddrValve</code>，只允许本机访问；GUI 有 CSRF 防护</td></tr>
+</table>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch19.startup.Bootstrap
+curl -u admin:password http://localhost:8080/manager/list
+curl -u admin:password 'http://localhost:8080/manager/stop?path=/app1'
+curl -u admin:password 'http://localhost:8080/manager/start?path=/app1'
+
+./run.sh ch19.tomcat.EmbeddedManager
+curl -u script:script http://localhost:8080/manager/text/list
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+$ curl -o /dev/null -w '%{http_code}\n' http://localhost:8080/manager/list
+401
+$ curl -u admin:password http://localhost:8080/manager/list
+OK - Listed applications for virtual host localhost
+/app1:running:0:/…/target/ch18-webapps/app1
+/app2:running:0:/…/target/ch18-webapps/app2
+/hello:running:0:/…/java17/myApp
+/manager:running:0:/…/target/manager
+$ curl -u admin:password 'http://localhost:8080/manager/stop?path=/app1'
+OK - Stopped application at context path /app1
+$ curl -o /dev/null -w '%{http_code}\n' http://localhost:8080/app1/Primitive
+503
+$ curl -u admin:password 'http://localhost:8080/manager/stop?path=/manager'
+FAIL - The manager can not reload, undeploy, stop, or start itself
+$ curl -u admin:password 'http://localhost:8080/manager/undeploy?path=/app2'
+OK - Undeployed application at context path /app2
+
+（Tomcat 11）
+$ curl -u script:script http://localhost:8080/manager/text/list
+OK - Listed applications for virtual host [localhost]
+/app1:running:0:/…/java17/webapps/app1
+/manager:running:0:/tmp/manager14813701880226360777
+$ curl -u script:script 'http://localhost:8080/manager/text/stop?path=/app1'
+OK - Stopped application at context path [/app1]
+$ curl -u script:script http://localhost:8080/manager/text/serverinfo
+OK - Server info
+Tomcat Version: [Apache Tomcat/11.0.21]
+</pre>
+</div>
+
+<p>二十年过去，<code>list</code> 命令的输出格式几乎没变：「路径:状态:会话数:docBase」。</p>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>Manager 应用通过描述符部署（<code>privileged="true"</code>），受 BASIC 认证保护，ManagerServlet 提供 list / start / stop / reload / undeploy 等文本命令。</li>
+  <li>实现 <code>ContainerServlet</code> 的 Servlet 在加载时由 StandardWrapper 调用 <code>setWrapper(this)</code>，从而能访问 Context 和 Host（Deployer）。</li>
+  <li>只有容器提供的、在特权应用中的 Servlet 才享有这一能力；它们必须由容器自己的类加载器加载。</li>
+  <li>现代 Manager 拆分了角色、提供了文本 / HTML / JMX 三种接口，并默认只允许本机访问。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>给 Java 17 版的 ManagerServlet 增加 <code>/deploy?path=/app4&amp;war=/绝对路径/x.war</code> 命令（提示：复用第 18 章的解压和 <code>StandardHostDeployer.install</code>）。</li>
+    <li>把 <code>/manager</code> 的 <code>setPrivileged(true)</code> 去掉，观察访问时得到的错误，理解 privileged 的作用。</li>
+    <li>给 Manager 加上 IP 限制：仿照 Tomcat 的 <code>RemoteAddrValve</code> 写一个 lambda 阀，只允许 <code>127.0.0.1</code> 访问。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

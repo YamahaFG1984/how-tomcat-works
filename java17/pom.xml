@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  《How Tomcat Works》配套代码的 Java 17+ 重写版。
+  原书基于 J2SE 1.4 + Tomcat 4.1.12 + javax.servlet 2.3；
+  这里统一换成 Java 17 语法 + jakarta.servlet 6.1 + 嵌入式 Tomcat 11。
+
+  编译：  mvn -q compile
+  运行：  ./run.sh ch01        （等价于 mvn -q exec:java -Dexec.mainClass=modern.ch01.HttpServer）
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>modern.tomcat</groupId>
+  <artifactId>how-tomcat-works-java17</artifactId>
+  <version>1.0</version>
+  <packaging>jar</packaging>
+
+  <properties>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <tomcat.version>11.0.21</tomcat.version>
+  </properties>
+
+  <dependencies>
+    <!-- 嵌入式 Tomcat 11：自带 jakarta.servlet 6.1 API、Catalina 核心、Digester、JULI 日志 -->
+    <dependency>
+      <groupId>org.apache.tomcat.embed</groupId>
+      <artifactId>tomcat-embed-core</artifactId>
+      <version>${tomcat.version}</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+        <configuration>
+          <!-- 不用 -Xlint:all：JDK 21 的 this-escape 检查会对原书 new LifecycleSupport(this) 这类写法报警告 -->
+          <compilerArgs><arg>-Xlint:unchecked,deprecation,removal,rawtypes,cast,fallthrough,finally,overrides,static,try,varargs</arg></compilerArgs>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <version>3.8.1</version>
+      </plugin>
+    </plugins>
+  </build>
+</project>

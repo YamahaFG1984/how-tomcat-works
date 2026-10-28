@@ -1,0 +1,559 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 6 章 · 生命周期 — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="6">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 6 章</span>
+<h1>生命周期</h1>
+<p class="lede">
+  Catalina 由许多组件组成：连接器、容器、载入器、会话管理器、日志记录器……
+  启动时它们都要启动，关闭时都要有机会清理（调用 Servlet 的 <code>destroy</code>、把会话存盘）。
+  <code>Lifecycle</code> 接口让这一切变成「<strong>启动一个，全部启动；停止一个，全部停止</strong>」，
+  同时提供了一套事件机制，让别的组件可以在启动、停止的各个时刻插一脚。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>理解 <code>Lifecycle</code>、<code>LifecycleEvent</code>、<code>LifecycleListener</code> 三个类型</li>
+    <li>看懂 <code>LifecycleSupport</code> 的写时复制技巧</li>
+    <li>理解父组件如何级联启动、停止子组件，以及六个事件的触发时机</li>
+    <li>了解 Tomcat 7 以后的 <code>LifecycleBase</code> 状态机</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="why">一键启停</h2>
+
+<p>Catalina 的设计是：<strong>除了最顶层的一个组件，每个组件都被「托管」给一个父组件</strong>，由父组件负责启动和停止它。这样启动类只需要启动一个组件：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="启动 SimpleContext 后，start 级联传递给载入器、两个 Wrapper 和管道">
+  <rect class="bx-a" x="40" y="20" width="160" height="44" rx="10"/>
+  <text class="mono on-a" x="120" y="47" text-anchor="middle">Bootstrap</text>
+  <path class="ln-a" d="M202 42 H298" marker-end="url(#ar-a)"/>
+  <text class="mono on-a" x="250" y="34" text-anchor="middle">start()</text>
+
+  <rect class="bx-g" x="300" y="16" width="200" height="52" rx="10"/>
+  <text class="ttl on-g" x="400" y="40" text-anchor="middle">SimpleContext</text>
+  <text class="sm" x="400" y="58" text-anchor="middle">唯一需要手动启动的组件</text>
+
+  <rect class="bx-p" x="40" y="150" width="160" height="50" rx="10"/>
+  <text class="mono on-p" x="120" y="172" text-anchor="middle">SimpleLoader</text>
+  <text class="sm" x="120" y="190" text-anchor="middle">① 下属组件</text>
+  <rect class="bx-b" x="230" y="150" width="140" height="50" rx="10"/>
+  <text class="mono on-b" x="300" y="172" text-anchor="middle">Wrapper</text>
+  <text class="sm" x="300" y="190" text-anchor="middle">② Primitive</text>
+  <rect class="bx-b" x="390" y="150" width="140" height="50" rx="10"/>
+  <text class="mono on-b" x="460" y="172" text-anchor="middle">Wrapper</text>
+  <text class="sm" x="460" y="190" text-anchor="middle">② Modern</text>
+  <rect class="bx" x="560" y="150" width="170" height="50" rx="10"/>
+  <text class="mono" x="645" y="172" text-anchor="middle">Pipeline / Valves</text>
+  <text class="sm" x="645" y="190" text-anchor="middle">③ 管道里的阀</text>
+
+  <path class="ln" d="M360 70 L130 146" marker-end="url(#ar)"/>
+  <path class="ln" d="M385 70 L305 146" marker-end="url(#ar)"/>
+  <path class="ln" d="M415 70 L455 146" marker-end="url(#ar)"/>
+  <path class="ln" d="M440 70 L640 146" marker-end="url(#ar)"/>
+  <text class="sm" x="560" y="108">start() 级联</text>
+
+  <rect class="bx-d" x="230" y="226" width="300" height="44" rx="10"/>
+  <text class="sm" x="380" y="244" text-anchor="middle">每个 Wrapper 再启动自己的下属组件……</text>
+  <text class="sm" x="380" y="260" text-anchor="middle">停止时顺序相反：③ → ② → ①</text>
+  <path class="ln-d" d="M300 202 V224"/>
+  <path class="ln-d" d="M460 202 V224"/>
+</svg>
+<figcaption>图 6-1　只启动顶层组件，整棵组件树都会被启动</figcaption>
+</figure>
+
+<h2 id="types">三个核心类型</h2>
+
+<h3>Lifecycle 接口</h3>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/Lifecycle.java（Tomcat 4）">
+<pre>
+public interface Lifecycle {
+    public static final String START_EVENT = "start";
+    public static final String BEFORE_START_EVENT = "before_start";
+    public static final String AFTER_START_EVENT = "after_start";
+    public static final String STOP_EVENT = "stop";
+    public static final String BEFORE_STOP_EVENT = "before_stop";
+    public static final String AFTER_STOP_EVENT = "after_stop";
+
+    public void addLifecycleListener(LifecycleListener listener);
+    public LifecycleListener[] findLifecycleListeners();
+    public void removeLifecycleListener(LifecycleListener listener);
+    public void start() throws LifecycleException;
+    public void stop() throws LifecycleException;
+}
+</pre>
+</div>
+
+<p>最重要的是 <code>start</code> 和 <code>stop</code>；另外三个方法管理监听器；六个常量是六种事件的名字。</p>
+
+<h3>LifecycleEvent 与 LifecycleListener</h3>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/LifecycleEvent.java（节选）">
+<pre>
+public final class LifecycleEvent extends EventObject {
+    public LifecycleEvent(Lifecycle lifecycle, String type, Object data) { ... }
+    public Object getData()        { return this.data; }      // 附加数据，通常为 null
+    public Lifecycle getLifecycle() { return this.lifecycle; } // 事件源
+    public String getType()        { return this.type; }      // "start"、"stop" ……
+}
+
+public interface LifecycleListener {
+    public void lifecycleEvent(LifecycleEvent event);
+}
+</pre>
+</div>
+
+<h3>六个事件的时间线</h3>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="start 与 stop 过程中六个事件的触发顺序">
+  <text class="ttl on-g" x="20" y="28">start()</text>
+  <rect class="bx-g" x="90" y="12" width="120" height="30" rx="6"/><text class="mono" x="150" y="32" text-anchor="middle">before_start</text>
+  <rect class="bx" x="220" y="12" width="250" height="30" rx="6"/><text class="sm" x="345" y="32" text-anchor="middle">started = true，启动载入器、子容器、管道</text>
+  <rect class="bx-g" x="480" y="12" width="90" height="30" rx="6"/><text class="mono" x="525" y="32" text-anchor="middle">start</text>
+  <rect class="bx-g" x="580" y="12" width="120" height="30" rx="6"/><text class="mono" x="640" y="32" text-anchor="middle">after_start</text>
+  <path class="ln" d="M90 56 H700" marker-end="url(#ar)"/>
+
+  <text class="ttl on-r" x="20" y="110">stop()</text>
+  <rect class="bx-r" x="90" y="94" width="120" height="30" rx="6"/><text class="mono" x="150" y="114" text-anchor="middle">before_stop</text>
+  <rect class="bx-r" x="220" y="94" width="80" height="30" rx="6"/><text class="mono" x="260" y="114" text-anchor="middle">stop</text>
+  <rect class="bx" x="310" y="94" width="260" height="30" rx="6"/><text class="sm" x="440" y="114" text-anchor="middle">started = false，停止管道、子容器、载入器</text>
+  <rect class="bx-r" x="580" y="94" width="120" height="30" rx="6"/><text class="mono" x="640" y="114" text-anchor="middle">after_stop</text>
+  <path class="ln" d="M90 138 H700" marker-end="url(#ar)"/>
+
+  <text class="sm" x="380" y="178" text-anchor="middle">监听器根据 event.getType() 判断是哪个时刻，决定做什么</text>
+  <text class="sm" x="380" y="198" text-anchor="middle">例：第 15 章的 ContextConfig 就是 Context 的一个监听器，它在 start 事件时读取 web.xml 配置 Context</text>
+  <text class="sm" x="380" y="218" text-anchor="middle">注意 stop 事件在停止子组件「之前」就发出了</text>
+</svg>
+<figcaption>图 6-2　六个事件的触发时机</figcaption>
+</figure>
+
+<h2 id="support">LifecycleSupport：写时复制</h2>
+
+<p>每个实现 Lifecycle 的组件都要自己存监听器、实现三个监听器方法、遍历调用——这些重复代码被抽到了工具类 <code>org.apache.catalina.util.LifecycleSupport</code> 里。它的实现很有意思：</p>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/util/LifecycleSupport.java（节选）">
+<pre>
+private LifecycleListener listeners[] = new LifecycleListener[0];
+
+public void addLifecycleListener(LifecycleListener listener) {
+    synchronized (listeners) {
+        LifecycleListener results[] = new LifecycleListener[listeners.length + 1];
+        for (int i = 0; i &lt; listeners.length; i++)
+            results[i] = listeners[i];
+        results[listeners.length] = listener;
+        listeners = results;                     // 换成新数组
+    }
+}
+
+public void fireLifecycleEvent(String type, Object data) {
+    LifecycleEvent event = new LifecycleEvent(lifecycle, type, data);
+    LifecycleListener interested[] = null;
+    synchronized (listeners) {
+        interested = (LifecycleListener[]) listeners.clone();   // 先拍快照
+    }
+    for (int i = 0; i &lt; interested.length; i++)
+        interested[i].lifecycleEvent(event);                    // 在快照上遍历
+}
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="写时复制：添加监听器时创建新数组，遍历的线程仍然读旧数组">
+  <text class="ttl" x="20" y="24">添加监听器 C 之前</text>
+  <rect class="bx-b" x="20" y="36" width="60" height="34" rx="4"/><text class="mono" x="50" y="58" text-anchor="middle">A</text>
+  <rect class="bx-b" x="84" y="36" width="60" height="34" rx="4"/><text class="mono" x="114" y="58" text-anchor="middle">B</text>
+  <text class="sm" x="160" y="58">← listeners</text>
+
+  <text class="ttl" x="300" y="24">add(C)：复制出新数组，再整体替换引用</text>
+  <rect class="bx-d" x="300" y="36" width="60" height="34" rx="4"/><text class="mono" x="330" y="58" text-anchor="middle">A</text>
+  <rect class="bx-d" x="364" y="36" width="60" height="34" rx="4"/><text class="mono" x="394" y="58" text-anchor="middle">B</text>
+  <text class="sm" x="440" y="58">旧数组：正在遍历的线程继续读它</text>
+  <rect class="bx-g" x="300" y="90" width="60" height="34" rx="4"/><text class="mono" x="330" y="112" text-anchor="middle">A</text>
+  <rect class="bx-g" x="364" y="90" width="60" height="34" rx="4"/><text class="mono" x="394" y="112" text-anchor="middle">B</text>
+  <rect class="bx-a" x="428" y="90" width="60" height="34" rx="4"/><text class="mono" x="458" y="112" text-anchor="middle">C</text>
+  <text class="sm" x="500" y="112">← listeners（新）</text>
+
+  <text class="sm" x="380" y="160" text-anchor="middle">写操作很少（启动时注册几个监听器），读操作（发布事件）相对频繁 → 用复制换取无锁遍历</text>
+  <text class="sm" x="380" y="182" text-anchor="middle">这正是 JDK 5 引入的 java.util.concurrent.CopyOnWriteArrayList 的原理</text>
+</svg>
+<figcaption>图 6-3　LifecycleSupport 的写时复制</figcaption>
+</figure>
+
+<p>组件只需持有一个 LifecycleSupport 并把调用转发给它：</p>
+
+<div class="code" data-lang="java">
+<pre>
+protected LifecycleSupport lifecycle = new LifecycleSupport(this);
+
+public void addLifecycleListener(LifecycleListener listener) {
+    lifecycle.addLifecycleListener(listener);
+}
+...
+lifecycle.fireLifecycleEvent(START_EVENT, null);
+</pre>
+</div>
+
+<h2 id="app">本章应用</h2>
+
+<p>应用基于第 5 章的 Context 应用（为简化去掉了两个日志阀）。<code>SimpleContext</code>、<code>SimpleWrapper</code>、<code>SimpleLoader</code>、<code>SimplePipeline</code> 都实现了 Lifecycle，另外新增一个监听器 <code>SimpleContextLifecycleListener</code>。</p>
+
+<h3>SimpleContext.start / stop</h3>
+
+<div class="code" data-lang="java" data-file="ex06/pyrmont/core/SimpleContext.java（节选）">
+<pre>
+public synchronized void start() throws LifecycleException {
+    if (started)
+        throw new LifecycleException("SimpleContext has already started");
+    lifecycle.fireLifecycleEvent(BEFORE_START_EVENT, null);
+    started = true;
+    try {
+        if ((loader != null) &amp;&amp; (loader instanceof Lifecycle))
+            ((Lifecycle) loader).start();                  // ① 载入器
+        Container children[] = findChildren();
+        for (int i = 0; i &lt; children.length; i++) {
+            if (children[i] instanceof Lifecycle)
+                ((Lifecycle) children[i]).start();         // ② 子容器
+        }
+        if (pipeline instanceof Lifecycle)
+            ((Lifecycle) pipeline).start();                // ③ 管道
+        lifecycle.fireLifecycleEvent(START_EVENT, null);
+    } catch (Exception e) {
+        e.printStackTrace();
+    }
+    lifecycle.fireLifecycleEvent(AFTER_START_EVENT, null);
+}
+
+public void stop() throws LifecycleException {
+    if (!started)
+        throw new LifecycleException("SimpleContext has not been started");
+    lifecycle.fireLifecycleEvent(BEFORE_STOP_EVENT, null);
+    lifecycle.fireLifecycleEvent(STOP_EVENT, null);
+    started = false;
+    // 按相反顺序停止：管道 → 子容器 → 载入器
+    ...
+    lifecycle.fireLifecycleEvent(AFTER_STOP_EVENT, null);
+}
+</pre>
+</div>
+
+<h3>SimpleWrapper.stop：Servlet 的最后一程</h3>
+
+<p>Wrapper 停止时最重要的一件事是调用 Servlet 的 <code>destroy()</code>——第 2 章讲的 Servlet 生命周期，终于在这里完整了：</p>
+
+<div class="code" data-lang="java" data-file="ex06/pyrmont/core/SimpleWrapper.java（节选）">
+<pre>
+public void stop() throws LifecycleException {
+    System.out.println("Stopping wrapper " + name);
+    try {
+        instance.destroy();          // Servlet 生命周期的最后一步
+    } catch (Throwable t) {
+    }
+    instance = null;
+    if (!started)
+        throw new LifecycleException("Wrapper " + name + " not started");
+    lifecycle.fireLifecycleEvent(BEFORE_STOP_EVENT, null);
+    lifecycle.fireLifecycleEvent(STOP_EVENT, null);
+    started = false;
+    ...
+    lifecycle.fireLifecycleEvent(AFTER_STOP_EVENT, null);
+}
+</pre>
+</div>
+
+<h3>监听器与启动类</h3>
+
+<div class="code" data-lang="java" data-file="ex06/pyrmont/core/SimpleContextLifecycleListener.java">
+<pre>
+public class SimpleContextLifecycleListener implements LifecycleListener {
+    public void lifecycleEvent(LifecycleEvent event) {
+        Lifecycle lifecycle = event.getLifecycle();
+        System.out.println("SimpleContextLifecycleListener's event " + event.getType().toString());
+        if (Lifecycle.START_EVENT.equals(event.getType())) {
+            System.out.println("Starting context.");
+        } else if (Lifecycle.STOP_EVENT.equals(event.getType())) {
+            System.out.println("Stopping context.");
+        }
+    }
+}
+</pre>
+</div>
+
+<div class="code" data-lang="java" data-file="ex06/pyrmont/startup/Bootstrap.java（节选）">
+<pre>
+LifecycleListener listener = new SimpleContextLifecycleListener();
+((Lifecycle) context).addLifecycleListener(listener);
+...
+connector.setContainer(context);
+connector.initialize();
+((Lifecycle) connector).start();
+((Lifecycle) context).start();       // 只启动 Context
+
+System.in.read();                    // 按回车
+((Lifecycle) context).stop();        // 只停止 Context
+</pre>
+</div>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch06/core/</code><code>startup/Bootstrap.java</code><code>tomcat/EmbeddedLifecycle.java</code></div>
+
+<p>Java 17 版的 <code>SimpleContext</code> / <code>SimpleWrapper</code> 直接<strong>继承</strong>第 5 章的同名类，只增加生命周期相关代码，体现了「本章在上一章基础上加功能」的关系。</p>
+
+<h3>① 字符串常量 → 枚举，事件类 → record</h3>
+
+<div class="vs">
+  <div class="old"><div class="h">原书</div>
+<div class="code" data-lang="java">
+<pre>
+public static final String START_EVENT = "start";
+...
+public final class LifecycleEvent extends EventObject {
+    private Object data;
+    private Lifecycle lifecycle;
+    private String type;
+    // 构造器 + 3 个 getter
+}
+if (Lifecycle.START_EVENT.equals(event.getType())) ...
+</pre>
+</div>
+  </div>
+  <div class="new"><div class="h">Java 17</div>
+<div class="code" data-lang="java">
+<pre>
+public record LifecycleEvent(Lifecycle lifecycle,
+                             Type type, Object data) {
+    public enum Type {
+        BEFORE_START, START, AFTER_START,
+        BEFORE_STOP, STOP, AFTER_STOP
+    }
+}
+switch (event.type()) {          // 拼错事件名会编译失败
+    case START -&gt; System.out.println("Starting context.");
+    case STOP  -&gt; System.out.println("Stopping context.");
+    default -&gt; { }
+}
+</pre>
+</div>
+  </div>
+</div>
+
+<h3>② 手写写时复制 → CopyOnWriteArrayList</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch06/core/LifecycleSupport.java（节选）">
+<pre>
+private final List&lt;LifecycleListener&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();
+
+public void addLifecycleListener(LifecycleListener listener) {
+    listeners.add(listener);                 // 内部就是「复制新数组 + 替换引用」
+}
+
+public void fireLifecycleEvent(LifecycleEvent.Type type, Object data) {
+    var event = new LifecycleEvent(lifecycle, type, data);
+    for (LifecycleListener listener : listeners) {    // 迭代器天然遍历快照
+        listener.lifecycleEvent(event);
+    }
+}
+</pre>
+</div>
+
+<h3>③ 消灭重复的 instanceof + 强转</h3>
+
+<div class="vs">
+  <div class="old"><div class="h">原书</div>
+<div class="code" data-lang="java">
+<pre>
+if ((loader != null) &amp;&amp; (loader instanceof Lifecycle))
+    ((Lifecycle) loader).start();
+Container children[] = findChildren();
+for (int i = 0; i &lt; children.length; i++) {
+    if (children[i] instanceof Lifecycle)
+        ((Lifecycle) children[i]).start();
+}
+</pre>
+</div>
+  </div>
+  <div class="new"><div class="h">Java 17</div>
+<div class="code" data-lang="java">
+<pre>
+// Lifecycle 接口里的静态工具方法
+static void start(Object component) throws LifecycleException {
+    if (component instanceof Lifecycle lifecycle) {
+        lifecycle.start();
+    }
+}
+
+Lifecycle.start(loader);
+for (Container child : findChildren()) {
+    Lifecycle.start(child);
+}
+</pre>
+</div>
+  </div>
+</div>
+
+<p>此外，<code>LifecycleListener</code> 是函数式接口，启动类里直接用 lambda 注册了第二个监听器：</p>
+
+<div class="code" data-lang="java">
+<pre>
+context.addLifecycleListener(new SimpleContextLifecycleListener());
+context.addLifecycleListener(event -&gt; System.out.println("  (lambda 监听器收到 " + event.type() + ")"));
+</pre>
+</div>
+
+<h3>④ 现代 Tomcat：LifecycleBase 状态机</h3>
+
+<p>原书中每个组件都要自己维护 <code>started</code> 布尔值、自己检查重复启动、自己按顺序发三个事件——同样的代码到处复制。Tomcat 7 把它重构成了模板方法 + 状态机：抽象类 <code>LifecycleBase</code> 实现 <code>init/start/stop/destroy</code>，负责状态检查和发事件，子类只需实现 <code>initInternal/startInternal/stopInternal/destroyInternal</code>。</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="Tomcat 7 之后的 LifecycleState 状态机">
+  <rect class="bx" x="20" y="30" width="80" height="34" rx="17"/><text class="mono sm" x="60" y="52" text-anchor="middle">NEW</text>
+  <rect class="bx-p" x="120" y="30" width="120" height="34" rx="17"/><text class="mono sm" x="180" y="52" text-anchor="middle">INITIALIZING</text>
+  <rect class="bx-p" x="260" y="30" width="120" height="34" rx="17"/><text class="mono sm" x="320" y="52" text-anchor="middle">INITIALIZED</text>
+  <rect class="bx-g" x="400" y="30" width="130" height="34" rx="17"/><text class="mono sm" x="465" y="52" text-anchor="middle">STARTING_PREP</text>
+  <rect class="bx-g" x="550" y="30" width="90" height="34" rx="17"/><text class="mono sm" x="595" y="52" text-anchor="middle">STARTING</text>
+  <rect class="bx-a" x="660" y="30" width="80" height="34" rx="17"/><text class="mono sm on-a" x="700" y="52" text-anchor="middle">STARTED</text>
+  <path class="ln" d="M102 47 H116" marker-end="url(#ar)"/>
+  <path class="ln" d="M242 47 H256" marker-end="url(#ar)"/>
+  <path class="ln" d="M382 47 H396" marker-end="url(#ar)"/>
+  <path class="ln" d="M532 47 H546" marker-end="url(#ar)"/>
+  <path class="ln" d="M642 47 H656" marker-end="url(#ar)"/>
+  <text class="sm" x="180" y="84" text-anchor="middle">init()</text>
+  <text class="sm" x="530" y="84" text-anchor="middle">start()</text>
+
+  <rect class="bx-r" x="590" y="120" width="150" height="34" rx="17"/><text class="mono sm" x="665" y="142" text-anchor="middle">STOPPING_PREP</text>
+  <rect class="bx-r" x="460" y="120" width="110" height="34" rx="17"/><text class="mono sm" x="515" y="142" text-anchor="middle">STOPPING</text>
+  <rect class="bx-r" x="340" y="120" width="100" height="34" rx="17"/><text class="mono sm" x="390" y="142" text-anchor="middle">STOPPED</text>
+  <rect class="bx-d" x="190" y="120" width="130" height="34" rx="17"/><text class="mono sm" x="255" y="142" text-anchor="middle">DESTROYING</text>
+  <rect class="bx-d" x="50" y="120" width="120" height="34" rx="17"/><text class="mono sm" x="110" y="142" text-anchor="middle">DESTROYED</text>
+  <path class="ln" d="M700 66 V116" marker-end="url(#ar)"/>
+  <text class="sm" x="708" y="96">stop()</text>
+  <path class="ln" d="M588 137 H574" marker-end="url(#ar)"/>
+  <path class="ln" d="M458 137 H444" marker-end="url(#ar)"/>
+  <path class="ln" d="M338 137 H324" marker-end="url(#ar)"/>
+  <path class="ln" d="M188 137 H174" marker-end="url(#ar)"/>
+  <text class="sm" x="255" y="174" text-anchor="middle">destroy()</text>
+  <path class="ln-d" d="M390 156 C390 200 465 200 465 68" marker-end="url(#ar)"/>
+  <text class="sm" x="440" y="206" text-anchor="middle">STOPPED 后可以再 start()</text>
+
+  <rect class="bx-r" x="560" y="200" width="100" height="34" rx="17"/><text class="mono sm on-r" x="610" y="222" text-anchor="middle">FAILED</text>
+  <text class="sm" x="560" y="250">任何一步抛异常都会进入 FAILED</text>
+</svg>
+<figcaption>图 6-4　Tomcat 7+ 的组件状态机（org.apache.catalina.LifecycleState）</figcaption>
+</figure>
+
+<p><code>EmbeddedLifecycle</code> 给 Tomcat 11 的 Context 注册了一个监听器，启动、停止、销毁整个服务器，打印 Context 收到的事件和状态。你会看到新增的 <code>before_init</code>/<code>after_init</code>、<code>configure_start</code>/<code>configure_stop</code>、<code>before_destroy</code>/<code>after_destroy</code> 等事件：</p>
+
+<div class="code" data-lang="java" data-file="java17/.../ch06/tomcat/EmbeddedLifecycle.java（节选）">
+<pre>
+Context context = tomcat.addContext("", null);
+context.addLifecycleListener((LifecycleEvent event) -&gt; {
+    if (!Lifecycle.PERIODIC_EVENT.equals(event.getType())) {     // 过滤掉后台线程的周期事件（第 12 章）
+        System.out.printf("  %-22s state=%s%n", event.getType(), event.getLifecycle().getState());
+    }
+});
+tomcat.start();
+tomcat.stop();
+tomcat.destroy();
+</pre>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch06.startup.Bootstrap          # 迷你容器：访问 /Primitive 后按回车停止
+./run.sh ch06.tomcat.EmbeddedLifecycle   # Tomcat 11 的生命周期事件
+</pre>
+</div>
+
+<div class="vs">
+  <div class="old"><div class="h">迷你容器（Bootstrap）</div>
+<div class="code" data-lang="out">
+<pre>
+SimpleContextLifecycleListener's event before_start
+  (lambda 监听器收到 before_start)
+Starting SimpleLoader
+Starting Wrapper Primitive
+Starting Wrapper Modern
+SimpleContextLifecycleListener's event start
+Starting context.
+SimpleContextLifecycleListener's event after_start
+init                ← 访问 /Primitive
+from service
+（按回车）
+SimpleContextLifecycleListener's event before_stop
+SimpleContextLifecycleListener's event stop
+Stopping context.
+Stopping wrapper Primitive
+destroy             ← Servlet.destroy()
+Stopping wrapper Modern
+Stopping SimpleLoader
+SimpleContextLifecycleListener's event after_stop
+</pre>
+</div>
+  </div>
+  <div class="new"><div class="h">Tomcat 11（EmbeddedLifecycle）</div>
+<div class="code" data-lang="out">
+<pre>
+== tomcat.start()
+  before_init            state=INITIALIZING
+  after_init             state=INITIALIZED
+  before_start           state=STARTING_PREP
+  configure_start        state=STARTING_PREP
+  start                  state=STARTING
+  after_start            state=STARTED
+== tomcat.stop()
+  before_stop            state=STOPPING_PREP
+  stop                   state=STOPPING
+  configure_stop         state=STOPPING
+  after_stop             state=STOPPED
+== tomcat.destroy()
+  before_destroy         state=DESTROYING
+  after_destroy          state=DESTROYED
+</pre>
+</div>
+  </div>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li><code>Lifecycle</code> 让父组件统一启停子组件，启动类只需启停最顶层的一个组件。</li>
+  <li>启动时依次触发 <code>before_start → start → after_start</code>，停止时 <code>before_stop → stop → after_stop</code>；停止顺序与启动顺序相反。</li>
+  <li><code>LifecycleSupport</code> 用写时复制数组保存监听器，等价于 <code>CopyOnWriteArrayList</code>。</li>
+  <li>Wrapper 停止时调用 <code>Servlet.destroy()</code>，Servlet 生命周期至此完整。</li>
+  <li>Tomcat 7+ 用 <code>LifecycleBase</code> + <code>LifecycleState</code> 状态机消除了各组件中的重复代码，并增加了 init/destroy 阶段。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>在 Java 17 版里连续调用两次 <code>context.start()</code>，观察抛出的异常。</li>
+    <li>写一个监听器，在 <code>AFTER_START</code> 时调用所有 Wrapper 的 <code>allocate()</code>，实现「启动时预加载 Servlet」（这就是 web.xml 里 <code>load-on-startup</code> 的效果）。</li>
+    <li>在监听器回调里调用 <code>removeLifecycleListener(this)</code> 注销自己。把 <code>CopyOnWriteArrayList</code> 换成 <code>ArrayList</code> 再试一次，解释为什么会抛 <code>ConcurrentModificationException</code>。</li>
+    <li>仿照 Tomcat 的 <code>LifecycleBase</code>，写一个抽象类：用一个 <code>LifecycleState</code> 枚举代替 <code>started</code> 布尔值，<code>start()</code> 负责状态检查和发事件，子类只实现 <code>startInternal()</code>。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

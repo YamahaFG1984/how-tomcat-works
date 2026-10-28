@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 16 章 · 关闭钩子 — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="16">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 16 章</span>
+<h1>关闭钩子</h1>
+<p class="lede">
+  第 14 章的关闭端口很优雅——前提是用户愿意配合，乖乖发送 <code>SHUTDOWN</code> 命令。
+  可现实中的用户会直接关掉控制台、按 Ctrl+C、或者由运维脚本 <code>kill</code> 进程。
+  Java 的<strong>关闭钩子（shutdown hook）</strong>保证：无论 JVM 因为什么正常地退出，你的清理代码都有机会执行。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>知道 JVM 在哪些情况下会关闭，以及关闭时的两个阶段</li>
+    <li>会写、会注册关闭钩子，并理解它的局限</li>
+    <li>理解 Tomcat 的 <code>CatalinaShutdownHook</code> 以及它和关闭端口的配合</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="when">JVM 什么时候关闭</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="JVM 正常退出和被用户中断两类事件都会触发关闭钩子，kill -9 不会">
+  <rect class="bx-g" x="20" y="20" width="250" height="90" rx="12"/>
+  <text class="ttl on-g" x="145" y="44" text-anchor="middle">正常退出</text>
+  <text class="sm" x="145" y="68" text-anchor="middle">调用 System.exit()</text>
+  <text class="sm" x="145" y="88" text-anchor="middle">最后一个非守护线程结束</text>
+
+  <rect class="bx-a" x="20" y="130" width="250" height="90" rx="12"/>
+  <text class="ttl on-a" x="145" y="154" text-anchor="middle">被用户强行终止</text>
+  <text class="sm" x="145" y="178" text-anchor="middle">Ctrl+C（SIGINT）、kill（SIGTERM）</text>
+  <text class="sm" x="145" y="198" text-anchor="middle">注销登录、关闭终端（SIGHUP）</text>
+
+  <rect class="bx-b" x="340" y="70" width="210" height="100" rx="12"/>
+  <text class="ttl on-b" x="445" y="96" text-anchor="middle">① 启动所有关闭钩子</text>
+  <text class="sm" x="445" y="120" text-anchor="middle">钩子是事先注册的 Thread</text>
+  <text class="sm" x="445" y="140" text-anchor="middle">并发运行，等全部结束</text>
+  <rect class="bx" x="580" y="70" width="160" height="100" rx="12"/>
+  <text class="ttl" x="660" y="96" text-anchor="middle">② 运行终结器</text>
+  <text class="sm" x="660" y="120" text-anchor="middle">（原书时代的第二阶段）</text>
+  <text class="sm" x="660" y="140" text-anchor="middle">然后 JVM 退出</text>
+  <path class="ln-g" d="M272 65 L336 105" marker-end="url(#ar-g)"/>
+  <path class="ln-a" d="M272 175 L336 140" marker-end="url(#ar-a)"/>
+  <path class="ln" d="M552 120 H576" marker-end="url(#ar)"/>
+
+  <rect class="bx-r" x="20" y="240" width="720" height="38" rx="8"/>
+  <text class="sm on-r" x="380" y="264" text-anchor="middle">不会触发钩子：kill -9（SIGKILL）、JVM 崩溃、断电——操作系统直接收回进程，Java 来不及做任何事</text>
+</svg>
+<figcaption>图 16-1　两类关闭事件与关闭的两个阶段</figcaption>
+</figure>
+
+<h2 id="hook">写一个关闭钩子</h2>
+
+<p>关闭钩子就是一个 <code>Thread</code> 子类的实例。步骤：</p>
+<ol class="steps">
+  <li>写一个继承 <code>Thread</code> 的类，在 <code>run()</code> 里写清理代码；</li>
+  <li>创建它的实例；</li>
+  <li>调用 <code>Runtime.getRuntime().addShutdownHook(hook)</code> 注册。</li>
+</ol>
+<p>注意：你<strong>不需要</strong>（也不能）自己调用它的 <code>start()</code>，JVM 关闭时会替你启动它。</p>
+
+<div class="code" data-lang="java" data-file="ex16/pyrmont/shutdownhook/ShutdownHookDemo.java（原书）">
+<pre>
+public class ShutdownHookDemo {
+    public void start() {
+        System.out.println("Demo");
+        ShutdownHook shutdownHook = new ShutdownHook();
+        Runtime.getRuntime().addShutdownHook(shutdownHook);
+    }
+    public static void main(String[] args) {
+        ShutdownHookDemo demo = new ShutdownHookDemo();
+        demo.start();
+        try {
+            System.in.read();          // 按回车退出，退出时打印 "Shutting down"
+        } catch (Exception e) {
+        }
+    }
+}
+
+class ShutdownHook extends Thread {
+    public void run() {
+        System.out.println("Shutting down");
+    }
+}
+</pre>
+</div>
+
+<h3>一个更实际的例子：删除临时文件</h3>
+
+<p>原书用一个 Swing 程序演示：启动时创建 <code>temp.txt</code>，退出时删除。如果用户点「Exit」按钮，<code>shutdown()</code> 会被调用；但如果点窗口右上角的 ×，或者从任务管理器结束进程，文件就留下了。解决办法是把 <code>shutdown()</code> 放进关闭钩子：</p>
+
+<div class="code" data-lang="java" data-file="ex16/pyrmont/shutdownhook/MySwingAppWithShutdownHook.java（节选）">
+<pre>
+private void initialize() {
+    MyShutdownHook shutdownHook = new MyShutdownHook();      // 内部类，可以调用外部类的 shutdown()
+    Runtime.getRuntime().addShutdownHook(shutdownHook);
+    File file = new File(dir, filename);
+    System.out.println("Creating temporary file");
+    file.createNewFile();
+}
+
+private class MyShutdownHook extends Thread {
+    public void run() {
+        shutdown();                                           // 删除 temp.txt
+    }
+}
+</pre>
+</div>
+
+<h2 id="tomcat">Tomcat 的关闭钩子</h2>
+
+<p><code>org.apache.catalina.startup.Catalina</code>（第 17 章）在启动 Server 时注册了一个关闭钩子：</p>
+
+<div class="code" data-lang="java" data-file="Catalina.CatalinaShutdownHook（对应原书 Listing 16.4）">
+<pre>
+protected class CatalinaShutdownHook extends Thread {
+    public void run() {
+        if (server != null) {
+            try {
+                ((Lifecycle) server).stop();       // 和收到 SHUTDOWN 命令后做的事一样
+            } catch (LifecycleException e) {
+                System.out.println("Catalina.stop: " + e);
+                ...
+            }
+        }
+    }
+}
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="两条关闭路径：关闭端口正常关闭时移除钩子后 stop；信号关闭时由钩子 stop">
+  <rect class="bx-a" x="280" y="16" width="200" height="40" rx="8"/>
+  <text class="mono sm" x="380" y="41" text-anchor="middle">server.start() + 注册钩子</text>
+
+  <rect class="bx-b" x="40" y="100" width="280" height="56" rx="10"/>
+  <text class="ttl on-b" x="180" y="122" text-anchor="middle">路径 A：shutdown.sh / Stopper</text>
+  <text class="sm" x="180" y="142" text-anchor="middle">await() 返回 → removeShutdownHook</text>
+  <rect class="bx-r" x="440" y="100" width="280" height="56" rx="10"/>
+  <text class="ttl on-r" x="580" y="122" text-anchor="middle">路径 B：Ctrl+C / kill</text>
+  <text class="sm" x="580" y="142" text-anchor="middle">await() 永远不会返回，JVM 启动钩子</text>
+  <path class="ln" d="M330 58 L200 96" marker-end="url(#ar)"/>
+  <path class="ln" d="M430 58 L560 96" marker-end="url(#ar)"/>
+
+  <rect class="bx-g" x="280" y="196" width="200" height="44" rx="10"/>
+  <text class="mono" x="380" y="223" text-anchor="middle">server.stop()</text>
+  <path class="ln-b" d="M180 158 L330 192" marker-end="url(#ar-b)"/>
+  <path class="ln-r" d="M580 158 L430 192" marker-end="url(#ar-r)"/>
+  <text class="sm" x="380" y="186" text-anchor="middle">两条路殊途同归，且 stop() 只执行一次</text>
+</svg>
+<figcaption>图 16-2　关闭端口和关闭钩子：两条路径都通向 server.stop()</figcaption>
+</figure>
+
+<div class="box warn">
+  <div class="t">&#9888; 关闭钩子的局限</div>
+  <ul>
+    <li><strong>要快</strong>：操作系统关机、容器编排系统（如 Kubernetes 默认 30 秒）发出 SIGTERM 后只会等一段时间，超时就发 SIGKILL。</li>
+    <li><strong>并发执行、顺序不定</strong>：多个钩子同时运行，不要依赖彼此的先后，也要小心死锁。</li>
+    <li><strong>不能再注册钩子</strong>，也不要调用 <code>System.exit()</code>（会永久阻塞）。</li>
+    <li>日志系统可能已经被别的钩子关掉了——Tomcat 的 JULI 专门做了处理：它的 <code>ClassLoaderLogManager</code> 会等 Catalina 的钩子跑完再关闭日志。</li>
+  </ul>
+</div>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch16/shutdownhook/</code><code>startup/Bootstrap.java</code><code>tomcat/EmbeddedShutdownHook.java</code></div>
+
+<h3>① lambda 代替 Thread 子类</h3>
+
+<div class="vs">
+  <div class="old"><div class="h">原书</div>
+<div class="code" data-lang="java">
+<pre>
+class ShutdownHook extends Thread {
+    public void run() {
+        System.out.println("Shutting down");
+    }
+}
+...
+Runtime.getRuntime().addShutdownHook(
+    new ShutdownHook());
+</pre>
+</div>
+  </div>
+  <div class="new"><div class="h">Java 17</div>
+<div class="code" data-lang="java">
+<pre>
+Runtime.getRuntime().addShutdownHook(
+    new Thread(() -&gt; System.out.println("Shutting down"),
+               "demo-hook"));          // 给线程起个名字，方便排查
+</pre>
+</div>
+  </div>
+</div>
+
+<h3>② 控制台版的临时文件程序</h3>
+
+<p>Swing 程序在没有图形界面的服务器上跑不起来，Java 17 版改成了控制台程序，并用 <code>ProcessHandle.current().pid()</code>（Java 9）打印进程号，方便用 <code>kill</code> 测试：</p>
+
+<div class="code" data-lang="java" data-file="java17/.../ch16/shutdownhook/TempFileApp.java（节选）">
+<pre>
+private static final Path TEMP = Path.of(System.getProperty("user.dir"), "temp.txt");
+
+public static void main(String[] args) throws IOException {
+    Runtime.getRuntime().addShutdownHook(new Thread(TempFileApp::shutdown, "cleanup-hook"));
+    Files.writeString(TEMP, "pid=" + ProcessHandle.current().pid());    // Java 11 writeString
+    System.out.println("按回车正常退出，或者在另一个终端执行 kill " + ProcessHandle.current().pid());
+    System.in.read();
+}
+
+private static void shutdown() {
+    try {
+        if (Files.deleteIfExists(TEMP)) System.out.println("Deleting temporary file.");
+    } catch (IOException e) {
+        System.err.println("删除临时文件失败: " + e);
+    }
+}
+</pre>
+</div>
+
+<div class="box tip">
+  <div class="t">&#128161; 只是删除临时文件的话</div>
+  <p>JDK 自带 <code>File.deleteOnExit()</code>，内部就是一个关闭钩子。用 NIO 的话还可以 <code>Files.newOutputStream(path, StandardOpenOption.DELETE_ON_CLOSE)</code>，文件流关闭时就删除。</p>
+</div>
+
+<h3>③ Catalina 风格的服务器钩子</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch16/startup/Bootstrap.java（节选）">
+<pre>
+StandardServer server = createServer(httpPort, shutdownPort);      // 第 14 章的整套组件
+Thread hook = new Thread(() -&gt; {
+    System.out.println("CatalinaShutdownHook: JVM 正在退出，停止服务器");
+    try {
+        server.stop();
+    } catch (LifecycleException e) {
+        System.out.println("Catalina.stop: " + e);
+    }
+}, "CatalinaShutdownHook");
+
+server.initialize();
+server.start();
+Runtime.getRuntime().addShutdownHook(hook);
+
+server.await();                                   // 路径 A：收到 SHUTDOWN 才返回
+Runtime.getRuntime().removeShutdownHook(hook);    // 正常关闭：移除钩子，避免 JVM 退出时再 stop 一次
+server.stop();
+</pre>
+</div>
+
+<h3>④ 嵌入式 Tomcat 11 要自己注册钩子</h3>
+
+<p>独立部署的 Tomcat 由 Catalina 注册钩子（可以通过 Catalina 的 <code>useShutdownHook</code> 属性关闭）；用 <code>Tomcat</code> 类嵌入时没有 Catalina，需要自己注册，否则 <code>kill</code> 时 Servlet 的 <code>destroy()</code> 不会被调用、会话不会持久化：</p>
+
+<div class="code" data-lang="java" data-file="java17/.../ch16/tomcat/EmbeddedShutdownHook.java（节选）">
+<pre>
+Runtime.getRuntime().addShutdownHook(new Thread(() -&gt; {
+    try {
+        tomcat.stop();
+        tomcat.destroy();
+    } catch (LifecycleException e) {
+        e.printStackTrace();
+    }
+}, "TomcatShutdownHook"));
+tomcat.start();
+tomcat.getServer().await();
+</pre>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch16.shutdownhook.ShutdownHookDemo      # 回车或 Ctrl+C
+./run.sh ch16.shutdownhook.TempFileApp           # 另开终端 kill &lt;pid&gt;
+./run.sh ch16.startup.Bootstrap 8080 8005        # kill &lt;pid&gt; 或 Ctrl+C
+./run.sh ch16.tomcat.EmbeddedShutdownHook
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+$ ./run.sh ch16.shutdownhook.TempFileApp
+Creating temporary file /home/ubuntu/how-tomcat-works/java17/temp.txt
+按回车正常退出，或者在另一个终端执行 kill 3442968
+（kill 3442968）
+Deleting temporary file.                       ← 进程被 SIGTERM 终止，文件仍被删除
+
+$ ./run.sh ch16.startup.Bootstrap 8080 8005
+pid=3443105，可以用 kill 或 Ctrl+C 试试
+StandardServer: 在 127.0.0.1:8005 等待关闭命令
+（kill 3443105）
+CatalinaShutdownHook: JVM 正在退出，停止服务器
+Stopping service Catalina
+ch04 连接器已停止
+Stopping wrapper Primitive
+destroy                                        ← Servlet 的 destroy() 照样被调用
+
+$ ./run.sh ch16.tomcat.EmbeddedShutdownHook
+Tomcat 11 已启动，pid=3443259
+（kill 3443259）
+shutdown hook: 停止 Tomcat 11
+destroy
+shutdown hook: Tomcat 11 已停止
+</pre>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>JVM 正常退出或被 Ctrl+C / SIGTERM 终止时，会先并发运行所有注册的关闭钩子；SIGKILL 和崩溃则不会。</li>
+  <li>关闭钩子是一个未启动的 Thread，通过 <code>Runtime.addShutdownHook</code> 注册。</li>
+  <li>Catalina 的钩子调用 <code>server.stop()</code>，正常关闭路径会先移除钩子，保证 stop 只执行一次。</li>
+  <li>钩子要快、不要依赖顺序、不要调用 <code>System.exit()</code>；嵌入式 Tomcat 需要自己注册钩子。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>注册两个钩子，分别 <code>sleep</code> 2 秒和 3 秒后打印，用 <code>time</code> 测量 <code>kill</code> 后进程多久退出，验证它们是并发运行的。</li>
+    <li>在钩子里调用 <code>System.exit(0)</code>，观察会发生什么（提示：用 <code>jstack</code> 看线程状态）。</li>
+    <li>给第 9 章的会话管理加上钩子：<code>kill</code> 进程后再启动，会话依然存在。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

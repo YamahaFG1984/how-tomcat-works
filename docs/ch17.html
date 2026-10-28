@@ -1,0 +1,484 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 17 章 · Tomcat 的启动 — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="17">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 17 章</span>
+<h1>Tomcat 的启动</h1>
+<p class="lede">
+  前面 16 章拼出了 Tomcat 的所有零件：连接器、四种容器、载入器、管理器、Server、Service、Digester、关闭钩子。
+  这一章把它们串起来，回答一个问题：<strong>敲下 <code>startup.sh</code> 之后到底发生了什么？</strong>
+  答案涉及两个 Java 类——<code>Bootstrap</code> 和 <code>Catalina</code>——以及一组启动脚本。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>理解 Catalina 类：解析命令行、用 Digester 解析 server.xml、启动与停止 Server</li>
+    <li>理解 Bootstrap 类：为什么要建立 common / catalina / shared 三个类加载器，为什么用反射调用 Catalina</li>
+    <li>看懂 <code>startup.sh</code> → <code>catalina.sh</code> → <code>java Bootstrap</code> 的调用链</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="chain">完整的启动链</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 400" role="img" aria-label="从 startup.sh 到 server.await 的启动链">
+  <rect class="bx-d" x="20" y="16" width="150" height="40" rx="8"/><text class="mono" x="95" y="41" text-anchor="middle">startup.sh</text>
+  <rect class="bx-d" x="200" y="16" width="200" height="40" rx="8"/><text class="mono" x="300" y="41" text-anchor="middle">catalina.sh start</text>
+  <rect class="bx-b" x="430" y="16" width="310" height="40" rx="8"/><text class="mono sm" x="585" y="41" text-anchor="middle">java … startup.Bootstrap start</text>
+  <path class="ln" d="M172 36 H196" marker-end="url(#ar)"/>
+  <path class="ln" d="M402 36 H426" marker-end="url(#ar)"/>
+  <text class="sm" x="300" y="74" text-anchor="middle">设置 CATALINA_HOME / BASE、JAVA_HOME、CLASSPATH</text>
+
+  <rect class="bx-p" x="430" y="90" width="310" height="80" rx="10"/>
+  <text class="ttl on-p" x="585" y="112" text-anchor="middle">Bootstrap.main()</text>
+  <text class="sm" x="585" y="134" text-anchor="middle">① 建立 common / catalina / shared 类加载器</text>
+  <text class="sm" x="585" y="154" text-anchor="middle">② 用 catalinaLoader 加载 Catalina，反射调用</text>
+  <path class="ln" d="M585 58 V86" marker-end="url(#ar)"/>
+
+  <rect class="bx-a" x="20" y="200" width="720" height="186" rx="12"/>
+  <text class="ttl on-a" x="40" y="224">Catalina.process(args) → start()</text>
+  <rect class="bx" x="40" y="240" width="200" height="56" rx="8"/>
+  <text class="mono sm" x="140" y="262" text-anchor="middle">createStartDigester()</text>
+  <text class="sm" x="140" y="282" text-anchor="middle">digester.push(this)</text>
+  <rect class="bx" x="270" y="240" width="200" height="56" rx="8"/>
+  <text class="mono sm" x="370" y="262" text-anchor="middle">digester.parse(server.xml)</text>
+  <text class="sm" x="370" y="282" text-anchor="middle">→ 整棵组件树（第 15 章）</text>
+  <rect class="bx" x="500" y="240" width="220" height="56" rx="8"/>
+  <text class="mono sm" x="610" y="262" text-anchor="middle">server.initialize()</text>
+  <text class="mono sm" x="610" y="282" text-anchor="middle">server.start()</text>
+  <path class="ln" d="M242 268 H266" marker-end="url(#ar)"/>
+  <path class="ln" d="M472 268 H496" marker-end="url(#ar)"/>
+
+  <rect class="bx-g" x="40" y="314" width="200" height="56" rx="8"/>
+  <text class="mono sm" x="140" y="336" text-anchor="middle">addShutdownHook(…)</text>
+  <text class="sm" x="140" y="356" text-anchor="middle">第 16 章</text>
+  <rect class="bx-b" x="270" y="314" width="200" height="56" rx="8"/>
+  <text class="mono sm" x="370" y="336" text-anchor="middle">server.await()</text>
+  <text class="sm" x="370" y="356" text-anchor="middle">⏳ 第 14 章</text>
+  <rect class="bx-r" x="500" y="314" width="220" height="56" rx="8"/>
+  <text class="mono sm" x="610" y="336" text-anchor="middle">removeShutdownHook</text>
+  <text class="mono sm" x="610" y="356" text-anchor="middle">server.stop()</text>
+  <path class="ln" d="M610 298 V302 H140 V310" marker-end="url(#ar)"/>
+  <path class="ln" d="M242 342 H266" marker-end="url(#ar)"/>
+  <path class="ln" d="M472 342 H496" marker-end="url(#ar)"/>
+  <path class="ln" d="M585 172 V196" marker-end="url(#ar)"/>
+</svg>
+<figcaption>图 17-1　从启动脚本到 server.await()</figcaption>
+</figure>
+
+<p>理论上 Bootstrap 和 Catalina 可以合并成一个类。分开的原因是要支持<strong>多种运行方式</strong>：<code>Bootstrap</code> 用于以独立程序运行，<code>BootstrapService</code> 用于作为 Windows NT 服务运行……它们都复用同一个 Catalina。</p>
+
+<h2 id="catalina">Catalina 类</h2>
+
+<h3>process：解析命令行</h3>
+
+<div class="code" data-lang="java" data-file="Catalina.process() / arguments()（Tomcat 4，节选）">
+<pre>
+public void process(String args[]) {
+    setCatalinaHome();          // catalina.home 默认为 user.dir
+    setCatalinaBase();          // catalina.base 默认为 catalina.home
+    try {
+        if (arguments(args))
+            execute();          // starting → start()；stopping → stop()
+    } catch (Exception e) {
+        e.printStackTrace(System.out);
+    }
+}
+
+protected boolean arguments(String args[]) {
+    ...
+    for (int i = 0; i &lt; args.length; i++) {
+        if (isConfig) { configFile = args[i]; isConfig = false; }
+        else if (args[i].equals("-config"))   isConfig = true;
+        else if (args[i].equals("-debug"))    debug = true;
+        else if (args[i].equals("-nonaming")) useNaming = false;   // 不启用 JNDI
+        else if (args[i].equals("-help"))     { usage(); return (false); }
+        else if (args[i].equals("start"))     starting = true;
+        else if (args[i].equals("stop"))      stopping = true;
+        else { usage(); return (false); }
+    }
+    return (true);
+}
+</pre>
+</div>
+
+<div class="box note">
+  <div class="t">&#9432; catalina.home 与 catalina.base</div>
+  <p><code>catalina.home</code> 是 Tomcat 的<strong>安装目录</strong>（bin、lib），<code>catalina.base</code> 是一个<strong>实例</strong>的目录（conf、logs、webapps、work）。一套安装可以跑多个实例，每个实例有自己的 base。两者默认相同。</p>
+</div>
+
+<h3>start：Digester 解析 server.xml</h3>
+
+<div class="code" data-lang="java" data-file="Catalina.start()（对应原书 Listing 17.4，节选）">
+<pre>
+protected void start() {
+    Digester digester = createStartDigester();
+    File file = configFile();                          // 默认 conf/server.xml
+    InputSource is = new InputSource("file://" + file.getAbsolutePath());
+    is.setByteStream(new FileInputStream(file));
+    digester.push(this);                               // ★ Catalina 压在栈底
+    digester.parse(is);                                // 解析完 this.server 就有值了
+    ...                                                // JNDI、安全管理器、替换 System.out 等
+    Thread shutdownHook = new CatalinaShutdownHook();
+    server.initialize();
+    ((Lifecycle) server).start();
+    Runtime.getRuntime().addShutdownHook(shutdownHook);
+    server.await();                                    // 等关闭命令
+    Runtime.getRuntime().removeShutdownHook(shutdownHook);   // 先移除，避免 stop 被调两次
+    ((Lifecycle) server).stop();
+}
+</pre>
+</div>
+
+<div class="code" data-lang="java" data-file="Catalina.createStartDigester()（对应原书 Listing 17.6，节选）">
+<pre>
+digester.addObjectCreate("Server", "org.apache.catalina.core.StandardServer", "className");
+digester.addSetProperties("Server");
+digester.addSetNext("Server", "setServer", "org.apache.catalina.Server");   // 栈底的 Catalina.setServer(server)
+
+digester.addObjectCreate("Server/Service", "org.apache.catalina.core.StandardService", "className");
+digester.addSetProperties("Server/Service");
+digester.addSetNext("Server/Service", "addService", "org.apache.catalina.Service");
+
+digester.addObjectCreate("Server/Service/Connector",
+    "org.apache.catalina.connector.http.HttpConnector", "className");
+digester.addSetProperties("Server/Service/Connector");
+digester.addSetNext("Server/Service/Connector", "addConnector", "org.apache.catalina.Connector");
+...
+digester.addRuleSet(new EngineRuleSet("Server/Service/"));
+digester.addRuleSet(new HostRuleSet("Server/Service/Engine/"));
+digester.addRuleSet(new ContextRuleSet("Server/Service/Engine/Host/"));
+digester.addRule("Server/Service/Engine", new SetParentClassLoaderRule(digester, parentClassLoader));
+</pre>
+</div>
+
+<p>注意 <code>addObjectCreate</code> 的第三个参数 <code>"className"</code>：server.xml 里任何元素都可以用 <code>className</code> 属性换成你自己的实现类——这正是 Tomcat 可扩展的关键。</p>
+
+<h3>stop：只解析 &lt;Server&gt;</h3>
+
+<p>停止时用的 <code>createStopDigester()</code> 只有 Server 的三条规则：它只需要从 server.xml 里读出关闭端口和关闭命令，然后像第 14 章的 Stopper 一样连上 <code>127.0.0.1:port</code> 发送命令。</p>
+
+<h2 id="bootstrap">Bootstrap 类</h2>
+
+<p><code>startup.sh</code> 最终执行的是 Bootstrap 的 <code>main</code> 方法。它做两件事：建立类加载器、通过反射启动 Catalina。</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="Tomcat 4 的类加载器层次：system、common、catalina、shared、webapp">
+  <rect class="bx-p" x="270" y="12" width="220" height="40" rx="8"/>
+  <text class="mono sm" x="380" y="30" text-anchor="middle">Bootstrap / System</text>
+  <text class="sm" x="380" y="46" text-anchor="middle">JDK + CLASSPATH（只有 bootstrap.jar）</text>
+  <rect class="bx-b" x="270" y="80" width="220" height="48" rx="8"/>
+  <text class="ttl on-b" x="380" y="100" text-anchor="middle">commonLoader</text>
+  <text class="sm" x="380" y="118" text-anchor="middle">common/classes、endorsed、lib</text>
+  <rect class="bx-a" x="60" y="170" width="250" height="56" rx="8"/>
+  <text class="ttl on-a" x="185" y="192" text-anchor="middle">catalinaLoader</text>
+  <text class="sm" x="185" y="212" text-anchor="middle">server/classes、server/lib（容器内部）</text>
+  <rect class="bx-g" x="450" y="170" width="250" height="56" rx="8"/>
+  <text class="ttl on-g" x="575" y="192" text-anchor="middle">sharedLoader</text>
+  <text class="sm" x="575" y="212" text-anchor="middle">shared/classes、shared/lib</text>
+  <rect class="bx" x="420" y="262" width="150" height="40" rx="8"/><text class="mono sm" x="495" y="287" text-anchor="middle">Webapp1 加载器</text>
+  <rect class="bx" x="590" y="262" width="150" height="40" rx="8"/><text class="mono sm" x="665" y="287" text-anchor="middle">Webapp2 加载器</text>
+  <path class="ln" d="M380 78 V54" marker-end="url(#ar)"/>
+  <path class="ln" d="M220 168 L330 130" marker-end="url(#ar)"/>
+  <path class="ln" d="M540 168 L430 130" marker-end="url(#ar)"/>
+  <path class="ln" d="M495 260 L550 228" marker-end="url(#ar)"/>
+  <path class="ln" d="M665 260 L610 228" marker-end="url(#ar)"/>
+  <text class="sm" x="185" y="250" text-anchor="middle">加载 Catalina 及所有容器类</text>
+  <text class="sm" x="185" y="268" text-anchor="middle">Web 应用看不见它们</text>
+  <text class="sm on-r" x="380" y="320" text-anchor="middle">shared 及其下的 Web 应用加载器访问不到 catalinaLoader 和 CLASSPATH 中的类（箭头指向父加载器）</text>
+</svg>
+<figcaption>图 17-2　Bootstrap 建立的类加载器（Tomcat 4/5）</figcaption>
+</figure>
+
+<div class="code" data-lang="java" data-file="Bootstrap.main()（对应原书 Listing 17.8，节选）">
+<pre>
+commonLoader = ClassLoaderFactory.createClassLoader(
+    unpacked /* common/classes */, packed2 /* common/endorsed, common/lib */, null);
+catalinaLoader = ClassLoaderFactory.createClassLoader(
+    unpacked /* server/classes */, packed /* server/lib */, commonLoader);
+sharedLoader = ClassLoaderFactory.createClassLoader(
+    unpacked /* shared/classes */, packed /* shared/lib */, commonLoader);
+
+Thread.currentThread().setContextClassLoader(catalinaLoader);
+Class startupClass = catalinaLoader.loadClass("org.apache.catalina.startup.Catalina");
+Object startupInstance = startupClass.newInstance();
+
+// 反射调用 setParentClassLoader(sharedLoader)：Web 应用加载器的父加载器就是它
+Method method = startupInstance.getClass().getMethod("setParentClassLoader",
+    new Class[] { Class.forName("java.lang.ClassLoader") });
+method.invoke(startupInstance, new Object[] { sharedLoader });
+
+// 反射调用 process(args)
+method = startupInstance.getClass().getMethod("process", new Class[] { args.getClass() });
+method.invoke(startupInstance, new Object[] { args });
+</pre>
+</div>
+
+<div class="box key">
+  <div class="t">&#128273; 为什么要用反射调用 Catalina？</div>
+  <p>Bootstrap 由系统类加载器加载，Catalina 由 catalinaLoader 加载。如果 Bootstrap 的源码里直接写 <code>new Catalina()</code>，编译后 JVM 会用<strong>加载 Bootstrap 的那个类加载器</strong>（系统类加载器）去找 Catalina——那就要求 Catalina 在 CLASSPATH 上，隔离也就失去了意义。通过反射，Bootstrap 在编译期完全不依赖 Catalina 类。</p>
+</div>
+
+<h2 id="scripts">启动脚本</h2>
+
+<p>为了不让用户记住一长串 java 命令行参数，Tomcat 提供了脚本：Windows 下是 <code>startup.bat</code>、<code>shutdown.bat</code>、<code>catalina.bat</code>，Unix/Linux 下是对应的 <code>.sh</code>。<code>startup</code> 和 <code>shutdown</code> 只是把 <code>start</code> / <code>stop</code> 参数传给 <code>catalina</code> 脚本。</p>
+
+<div class="tw">
+<table>
+  <tr><th>catalina.sh 参数</th><th>作用</th></tr>
+  <tr><td><code>run</code></td><td>在当前窗口前台运行（日志直接输出到终端）</td></tr>
+  <tr><td><code>start</code></td><td>后台运行，输出重定向到 <code>logs/catalina.out</code></td></tr>
+  <tr><td><code>stop</code> / <code>stop -force</code></td><td>发送关闭命令；<code>-force</code> 时再按 <code>CATALINA_PID</code> 里的进程号 <code>kill -9</code></td></tr>
+  <tr><td><code>jpda start</code></td><td>以 JPDA 调试模式启动，可以用 IDE 远程连接调试</td></tr>
+  <tr><td><code>debug</code>、<code>embedded</code>、<code>-security</code></td><td>在调试器中启动 / 嵌入式模式 / 启用安全管理器（Tomcat 4 时代的选项）</td></tr>
+</table>
+</div>
+
+<p>原书花了不少篇幅介绍批处理和 shell 的基础语法（<code>rem</code>、<code>if exist</code>、<code>goto</code>、<code>shift</code>、<code>$1</code>、<code>case</code>、<code>`dirname`</code>……）。catalina 脚本本身做的事情可以归纳为：</p>
+
+<ol class="steps">
+  <li>解析符号链接，找到脚本所在目录，推出 <code>CATALINA_HOME</code>；<code>CATALINA_BASE</code> 默认等于它。</li>
+  <li>调用 <code>setclasspath</code> 检查 <code>JAVA_HOME</code>，确定 java 可执行文件。</li>
+  <li>把 <code>bootstrap.jar</code> 等加入 CLASSPATH，拼出 <code>-Dcatalina.home</code>、<code>-Dcatalina.base</code>、<code>-Djava.io.tmpdir</code> 等参数，加上用户的 <code>JAVA_OPTS</code> / <code>CATALINA_OPTS</code>。</li>
+  <li>按第一个参数分支：<code>start</code> 时后台运行并写 PID 文件，<code>stop</code> 时运行 <code>Bootstrap … stop</code>。</li>
+</ol>
+
+<div class="code" data-lang="bash" data-file="catalina.sh（原书 Listing 17.12，stop 分支）">
+<pre>
+elif [ "$1" = "stop" ] ; then
+    shift
+    "$_RUNJAVA" $JAVA_OPTS $CATALINA_OPTS \
+      -Djava.endorsed.dirs="$JAVA_ENDORSED_DIRS" -classpath "$CLASSPATH" \
+      -Dcatalina.base="$CATALINA_BASE" \
+      -Dcatalina.home="$CATALINA_HOME" \
+      -Djava.io.tmpdir="$CATALINA_TMPDIR" \
+      org.apache.catalina.startup.Bootstrap "$@" stop
+    if [ "$1" = "-force" ] ; then
+        shift
+        if [ ! -z "$CATALINA_PID" ]; then
+            echo "Killing: `cat $CATALINA_PID`"
+            kill -9 `cat $CATALINA_PID`
+        fi
+    fi
+</pre>
+</div>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch17/startup/Catalina.java</code><code>startup/Bootstrap.java</code><code>tomcat/RealCatalina.java</code><code>java17/conf/server.xml</code><code>java17/bin/*.sh</code></div>
+
+<p>Java 17 版把前 16 章的成果组装成一个「能用脚本启停、能读 server.xml 的迷你 Tomcat」：</p>
+
+<h3>① 迷你 Catalina：用第 15 章的 MiniDigester 解析 server.xml</h3>
+
+<div class="code" data-lang="xml" data-file="java17/conf/server.xml">
+<pre>
+&lt;Server port="8005" shutdown="SHUTDOWN"&gt;
+  &lt;Service name="Catalina"&gt;
+    &lt;Connector port="8080"/&gt;
+    &lt;Connector port="8081"/&gt;
+    &lt;Engine defaultHost="localhost"&gt;
+      &lt;Host name="localhost" appBase="webapps"&gt;
+        &lt;Context path="/app1" docBase="webapps/app1"/&gt;
+        &lt;Context path="/myApp" docBase="myApp"/&gt;
+      &lt;/Host&gt;
+    &lt;/Engine&gt;
+  &lt;/Service&gt;
+&lt;/Server&gt;
+</pre>
+</div>
+
+<div class="code" data-lang="java" data-file="java17/.../ch17/startup/Catalina.java（节选）">
+<pre>
+digester.addObjectCreate("Server", StandardServer::new);
+digester.addSetProperties("Server");                              // port、shutdown
+digester.addSetNext("Server", "setServer");
+
+digester.addObjectCreate("Server/Service", StandardService::new);
+digester.addSetProperties("Server/Service");
+digester.addSetNext("Server/Service", "addService");
+
+digester.addRule("Server/Service/Connector", new MiniDigester.Rule() {   // 端口是构造器参数
+    @Override public void begin(MiniDigester d, Attributes a) {
+        d.push(new HttpConnector(Integer.parseInt(a.getValue("port"))));
+    }
+    @Override public void end(MiniDigester d) { d.pop(); }
+});
+digester.addSetNext("Server/Service/Connector", "addConnector");
+...
+digester.addObjectCreate("Server/Service/Engine/Host/Context", StandardContext::new);
+digester.addSetProperties("Server/Service/Engine/Host/Context");
+digester.addSetNext("Server/Service/Engine/Host/Context", "addChild");
+digester.addRule("Server/Service/Engine/Host/Context", new MiniDigester.Rule() {
+    @Override public void end(MiniDigester d) {        // end 倒序：先于 addChild 执行
+        var context = (StandardContext) d.peek(0);
+        context.addLifecycleListener(new ContextConfig());                    // 第 15 章
+        context.setLoader(new WebappLoader(context.getDocBase(), context::reload));   // 第 8 章
+    }
+});
+</pre>
+</div>
+
+<h3>② 迷你 Bootstrap：独立的类加载器 + 方法句柄</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch17/startup/Bootstrap.java（节选）">
+<pre>
+URL[] repositories = Arrays.stream(System.getProperty("java.class.path").split(File.pathSeparator))
+        .map(Bootstrap::toUrl).toArray(URL[]::new);
+// 父加载器是平台类加载器：只认识 JDK，不认识 CLASSPATH 上的任何类
+var catalinaLoader = new URLClassLoader("catalina", repositories, ClassLoader.getPlatformClassLoader());
+
+Class&lt;?&gt; startupClass = catalinaLoader.loadClass("modern.ch17.startup.Catalina");
+Object catalina = startupClass.getDeclaredConstructor().newInstance();
+
+var lookup = MethodHandles.publicLookup();                         // Java 7 的方法句柄
+lookup.findVirtual(startupClass, "setParentClassLoader", MethodType.methodType(void.class, ClassLoader.class))
+      .invoke(catalina, sharedLoader);
+lookup.findVirtual(startupClass, "process", MethodType.methodType(void.class, String[].class))
+      .invoke(catalina, args);
+</pre>
+</div>
+
+<p>运行时会打印「Catalina 由 catalina 类加载器加载（不是加载 Bootstrap 的 app）」——同一个 JVM 里，Catalina 这个类确实来自另一个类加载器。</p>
+
+<h3>③ 现代 bash 脚本</h3>
+
+<div class="code" data-lang="bash" data-file="java17/bin/catalina.sh（节选）">
+<pre>
+PRG="$(readlink -f "$0")"                     # 原书一整段 while [ -h "$PRG" ] 循环解析软链接
+CATALINA_HOME="${CATALINA_HOME:-$(cd "$(dirname "$PRG")/.." &amp;&amp; pwd)}"
+CATALINA_BASE="${CATALINA_BASE:-$CATALINA_HOME}"
+CATALINA_PID="${CATALINA_PID:-$CATALINA_BASE/logs/catalina.pid}"
+
+case "${1:-}" in
+  run)   exec "$JAVA" … modern.ch17.startup.Bootstrap "$@" start ;;
+  start) nohup "$JAVA" … modern.ch17.startup.Bootstrap "$@" start \
+           &gt;&gt; "$CATALINA_BASE/logs/catalina.out" 2&gt;&amp;1 &lt; /dev/null &amp;
+         echo $! &gt; "$CATALINA_PID" ;;
+  stop)  run_java "$@" stop ;;
+esac
+</pre>
+</div>
+
+<h3>④ 真正的 Tomcat 11 Catalina</h3>
+
+<p><code>RealCatalina</code> 直接使用 <code>org.apache.catalina.startup.Catalina</code>——和原书讲的是同一个类，只是 20 年后的版本。它准备一个临时的 CATALINA_BASE（只放一个 <code>conf/server.xml</code>），然后：</p>
+
+<div class="code" data-lang="java" data-file="java17/.../ch17/tomcat/RealCatalina.java（节选）">
+<pre>
+var catalina = new Catalina();
+catalina.setAwait(true);       // start() 末尾调用 server.await()
+catalina.load();               // createStartDigester() 解析 conf/server.xml，server.init()
+catalina.start();              // 启动 → 注册钩子 → await → 移除钩子 → stop（与原书一致）
+</pre>
+</div>
+
+<div class="code" data-lang="xml" data-file="java17/conf/tomcat11/server.xml（节选）">
+<pre>
+&lt;Server port="${demo.shutdownPort}" shutdown="SHUTDOWN"&gt;
+  &lt;Service name="Catalina"&gt;
+    &lt;Connector port="${demo.port}" address="127.0.0.1" protocol="HTTP/1.1" connectionTimeout="20000"/&gt;
+    &lt;Engine name="Catalina" defaultHost="localhost"&gt;
+      &lt;Host name="localhost" appBase="${demo.appBase}" autoDeploy="true" unpackWARs="true"/&gt;
+    &lt;/Engine&gt;
+  &lt;/Service&gt;
+&lt;/Server&gt;
+</pre>
+</div>
+
+<p>Tomcat 的 Digester 会把 <code>${...}</code> 替换成同名系统属性。Host 里没有写 Context，Tomcat 依然部署了 <code>/app1</code>——这是 HostConfig 的功劳，也就是下一章的主题。</p>
+
+<div class="box note">
+  <div class="t">&#9432; 现代 Tomcat 的变化</div>
+  <ul>
+    <li>类加载器只剩 <code>common</code>（<code>$CATALINA_HOME/lib</code>）；<code>server.loader</code>、<code>shared.loader</code> 默认留空，可在 <code>conf/catalina.properties</code> 中配置。</li>
+    <li>脚本把自定义配置拆到 <code>bin/setenv.sh</code>（JAVA_OPTS、CATALINA_OPTS），升级 Tomcat 时不用改 catalina.sh。</li>
+    <li>安全管理器已在 Java 17 被废弃（JEP 411）、Java 24 起被永久禁用，Tomcat 11 也移除了 <code>-security</code> 支持。</li>
+    <li>Linux 上更多用 systemd 管理 Tomcat：<code>ExecStart=/opt/tomcat/bin/catalina.sh run</code>，由 systemd 负责后台化、日志和重启。</li>
+  </ul>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+bin/startup.sh                       # 后台启动迷你 Tomcat（读 conf/server.xml）
+curl http://localhost:8080/app1/Primitive
+curl http://localhost:8081/myApp/Hello
+bin/shutdown.sh                      # 读 server.xml 找到关闭端口，发送 SHUTDOWN
+cat logs/catalina.out
+
+./run.sh ch17.tomcat.RealCatalina 8080 8005     # 真正的 Tomcat 11 Catalina
+./run.sh ch14.startup.Stopper 8005
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+$ bin/startup.sh
+已启动，PID 3445180，日志：…/logs/catalina.out
+$ curl http://localhost:8081/myApp/Hello
+Hello, version 1
+loaded by: WebappClassLoader[webapp:myApp, delegate=false]
+看不到容器的内部类 modern.ch08.startup.Bootstrap（隔离生效）
+$ bin/shutdown.sh
+Bootstrap: Catalina 由 catalina 类加载器加载（不是加载 Bootstrap 的 app）
+Catalina: 已向端口 8005 发送关闭命令
+
+$ cat logs/catalina.out
+Bootstrap: Catalina 由 catalina 类加载器加载（不是加载 Bootstrap 的 app）
+Catalina: 从 conf/server.xml 创建了 Server，父类加载器 = catalina
+Starting service Catalina
+ch04 连接器启动：http://localhost:8080/  处理器 min=5 max=20
+ch04 连接器启动：http://localhost:8081/  处理器 min=5 max=20
+StandardServer: 在 127.0.0.1:8005 等待关闭命令
+StandardServer: 收到关闭命令
+Stopping service Catalina
+
+$ ./run.sh ch17.tomcat.RealCatalina 8080 8005
+Catalina 解析出的 Server: StandardServer[8005]，关闭端口 8005
+INFO: Deploying web application directory [/…/java17/webapps/app1]
+INFO: Server startup in [710] milliseconds
+INFO: A valid shutdown command was received via the shutdown port. Stopping the Server instance.
+Tomcat 11 Catalina 已退出
+</pre>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>启动链：<code>startup.sh → catalina.sh start → java Bootstrap start → Catalina.process → start</code>。</li>
+  <li>Catalina 用 Digester 解析 server.xml（自己压在栈底，通过 <code>setServer</code> 拿到 Server），然后 initialize → start → 注册钩子 → await → stop；<code>stop</code> 命令只解析 <code>&lt;Server&gt;</code> 并发送关闭命令。</li>
+  <li>Bootstrap 建立 common / catalina / shared 类加载器，用 catalinaLoader 加载 Catalina 并通过反射调用，保证容器类与 Web 应用隔离。</li>
+  <li>脚本负责环境变量、类路径、前台/后台运行和 PID 文件。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>给迷你 Catalina 的 Digester 增加对 <code>className</code> 属性的支持，让 server.xml 能把 Engine 换成你自己写的子类。</li>
+    <li>写一个 <code>bin/setenv.sh</code>，在其中设置 <code>JAVA_OPTS="-Xmx256m"</code>，修改 catalina.sh 让它在启动前 <code>source</code> 这个文件（如果存在）。</li>
+    <li>复制一份 <code>conf/</code> 到另一个目录并改掉端口，用 <code>CATALINA_BASE=那个目录 bin/startup.sh</code> 同时运行两个实例。</li>
+    <li>为迷你 Tomcat 写一个 systemd unit 文件（<code>Type=simple</code>，<code>ExecStart=…/bin/catalina.sh run</code>），并思考：此时还需要关闭端口吗？</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

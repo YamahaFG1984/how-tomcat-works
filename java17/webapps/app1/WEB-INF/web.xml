@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 原书 webapps/app1/WEB-INF/web.xml 的 Servlet 6.1 版（第 13 章起使用，第 15 章由 ContextConfig 解析） -->
+<web-app xmlns="https://jakarta.ee/xml/ns/jakartaee"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="https://jakarta.ee/xml/ns/jakartaee https://jakarta.ee/xml/ns/jakartaee/web-app_6_1.xsd"
+         version="6.1">
+  <servlet>
+    <servlet-name>Modern</servlet-name>
+    <servlet-class>ModernServlet</servlet-class>
+  </servlet>
+  <servlet>
+    <servlet-name>Primitive</servlet-name>
+    <servlet-class>PrimitiveServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>Modern</servlet-name>
+    <url-pattern>/Modern</url-pattern>
+  </servlet-mapping>
+  <servlet-mapping>
+    <servlet-name>Primitive</servlet-name>
+    <url-pattern>/Primitive</url-pattern>
+  </servlet-mapping>
+</web-app>

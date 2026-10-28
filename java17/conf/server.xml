@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  第 17 章迷你 Catalina 读取的 server.xml。结构和 Tomcat 的 conf/server.xml 一样：
+  Server → Service → Connector* + Engine → Host → Context*
+  每个 Context 都会自动挂上第 15 章的 ContextConfig（读 WEB-INF/web.xml）和第 8 章的 WebappLoader。
+-->
+<Server port="8005" shutdown="SHUTDOWN">
+  <Service name="Catalina">
+    <Connector port="8080"/>
+    <Connector port="8081"/>
+    <Engine defaultHost="localhost">
+      <Host name="localhost" appBase="webapps">
+        <Context path="/app1" docBase="webapps/app1"/>
+        <Context path="/myApp" docBase="myApp"/>
+      </Host>
+    </Engine>
+  </Service>
+</Server>

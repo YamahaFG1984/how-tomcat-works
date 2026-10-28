@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  原书 car-mbean-descriptor.xml 的 Tomcat 11 版。格式与 Commons Modeler 相同（Tomcat 把 Modeler 并入了
+  org.apache.tomcat.util.modeler）；Tomcat 自己的组件也都在各自包里的 mbeans-descriptors.xml 中这样描述。
+  原书的 drive 操作声明了一个参数，但调用时却不传参数——这里去掉了那个多余的 parameter。
+-->
+<mbeans-descriptors>
+  <mbean name="myMBean"
+         className="org.apache.tomcat.util.modeler.BaseModelMBean"
+         description="The ModelMBean that manages our Car object"
+         type="modern.ch20.modelmbeantest2.Car">
+    <attribute name="color" description="The car color" type="java.lang.String"/>
+    <operation name="drive" description="drive method" impact="ACTION" returnType="void"/>
+  </mbean>
+</mbeans-descriptors>

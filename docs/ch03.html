@@ -1,0 +1,759 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 3 章 · 连接器 — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="3">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 3 章</span>
+<h1>连接器</h1>
+<p class="lede">
+  Catalina 由两大模块组成：<strong>连接器（connector）</strong>和<strong>容器（container）</strong>。
+  连接器负责把一条 HTTP 请求变成一个功能完整的 <code>HttpServletRequest</code> 对象——请求头、Cookie、参数都要能取到。
+  这一章我们写一个简化版的 Tomcat 4 默认连接器，让第 2 章跑不起来的 <code>ModernServlet</code> 也能正常工作。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>理解连接器和容器的分工，以及 <code>HttpConnector</code> / <code>HttpProcessor</code> 的拆分</li>
+    <li>学会解析请求行：查询串、绝对 URI、URL 中的 <code>jsessionid</code>、URI 规范化</li>
+    <li>学会解析请求头和 Cookie，理解参数为什么要「懒解析」</li>
+    <li>理解 <code>StringManager</code> 如何按包管理多语言错误消息</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="overview">连接器要做什么</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="Catalina 的两大模块：连接器创建请求和响应对象，容器调用 Servlet">
+  <rect class="bx-b" x="20" y="70" width="120" height="60" rx="10"/>
+  <text class="ttl on-b" x="80" y="98" text-anchor="middle">浏览器</text>
+  <text class="sm" x="80" y="116" text-anchor="middle">HTTP 字节流</text>
+
+  <rect class="bx-a" x="200" y="30" width="230" height="150" rx="14"/>
+  <text class="ttl on-a" x="315" y="56" text-anchor="middle">连接器 Connector</text>
+  <text class="sm" x="315" y="84" text-anchor="middle">① 等待并接受 TCP 连接</text>
+  <text class="sm" x="315" y="106" text-anchor="middle">② 解析请求行、请求头、Cookie</text>
+  <text class="sm" x="315" y="128" text-anchor="middle">③ 创建 HttpServletRequest</text>
+  <text class="sm" x="315" y="150" text-anchor="middle">　 和 HttpServletResponse</text>
+
+  <rect class="bx-g" x="490" y="30" width="250" height="150" rx="14"/>
+  <text class="ttl on-g" x="615" y="56" text-anchor="middle">容器 Container</text>
+  <text class="sm" x="615" y="84" text-anchor="middle">加载 Servlet、认证用户</text>
+  <text class="sm" x="615" y="106" text-anchor="middle">更新会话、调用过滤器</text>
+  <text class="sm" x="615" y="128" text-anchor="middle">调用 servlet.service(req, res)</text>
+  <text class="sm" x="615" y="150" text-anchor="middle">（第 5 章开始讲）</text>
+
+  <path class="ln-b" d="M142 100 H196" marker-end="url(#ar-b)"/>
+  <path class="ln-a" d="M432 105 H486" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="459" y="97" text-anchor="middle">req, res</text>
+</svg>
+<figcaption>图 3-1　Catalina 的两大模块（原书引言中的图 I.1）</figcaption>
+</figure>
+
+<p>Servlet 2.3/2.4 规范要求连接器必须创建 <code>HttpServletRequest</code> 和 <code>HttpServletResponse</code>。连接器并不知道被调用的 Servlet 是直接实现了 <code>Servlet</code>、继承了 <code>GenericServlet</code> 还是继承了 <code>HttpServlet</code>，所以它<strong>总是</strong>提供 HTTP 版本的请求和响应对象。</p>
+
+<p>从本章开始，示例程序被分成三个模块：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="第 3 章应用的模块划分：startup、connector、core">
+  <rect class="bx-d" x="20" y="20" width="150" height="250" rx="12"/>
+  <text class="ttl" x="95" y="44" text-anchor="middle">startup</text>
+  <rect class="bx-a" x="35" y="120" width="120" height="44" rx="8"/>
+  <text class="mono" x="95" y="147" text-anchor="middle">Bootstrap</text>
+
+  <rect class="bx-d" x="200" y="20" width="370" height="250" rx="12"/>
+  <text class="ttl" x="385" y="44" text-anchor="middle">connector / connector.http</text>
+  <rect class="bx-b" x="215" y="60" width="165" height="40" rx="8"/>
+  <text class="mono" x="297" y="85" text-anchor="middle">HttpConnector</text>
+  <rect class="bx-b" x="390" y="60" width="165" height="40" rx="8"/>
+  <text class="mono" x="472" y="85" text-anchor="middle">HttpProcessor</text>
+  <rect class="bx" x="215" y="112" width="165" height="40" rx="8"/>
+  <text class="mono" x="297" y="137" text-anchor="middle">HttpRequest</text>
+  <rect class="bx" x="390" y="112" width="165" height="40" rx="8"/>
+  <text class="mono" x="472" y="137" text-anchor="middle">HttpResponse</text>
+  <rect class="bx-g" x="215" y="164" width="165" height="40" rx="8"/>
+  <text class="mono" x="297" y="189" text-anchor="middle">HttpRequestFacade</text>
+  <rect class="bx-g" x="390" y="164" width="165" height="40" rx="8"/>
+  <text class="mono" x="472" y="189" text-anchor="middle">HttpResponseFacade</text>
+  <text class="sm" x="385" y="228" text-anchor="middle">SocketInputStream · HttpRequestLine · HttpHeader</text>
+  <text class="sm" x="385" y="248" text-anchor="middle">RequestStream · ResponseStream · ResponseWriter · Constants</text>
+
+  <rect class="bx-d" x="600" y="20" width="140" height="250" rx="12"/>
+  <text class="ttl" x="670" y="44" text-anchor="middle">core</text>
+  <rect class="bx-p" x="612" y="100" width="116" height="48" rx="8"/>
+  <text class="mono" x="670" y="120" text-anchor="middle">Servlet</text>
+  <text class="mono" x="670" y="138" text-anchor="middle">Processor</text>
+  <rect class="bx-p" x="612" y="160" width="116" height="48" rx="8"/>
+  <text class="mono" x="670" y="180" text-anchor="middle">StaticRes…</text>
+  <text class="mono" x="670" y="198" text-anchor="middle">Processor</text>
+
+  <path class="ln" d="M157 142 C185 142 185 80 211 80" marker-end="url(#ar)"/>
+  <path class="ln" d="M382 80 H386" marker-end="url(#ar)"/>
+  <path class="ln" d="M557 80 C590 80 590 124 608 124" marker-end="url(#ar)"/>
+</svg>
+<figcaption>图 3-2　第 3 章应用的结构：第 2 章的 HttpServer 被拆成了 HttpConnector 和 HttpProcessor</figcaption>
+</figure>
+
+<div class="cards">
+  <div class="card"><span class="ic">&#128225;</span><h4>HttpConnector</h4><p>只负责「等」：创建 ServerSocket，accept 到 socket 就交出去。</p></div>
+  <div class="card"><span class="ic">&#9881;</span><h4>HttpProcessor</h4><p>只负责「拆」：读请求行和请求头，填充 HttpRequest，再分派给处理器。</p></div>
+  <div class="card"><span class="ic">&#128230;</span><h4>HttpRequest</h4><p>实现 <code>HttpServletRequest</code>，保存请求头、Cookie、参数。</p></div>
+  <div class="card"><span class="ic">&#9993;</span><h4>HttpResponse</h4><p>实现 <code>HttpServletResponse</code>，可以设置响应头，<code>getWriter</code> 不再丢数据。</p></div>
+</div>
+
+<h2 id="stringmanager">StringManager：按包管理错误消息</h2>
+
+<p>Tomcat 有几百个类，错误消息既要给管理员看（写日志），又要给 Servlet 程序员看（放进 <code>ServletException</code>）。如果全塞进一个大 properties 文件，维护起来是噩梦。Tomcat 的做法是：<strong>每个包一个 properties 文件</strong>，由一个 <code>StringManager</code> 实例负责读取。</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="StringManager 每个包一个实例，从 LocalStrings 文件读取对应语言的消息">
+  <rect class="bx-a" x="20" y="70" width="210" height="90" rx="12"/>
+  <text class="ttl on-a" x="125" y="96" text-anchor="middle">StringManager.managers</text>
+  <text class="sm" x="125" y="118" text-anchor="middle">Hashtable&lt;包名, 实例&gt;</text>
+  <text class="sm" x="125" y="138" text-anchor="middle">getManager(包名) 取或建</text>
+
+  <rect class="bx-b" x="290" y="20" width="200" height="56" rx="10"/>
+  <text class="mono" x="390" y="44" text-anchor="middle">…connector.http</text>
+  <text class="sm" x="390" y="64" text-anchor="middle">StringManager 实例 #1</text>
+  <rect class="bx-b" x="290" y="96" width="200" height="56" rx="10"/>
+  <text class="mono" x="390" y="120" text-anchor="middle">…catalina.core</text>
+  <text class="sm" x="390" y="140" text-anchor="middle">StringManager 实例 #2</text>
+  <rect class="bx-b" x="290" y="172" width="200" height="40" rx="10"/>
+  <text class="sm" x="390" y="197" text-anchor="middle">… 每个包一个</text>
+
+  <path class="ln" d="M232 100 L286 50" marker-end="url(#ar)"/>
+  <path class="ln" d="M232 115 H286" marker-end="url(#ar)"/>
+  <path class="ln" d="M232 130 L286 190" marker-end="url(#ar)"/>
+
+  <rect class="bx-d" x="540" y="14" width="200" height="72" rx="10"/>
+  <text class="mono" x="640" y="36" text-anchor="middle">LocalStrings.properties</text>
+  <text class="mono" x="640" y="56" text-anchor="middle">LocalStrings_es.properties</text>
+  <text class="mono" x="640" y="76" text-anchor="middle">LocalStrings_ja.properties</text>
+  <path class="ln-d" d="M492 48 H536" marker-end="url(#ar)"/>
+  <text class="sm" x="640" y="110" text-anchor="middle">按服务器的 Locale 选择文件</text>
+</svg>
+<figcaption>图 3-3　StringManager：每个包一个单例</figcaption>
+</figure>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/util/StringManager.java（原书，节选）">
+<pre>
+private static Hashtable managers = new Hashtable();
+
+public synchronized static StringManager getManager(String packageName) {
+    StringManager mgr = (StringManager) managers.get(packageName);
+    if (mgr == null) {
+        mgr = new StringManager(packageName);    // 构造器是 private 的
+        managers.put(packageName, mgr);
+    }
+    return mgr;
+}
+
+// 用法
+StringManager sm = StringManager.getManager("ex03.pyrmont.connector.http");
+sm.getString("httpConnector.alreadyInitialized");
+// → "HTTP connector has already been initialized"
+</pre>
+</div>
+
+<div class="vs">
+  <div class="old"><div class="h">原书：synchronized + Hashtable</div>
+<div class="code" data-lang="java">
+<pre>
+public synchronized static StringManager
+        getManager(String packageName) {
+    StringManager mgr =
+        (StringManager) managers.get(packageName);
+    if (mgr == null) {
+        mgr = new StringManager(packageName);
+        managers.put(packageName, mgr);
+    }
+    return mgr;
+}
+</pre>
+</div>
+  </div>
+  <div class="new"><div class="h">Java 17：ConcurrentHashMap</div>
+<div class="code" data-lang="java">
+<pre>
+private static final Map&lt;String, StringManager&gt;
+    MANAGERS = new ConcurrentHashMap&lt;&gt;();
+
+public static StringManager getManager(String pkg) {
+    // 原子地「没有就创建」，不用给整个方法加锁
+    return MANAGERS.computeIfAbsent(pkg, StringManager::new);
+}
+</pre>
+</div>
+  </div>
+</div>
+
+<p>Java 17 版还额外放了一个 <code>LocalStrings_zh.properties</code>：在中文系统上运行，错误消息会自动变成中文。另外 Java 9 起 properties 资源包默认按 UTF-8 读取，不用再写 <code>中文</code> 这种转义了。</p>
+
+<h2 id="connector">HttpConnector：在自己的线程里等待</h2>
+
+<div class="code" data-lang="java" data-file="ex03/pyrmont/connector/http/HttpConnector.java（原书）">
+<pre>
+public class HttpConnector implements Runnable {
+    boolean stopped;
+    private String scheme = "http";
+
+    public void run() {
+        ServerSocket serverSocket = null;
+        int port = 8080;
+        try {
+            serverSocket = new ServerSocket(port, 1, InetAddress.getByName("127.0.0.1"));
+        } catch (IOException e) {
+            e.printStackTrace();
+            System.exit(1);
+        }
+        while (!stopped) {
+            Socket socket = null;
+            try {
+                socket = serverSocket.accept();
+            } catch (Exception e) {
+                continue;
+            }
+            HttpProcessor processor = new HttpProcessor(this);   // 每个请求一个处理器
+            processor.process(socket);
+        }
+    }
+
+    public void start() {
+        Thread thread = new Thread(this);
+        thread.start();
+    }
+}
+</pre>
+</div>
+
+<p>启动类 <code>Bootstrap</code> 只有两行：<code>new HttpConnector()</code>，然后 <code>start()</code>。注意本章<strong>还没有关闭机制</strong>，只能直接关掉控制台或者 kill 进程（第 14 章才会有优雅的关闭）。</p>
+
+<h2 id="processor">HttpProcessor：一次请求的完整流程</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="HttpProcessor.process 的步骤">
+  <rect class="bx" x="20" y="20" width="220" height="44" rx="10"/>
+  <text class="mono" x="130" y="47" text-anchor="middle">new SocketInputStream(in, 2048)</text>
+  <rect class="bx" x="20" y="80" width="220" height="44" rx="10"/>
+  <text class="mono" x="130" y="107" text-anchor="middle">new HttpRequest(input)</text>
+  <rect class="bx" x="20" y="140" width="220" height="44" rx="10"/>
+  <text class="mono" x="130" y="160" text-anchor="middle">new HttpResponse(output)</text>
+  <text class="sm" x="130" y="177" text-anchor="middle">setHeader("Server", …)</text>
+  <path class="ln" d="M130 66 V76" marker-end="url(#ar)"/>
+  <path class="ln" d="M130 126 V136" marker-end="url(#ar)"/>
+
+  <rect class="bx-b" x="290" y="20" width="200" height="64" rx="10"/>
+  <text class="mono on-b" x="390" y="46" text-anchor="middle">parseRequest()</text>
+  <text class="sm" x="390" y="66" text-anchor="middle">请求行 → 方法/URI/协议</text>
+  <rect class="bx-b" x="290" y="100" width="200" height="64" rx="10"/>
+  <text class="mono on-b" x="390" y="126" text-anchor="middle">parseHeaders()</text>
+  <text class="sm" x="390" y="146" text-anchor="middle">请求头、Cookie、长度、类型</text>
+  <path class="ln" d="M242 162 C266 162 266 52 286 52" marker-end="url(#ar)"/>
+  <path class="ln" d="M390 86 V96" marker-end="url(#ar)"/>
+
+  <path class="bx-a" d="M390 186 L470 216 L390 246 L310 216 Z" style="stroke-width:1.5"/>
+  <text class="sm on-a" x="390" y="220" text-anchor="middle">/servlet/ 开头？</text>
+  <path class="ln" d="M390 166 V184" marker-end="url(#ar)"/>
+
+  <rect class="bx-p" x="540" y="160" width="200" height="48" rx="10"/>
+  <text class="mono on-p" x="640" y="189" text-anchor="middle">ServletProcessor</text>
+  <rect class="bx-g" x="540" y="240" width="200" height="48" rx="10"/>
+  <text class="mono on-g" x="640" y="269" text-anchor="middle">StaticResourceProcessor</text>
+  <path class="ln-p" d="M462 206 L536 186" marker-end="url(#ar-p)"/>
+  <path class="ln-g" d="M462 226 L536 260" marker-end="url(#ar-g)"/>
+  <text class="sm on-p" x="500" y="186">是</text>
+  <text class="sm on-g" x="500" y="258">否</text>
+
+  <rect class="bx-r" x="290" y="270" width="200" height="44" rx="10"/>
+  <text class="mono" x="390" y="297" text-anchor="middle">socket.close()</text>
+  <path class="ln-d" d="M538 280 H494" marker-end="url(#ar)"/>
+  <path class="ln-d" d="M640 210 V232"/>
+</svg>
+<figcaption>图 3-4　HttpProcessor.process() 的步骤</figcaption>
+</figure>
+
+<div class="code" data-lang="java" data-file="ex03/pyrmont/connector/http/HttpProcessor.java（原书，节选）">
+<pre>
+public void process(Socket socket) {
+    SocketInputStream input = null;
+    OutputStream output = null;
+    try {
+        input = new SocketInputStream(socket.getInputStream(), 2048);
+        output = socket.getOutputStream();
+        request = new HttpRequest(input);
+        response = new HttpResponse(output);
+        response.setRequest(request);
+        response.setHeader("Server", "Pyrmont Servlet Container");
+        parseRequest(input, output);
+        parseHeaders(input);
+        if (request.getRequestURI().startsWith("/servlet/")) {
+            ServletProcessor processor = new ServletProcessor();
+            processor.process(request, response);
+        } else {
+            StaticResourceProcessor processor = new StaticResourceProcessor();
+            processor.process(request, response);
+        }
+        socket.close();
+    } catch (Exception e) {
+        e.printStackTrace();
+    }
+}
+</pre>
+</div>
+
+<h2 id="socketinput">SocketInputStream：只能往前读</h2>
+
+<p>前两章只是 <code>input.read(buffer)</code> 读一次。本章的 <code>SocketInputStream</code>（直接复制自 Tomcat 4 的同名类）包装了 socket 的输入流，提供两个关键方法：</p>
+
+<ul>
+  <li><code>readRequestLine(HttpRequestLine)</code>：读出第一行，填充方法、URI、协议。</li>
+  <li><code>readHeader(HttpHeader)</code>：每调用一次读出一个请求头；读到空行时返回的 <code>HttpHeader</code> 的 <code>nameEnd</code> 和 <code>valueEnd</code> 都是 0。</li>
+</ul>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="SocketInputStream 顺序读取：先请求行，再逐个请求头，最后请求体">
+  <rect class="bx-a" x="20" y="40" width="190" height="44" rx="6"/>
+  <text class="mono" x="115" y="67" text-anchor="middle">GET /a?x=1 HTTP/1.1</text>
+  <rect class="bx-b" x="214" y="40" width="130" height="44" rx="6"/>
+  <text class="mono" x="279" y="67" text-anchor="middle">Host: …</text>
+  <rect class="bx-b" x="348" y="40" width="130" height="44" rx="6"/>
+  <text class="mono" x="413" y="67" text-anchor="middle">Cookie: …</text>
+  <rect class="bx-d" x="482" y="40" width="40" height="44" rx="6"/>
+  <text class="sm" x="502" y="67" text-anchor="middle">\r\n</text>
+  <rect class="bx-g" x="526" y="40" width="214" height="44" rx="6"/>
+  <text class="mono" x="633" y="67" text-anchor="middle">a=1&amp;b=2（请求体）</text>
+
+  <path class="ln-a" d="M115 96 V120"/>
+  <text class="sm on-a" x="115" y="138" text-anchor="middle">readRequestLine()</text>
+  <text class="sm on-a" x="115" y="154" text-anchor="middle">只调用一次，且必须最先调用</text>
+  <path class="ln-b" d="M346 96 V120"/>
+  <text class="sm on-b" x="346" y="138" text-anchor="middle">readHeader() × N</text>
+  <text class="sm on-b" x="346" y="154" text-anchor="middle">直到读到空行</text>
+  <path class="ln-g" d="M633 96 V120"/>
+  <text class="sm on-g" x="633" y="138" text-anchor="middle">getInputStream()</text>
+  <text class="sm on-g" x="633" y="154" text-anchor="middle">或解析表单参数时才读</text>
+
+  <path class="ln" d="M20 22 H740" marker-end="url(#ar)"/>
+  <text class="sm" x="380" y="16" text-anchor="middle">读取方向：从第一个字节到最后一个字节，永远不会回头</text>
+  <text class="sm" x="380" y="186" text-anchor="middle">所以请求体只能被读一次：参数一旦从请求体解析出来，getInputStream() 就读不到东西了</text>
+</svg>
+<figcaption>图 3-5　字节流只能往前读，这决定了各个方法的调用顺序</figcaption>
+</figure>
+
+<div class="box deep">
+  <div class="t">&#128270; 为什么用 char[] 而不是 String？</div>
+  <p>原书的 <code>HttpRequestLine</code> 和 <code>HttpHeader</code> 内部都是 <code>char[]</code> 加一个 <code>xxxEnd</code> 下标，处理完调用 <code>recycle()</code> 复用。2004 年的 JVM 垃圾回收很慢，Tomcat 想尽量少创建对象。今天的分代/区域化 GC 回收短命小对象几乎没有成本，Java 17 版直接用 <code>record HttpRequestLine(String method, String uri, String protocol)</code>，代码简单得多。</p>
+</div>
+
+<h2 id="requestline">解析请求行</h2>
+
+<p>请求行的第二部分不只是路径，还可能夹带查询串、会话 ID，甚至是一个绝对 URL。<code>parseRequest</code> 要把它们一一拆开：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="请求行的 URI 部分拆解：路径、jsessionid、查询串">
+  <text class="mono" x="20" y="60" style="font-size:14px"><tspan class="on-a">GET</tspan> <tspan class="on-b">/myApp/ModernServlet</tspan><tspan class="on-p">;jsessionid=5AC6</tspan><tspan class="on-g">?userName=tarzan&amp;password=pwd</tspan> HTTP/1.1</text>
+  <path class="ln-b" d="M58 74 H222"/>
+  <path class="ln-p" d="M224 74 H352"/>
+  <path class="ln-g" d="M354 74 H598"/>
+  <text class="ttl on-b" x="140" y="100" text-anchor="middle">requestURI</text>
+  <text class="sm" x="140" y="118" text-anchor="middle">规范化后存进 request</text>
+  <text class="ttl on-p" x="288" y="100" text-anchor="middle">requestedSessionId</text>
+  <text class="sm" x="288" y="118" text-anchor="middle">setRequestedSessionURL(true)</text>
+  <text class="ttl on-g" x="476" y="100" text-anchor="middle">queryString</text>
+  <text class="sm" x="476" y="118" text-anchor="middle">问号之后，参数暂时不解析</text>
+
+  <rect class="bx-d" x="20" y="140" width="720" height="44" rx="8"/>
+  <text class="sm" x="380" y="160" text-anchor="middle">也可能是绝对 URI：GET http://www.brainysoftware.com/index.html?name=Tarzan HTTP/1.1</text>
+  <text class="sm" x="380" y="176" text-anchor="middle">此时找到 "://" 之后的第一个 "/"，只保留后面的路径部分</text>
+</svg>
+<figcaption>图 3-6　从请求行里拆出 URI、会话 ID 和查询串</figcaption>
+</figure>
+
+<ol class="steps">
+  <li><strong>拆查询串</strong>：找第一个 <code>?</code>，后面的部分调用 <code>request.setQueryString()</code>。</li>
+  <li><strong>处理绝对 URI</strong>：不以 <code>/</code> 开头就找 <code>://</code>，截掉协议和主机名。</li>
+  <li><strong>取 URL 里的会话 ID</strong>：会话 ID 通常放在 Cookie 里，但浏览器禁用 Cookie 时会被改写进 URL（<code>;jsessionid=…</code>）。找到就记下来并从 URI 中删掉。</li>
+  <li><strong>规范化</strong>：<code>normalize()</code> 把 <code>\</code> 换成 <code>/</code>，合并 <code>//</code>，处理 <code>/./</code> 和 <code>/../</code>。如果想用 <code>/../</code> 跳出根目录，或者包含 <code>%2e</code>、<code>%2f</code>、<code>%5c</code>、<code>%25</code> 这类编码过的特殊字符，就返回 <code>null</code>，请求被判为非法。</li>
+</ol>
+
+<div class="code" data-lang="java" data-file="ex03/.../HttpProcessor.java parseRequest（原书，节选）">
+<pre>
+input.readRequestLine(requestLine);
+String method = new String(requestLine.method, 0, requestLine.methodEnd);
+String protocol = new String(requestLine.protocol, 0, requestLine.protocolEnd);
+
+int question = requestLine.indexOf("?");
+if (question &gt;= 0) {
+    request.setQueryString(new String(requestLine.uri, question + 1,
+        requestLine.uriEnd - question - 1));
+    uri = new String(requestLine.uri, 0, question);
+} else {
+    request.setQueryString(null);
+    uri = new String(requestLine.uri, 0, requestLine.uriEnd);
+}
+
+String match = ";jsessionid=";
+int semicolon = uri.indexOf(match);
+if (semicolon &gt;= 0) {
+    String rest = uri.substring(semicolon + match.length());
+    int semicolon2 = rest.indexOf(';');
+    if (semicolon2 &gt;= 0) {
+        request.setRequestedSessionId(rest.substring(0, semicolon2));
+        rest = rest.substring(semicolon2);
+    } else {
+        request.setRequestedSessionId(rest);
+        rest = "";
+    }
+    request.setRequestedSessionURL(true);
+    uri = uri.substring(0, semicolon) + rest;
+}
+
+String normalizedUri = normalize(uri);
+...
+if (normalizedUri == null) {
+    throw new ServletException("Invalid URI: " + uri + "'");
+}
+</pre>
+</div>
+
+<div class="box warn">
+  <div class="t">&#9888; 规范化是安全问题，不是格式问题</div>
+  <p>Web 服务器历史上最常见的漏洞之一就是路径穿越。攻击者会想尽办法绕过检查：<code>/..\..\</code>、<code>/%2e%2e/</code>、<code>/%252e%252e/</code>（双重编码）……这也是为什么 normalize 会拒绝所有编码过的 <code>.</code> <code>/</code> <code>\</code> <code>%</code>。</p>
+</div>
+
+<h2 id="headers">解析请求头和 Cookie</h2>
+
+<p><code>parseHeaders</code> 循环调用 <code>readHeader</code>，把每个头加进 <code>HttpRequest</code> 的 <code>headers</code> 表。有三个头需要特别处理：</p>
+
+<div class="tw">
+<table>
+  <tr><th>请求头</th><th>处理</th><th>对应的 Servlet API</th></tr>
+  <tr><td><code>cookie</code></td><td>用 <code>RequestUtil.parseCookieHeader</code> 拆成多个 <code>Cookie</code>；名为 <code>jsessionid</code> 的 Cookie 会覆盖 URL 里的会话 ID</td><td><code>getCookies()</code>、<code>getRequestedSessionId()</code></td></tr>
+  <tr><td><code>content-length</code></td><td>转成整数，非法就抛 <code>ServletException</code></td><td><code>getContentLength()</code></td></tr>
+  <tr><td><code>content-type</code></td><td>原样保存</td><td><code>getContentType()</code></td></tr>
+</table>
+</div>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/util/RequestUtil.java parseCookieHeader（原书）">
+<pre>
+// 输入："userName=budi; password=pwd;"
+public static Cookie[] parseCookieHeader(String header) {
+    if ((header == null) || (header.length() &lt; 1))
+        return (new Cookie[0]);
+    ArrayList cookies = new ArrayList();
+    while (header.length() &gt; 0) {
+        int semicolon = header.indexOf(';');
+        if (semicolon &lt; 0) semicolon = header.length();
+        if (semicolon == 0) break;
+        String token = header.substring(0, semicolon);
+        header = semicolon &lt; header.length() ? header.substring(semicolon + 1) : "";
+        int equals = token.indexOf('=');
+        if (equals &gt; 0) {
+            String name = token.substring(0, equals).trim();
+            String value = token.substring(equals + 1).trim();
+            cookies.add(new Cookie(name, value));
+        }
+    }
+    return ((Cookie[]) cookies.toArray(new Cookie[cookies.size()]));
+}
+</pre>
+</div>
+
+<h2 id="params">参数的懒解析</h2>
+
+<p>解析参数要做大量字符串操作和 URL 解码，很费 CPU。如果 Servlet 根本不调用 <code>getParameter</code>，这些工作就白做了。所以 <code>HttpProcessor</code> <strong>不解析参数</strong>，而是交给 <code>HttpRequest</code> 在第一次被问到时再解析：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="parseParameters 流程：已解析直接返回，否则解析查询串，若为 POST 表单再解析请求体，最后上锁">
+  <rect class="bx-p" x="20" y="20" width="240" height="44" rx="10"/>
+  <text class="mono" x="140" y="47" text-anchor="middle">getParameter("userName")</text>
+  <path class="ln" d="M140 66 V90" marker-end="url(#ar)"/>
+  <path class="bx-a" d="M140 92 L220 122 L140 152 L60 122 Z" style="stroke-width:1.5"/>
+  <text class="sm on-a" x="140" y="126" text-anchor="middle">parsed == true ?</text>
+  <path class="ln-g" d="M222 122 H330" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="276" y="114" text-anchor="middle">是</text>
+  <rect class="bx-g" x="332" y="100" width="190" height="44" rx="10"/>
+  <text class="sm" x="427" y="127" text-anchor="middle">直接从 parameters 里取值</text>
+
+  <path class="ln" d="M140 154 V178" marker-end="url(#ar)"/>
+  <text class="sm" x="150" y="170">否</text>
+  <rect class="bx-b" x="20" y="180" width="240" height="44" rx="10"/>
+  <text class="sm" x="140" y="200" text-anchor="middle">① 解析查询串</text>
+  <text class="sm mono" x="140" y="216" text-anchor="middle">userName=tarzan&amp;password=pwd</text>
+  <path class="ln" d="M262 202 H300" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="302" y="168" width="250" height="68" rx="10"/>
+  <text class="sm" x="427" y="188" text-anchor="middle">② 若 method == POST</text>
+  <text class="sm" x="427" y="206" text-anchor="middle">且 Content-Length &gt; 0 且 Content-Type 是</text>
+  <text class="sm mono" x="427" y="224" text-anchor="middle">application/x-www-form-urlencoded</text>
+  <path class="ln" d="M554 202 H592" marker-end="url(#ar)"/>
+  <rect class="bx-r" x="594" y="168" width="146" height="68" rx="10"/>
+  <text class="sm" x="667" y="192" text-anchor="middle">③ 上锁</text>
+  <text class="sm mono" x="667" y="210" text-anchor="middle">setLocked(true)</text>
+  <text class="sm mono" x="667" y="226" text-anchor="middle">parsed = true</text>
+  <text class="sm" x="427" y="268" text-anchor="middle">请求体读完后 SocketInputStream 就到底了，所以只能、也只需解析一次</text>
+</svg>
+<figcaption>图 3-7　参数只在第一次被访问时解析，而且只解析一次</figcaption>
+</figure>
+
+<p>Servlet 规范规定<strong>参数是只读的</strong>，所以 Tomcat 用了一个特殊的 <code>HashMap</code> 子类 <code>ParameterMap</code>：它有一个 <code>locked</code> 标志，上锁之后调用 <code>put</code>、<code>putAll</code>、<code>remove</code>、<code>clear</code> 都会抛 <code>IllegalStateException</code>。</p>
+
+<div class="vs">
+  <div class="old"><div class="h">原书：可上锁的 ParameterMap</div>
+<div class="code" data-lang="java">
+<pre>
+public final class ParameterMap extends HashMap {
+    private boolean locked = false;
+    public void setLocked(boolean locked) { ... }
+
+    public Object put(Object key, Object value) {
+        if (locked)
+            throw new IllegalStateException(
+                sm.getString("parameterMap.locked"));
+        return super.put(key, value);
+    }
+    // putAll、remove、clear 同理
+}
+</pre>
+</div>
+  </div>
+  <div class="new"><div class="h">Java 17：不可变视图</div>
+<div class="code" data-lang="java">
+<pre>
+Map&lt;String, String[]&gt; results = new LinkedHashMap&lt;&gt;();
+RequestUtil.parseParameters(results, queryString, charset);
+if (isPostForm) {
+    byte[] body = getInputStream()
+        .readNBytes((int) contentLength);   // Java 11
+    RequestUtil.parseParameters(results, ..., charset);
+}
+// 任何修改都抛 UnsupportedOperationException
+parameters = Collections.unmodifiableMap(results);
+</pre>
+</div>
+  </div>
+</div>
+
+<h2 id="response">HttpResponse 与「不丢最后一行」</h2>
+
+<p>第 2 章 <code>getWriter()</code> 返回的 <code>PrintWriter</code> 只在 <code>println</code> 时刷新。本章用一条输出链解决它：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 170" role="img" aria-label="ResponseWriter 包装 OutputStreamWriter 包装 ResponseStream 写到 socket">
+  <rect class="bx-p" x="20" y="50" width="150" height="64" rx="10"/>
+  <text class="mono on-p" x="95" y="78" text-anchor="middle">Servlet</text>
+  <text class="sm" x="95" y="98" text-anchor="middle">out.print("…")</text>
+  <rect class="bx-a" x="210" y="50" width="160" height="64" rx="10"/>
+  <text class="mono on-a" x="290" y="78" text-anchor="middle">ResponseWriter</text>
+  <text class="sm" x="290" y="98" text-anchor="middle">每次 print 都 flush</text>
+  <rect class="bx-b" x="410" y="50" width="160" height="64" rx="10"/>
+  <text class="mono on-b" x="490" y="78" text-anchor="middle">OutputStreamWriter</text>
+  <text class="sm" x="490" y="98" text-anchor="middle">字符 → 字节（按编码）</text>
+  <rect class="bx-g" x="610" y="50" width="130" height="64" rx="10"/>
+  <text class="mono on-g" x="675" y="78" text-anchor="middle">ResponseStream</text>
+  <text class="sm" x="675" y="98" text-anchor="middle">→ socket</text>
+  <path class="ln" d="M172 82 H206" marker-end="url(#ar)"/>
+  <path class="ln" d="M372 82 H406" marker-end="url(#ar)"/>
+  <path class="ln" d="M572 82 H606" marker-end="url(#ar)"/>
+  <text class="sm" x="380" y="150" text-anchor="middle">service() 返回后，ServletProcessor 再调用 response.finishResponse() 刷新并关闭 writer</text>
+</svg>
+<figcaption>图 3-8　原书本章的输出链</figcaption>
+</figure>
+
+<div class="code" data-lang="java" data-file="ex03/.../HttpResponse.java（原书，节选）">
+<pre>
+public PrintWriter getWriter() throws IOException {
+    ResponseStream newStream = new ResponseStream(this);
+    newStream.setCommit(false);
+    OutputStreamWriter osr = new OutputStreamWriter(newStream, getCharacterEncoding());
+    writer = new ResponseWriter(osr);
+    return writer;
+}
+
+public void finishResponse() {
+    // sendHeaders();          ← 注意：这一行在原书源码里是被注释掉的
+    if (writer != null) {
+        writer.flush();
+        writer.close();
+    }
+}
+</pre>
+</div>
+
+<div class="box key">
+  <div class="t">&#128273; 读源码时发现的小秘密</div>
+  <p><code>HttpResponse</code> 里明明写好了 <code>sendHeaders()</code>（输出状态行、<code>Content-Type</code>、<code>Content-Length</code> 和自定义头），但 <code>finishResponse()</code> 里调用它的那一行被注释掉了。所以本章 Servlet 的输出依然没有状态行，<code>setHeader("Server", ...)</code> 也没有真正发出去。第 4 章的 Tomcat 默认连接器才把这件事做完整。Java 17 版在本章就补上了。</p>
+</div>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch03/</code><code>connector/http/HttpProcessor.java</code><code>connector/http/HttpRequest.java</code><code>connector/http/HttpResponse.java</code><code>connector/http/RequestUtil.java</code></div>
+
+<p>类的划分和原书一一对应。主要差异如下：</p>
+
+<div class="tw">
+<table>
+  <tr><th>原书</th><th>Java 17 版</th><th>好处</th></tr>
+  <tr><td><code>HttpRequestLine</code>：3 个 <code>char[]</code> + 3 个下标 + <code>recycle()</code></td><td><code>record HttpRequestLine(String method, String uri, String protocol)</code></td><td>不可变、代码量从 148 行降到 1 行</td></tr>
+  <tr><td>手写字节状态机读请求行和请求头（537 行）</td><td>继承 <code>BufferedInputStream</code>，按行读取（约 80 行），并限制单行最长 8KB</td><td>易读；防止超长头部耗尽内存</td></tr>
+  <tr><td><code>if (name.equals("cookie")) ... else if ...</code></td><td><code>switch (name) { case "cookie" -&gt; ... }</code></td><td>箭头语法不会贯穿（fall-through）</td></tr>
+  <tr><td><code>ParameterMap</code> 加锁</td><td><code>Collections.unmodifiableMap</code></td><td>用标准库表达「只读」</td></tr>
+  <tr><td><code>URLDecoder.decode(s, "ISO-8859-1")</code> 要捕获异常</td><td><code>URLDecoder.decode(s, StandardCharsets.UTF_8)</code></td><td>Java 10 起支持 <code>Charset</code> 参数，默认 UTF-8 更符合现代浏览器</td></tr>
+  <tr><td>非法 URI：打印异常后断开连接</td><td>返回 <code>400 Bad Request</code></td><td>客户端能知道发生了什么</td></tr>
+  <tr><td><code>finishResponse()</code> 不发状态行</td><td>发送状态行 + <code>Content-Length</code> + <code>Date</code> + 自定义头 + 正文</td><td>合法的 HTTP/1.1 响应</td></tr>
+</table>
+</div>
+
+<h3>请求头的分派</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch03/connector/http/HttpProcessor.java（节选）">
+<pre>
+private void parseHeaders(SocketInputStream input) throws IOException, ServletException {
+    for (HttpHeader header; (header = input.readHeader()) != null; ) {
+        String name = header.name();
+        String value = header.value();
+        request.addHeader(name, value);
+        switch (name) {
+            case "cookie" -&gt; {
+                for (Cookie cookie : RequestUtil.parseCookieHeader(value)) {
+                    if (cookie.getName().equalsIgnoreCase("jsessionid")
+                            &amp;&amp; !request.isRequestedSessionIdFromCookie()) {
+                        request.setRequestedSessionId(cookie.getValue());
+                        request.setRequestedSessionCookie(true);
+                        request.setRequestedSessionURL(false);
+                    }
+                    request.addCookie(cookie);
+                }
+            }
+            case "content-length" -&gt; {
+                try {
+                    request.setContentLength(Long.parseLong(value));
+                } catch (NumberFormatException e) {
+                    throw new ServletException(sm.getString("httpProcessor.parseHeaders.contentLength"));
+                }
+            }
+            case "content-type" -&gt; request.setContentType(value);
+            default -&gt; { }
+        }
+    }
+}
+</pre>
+</div>
+
+<h3>按「段」规范化 URI</h3>
+
+<p>原书用三个 <code>while + indexOf</code> 循环分别处理 <code>//</code>、<code>/./</code>、<code>/../</code>。按 <code>/</code> 切成段再用一个栈处理，逻辑一目了然：</p>
+
+<div class="code" data-lang="java" data-file="java17/.../ch03/connector/http/RequestUtil.java（节选）">
+<pre>
+var segments = new ArrayList&lt;String&gt;();
+for (String seg : normalized.split("/")) {
+    switch (seg) {
+        case "", "." -&gt; { }                          // "//" 和 "/./" 直接跳过
+        case ".." -&gt; {
+            if (segments.isEmpty()) return null;     // 想跳出根目录
+            segments.remove(segments.size() - 1);    // 弹出上一段
+        }
+        default -&gt; segments.add(seg);
+    }
+}
+return "/" + String.join("/", segments);
+</pre>
+</div>
+
+<h3>多值参数的合并</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch03/connector/http/RequestUtil.java（节选）">
+<pre>
+// "a=1&amp;b=2&amp;a=3" → {a=[1, 3], b=[2]}
+map.merge(name, new String[] {value}, (old, add) -&gt; {
+    String[] all = Arrays.copyOf(old, old.length + 1);
+    all[old.length] = add[0];
+    return all;
+});
+</pre>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+# 原书
+java -classpath ./lib/servlet.jar:./ ex03.pyrmont.startup.Bootstrap
+
+# Java 17
+cd java17 &amp;&amp; ./run.sh ch03.startup.Bootstrap
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+$ curl -i http://localhost:8080/servlet/PrimitiveServlet
+HTTP/1.1 200 OK
+Content-Length: 39
+Date: Tue, 27 Oct 2026 16:47:47 GMT
+Server: Pyrmont Servlet Container (Java 17)
+
+Hello. Roses are red.
+Violets are blue.
+
+$ curl -b 'userName=budi; jsessionid=ABC' \
+    'http://localhost:8080/servlet/ModernServlet?userName=tarzan&amp;password=pwd'
+&lt;h2&gt;Headers&lt;/h2&gt;
+&lt;br&gt;host : localhost:8080
+&lt;br&gt;user-agent : curl/8.5.0
+&lt;br&gt;accept : */*
+&lt;br&gt;cookie : userName=budi; jsessionid=ABC
+&lt;h2&gt;Method&lt;/h2&gt;  &lt;br&gt;GET
+&lt;h2&gt;Parameters&lt;/h2&gt;
+&lt;br&gt;userName : tarzan
+&lt;br&gt;password : pwd
+...
+
+$ curl -d 'a=1&amp;b=%E4%BD%A0%E5%A5%BD' 'http://localhost:8080/servlet/ModernServlet?q=x'
+&lt;h2&gt;Parameters&lt;/h2&gt;
+&lt;br&gt;q : x
+&lt;br&gt;a : 1
+&lt;br&gt;b : 你好                    ← 查询串和请求体里的参数被合并
+
+$ curl -i --path-as-is http://localhost:8080/../pom.xml
+HTTP/1.1 400 Invalid URI: /../pom.xml
+</pre>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>连接器负责创建 <code>HttpServletRequest</code> / <code>HttpServletResponse</code>；它被拆成「等连接」的 HttpConnector 和「拆报文」的 HttpProcessor。</li>
+  <li>请求行要拆出查询串、处理绝对 URI、取出 URL 中的 <code>jsessionid</code>，并做安全的规范化。</li>
+  <li>请求头逐个读取，<code>cookie</code>、<code>content-length</code>、<code>content-type</code> 需要额外处理。</li>
+  <li>参数懒解析、只解析一次、解析完只读。</li>
+  <li><code>StringManager</code> 每个包一个单例，从 <code>LocalStrings*.properties</code> 读取多语言消息。</li>
+  <li>本章连接器每次只能处理一个请求，用完就关连接——下一章的 Tomcat 默认连接器解决这两个问题。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>写一个 Servlet，用 <code>getParameterMap().put("x", ...)</code> 尝试修改参数，观察抛出的异常。</li>
+    <li>用 <code>curl 'http://localhost:8080/servlet/ModernServlet;jsessionid=XYZ?a=1'</code> 请求，在 Servlet 里打印 <code>getRequestedSessionId()</code> 和 <code>isRequestedSessionIdFromURL()</code>。</li>
+    <li>给 <code>RequestUtil.normalize</code> 写一组单元测试，覆盖 <code>/a/./b</code>、<code>/a//b</code>、<code>/a/b/../c</code>、<code>/../x</code>、<code>/%2e%2e/x</code>。</li>
+    <li>用 <code>JAVA_TOOL_OPTIONS=-Duser.language=zh ./run.sh ch03.startup.Bootstrap</code> 启动，请求一个非法 URI，看控制台打印的错误消息是否变成了中文。再想想：为什么不该把中文放进 HTTP 状态行？（提示：状态行按 ISO-8859-1 编码。）</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

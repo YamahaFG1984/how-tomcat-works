@@ -1,0 +1,644 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 8 章 · 载入器 — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="8">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 8 章</span>
+<h1>载入器</h1>
+<p class="lede">
+  前几章我们用一个普通的 <code>URLClassLoader</code> 加载 Servlet。真正的 Servlet 容器不能这么做：
+  它要防止 Web 应用看到不该看的类，要让每个应用拥有独立的类空间，还要在类文件被重新编译后<strong>自动重新加载</strong>。
+  这些都由 Web 应用载入器 <code>WebappLoader</code> 和它内部的 <code>WebappClassLoader</code> 完成。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>复习 Java 的类加载器层次和双亲委派模型，理解它为什么关乎安全</li>
+    <li>理解 Tomcat 为什么需要自己的类加载器：隔离、缓存、自动重载</li>
+    <li>掌握 <code>Loader</code> / <code>Reloader</code> 接口、<code>WebappLoader</code>、<code>WebappClassLoader</code> 的分工</li>
+    <li>读懂 WebappClassLoader 的加载顺序：何时问父加载器，何时自己加载</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="jvm">Java 的类加载器</h2>
+
+<p>每次创建一个类的实例，JVM 都要先把这个类加载进内存，这件事由<strong>类加载器</strong>完成。从 J2SE 1.2 起，JVM 有三个类加载器，它们是父子关系：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="双亲委派：系统类加载器把请求交给扩展类加载器，再交给引导类加载器；父加载器找不到时子加载器才自己找">
+  <rect class="bx-p" x="40" y="20" width="300" height="60" rx="10"/>
+  <text class="ttl on-p" x="190" y="44" text-anchor="middle">引导类加载器 Bootstrap</text>
+  <text class="sm" x="190" y="64" text-anchor="middle">原生代码实现；java.lang、java.io…（rt.jar）</text>
+  <rect class="bx-b" x="40" y="130" width="300" height="60" rx="10"/>
+  <text class="ttl on-b" x="190" y="154" text-anchor="middle">扩展类加载器 Extension</text>
+  <text class="sm" x="190" y="174" text-anchor="middle">jre/lib/ext 目录下的 JAR</text>
+  <rect class="bx-g" x="40" y="240" width="300" height="60" rx="10"/>
+  <text class="ttl on-g" x="190" y="264" text-anchor="middle">系统类加载器 System</text>
+  <text class="sm" x="190" y="284" text-anchor="middle">CLASSPATH 中的目录和 JAR</text>
+
+  <path class="ln-a" d="M150 238 V194" marker-end="url(#ar-a)"/>
+  <path class="ln-a" d="M150 128 V84" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="80" y="220">① 先问父亲</text>
+  <text class="sm on-a" x="80" y="110">② 再问父亲</text>
+  <path class="ln-g" d="M230 84 V128" marker-end="url(#ar-g)"/>
+  <path class="ln-g" d="M230 194 V238" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="240" y="110">③ 父亲找不到才自己找</text>
+  <text class="sm on-g" x="240" y="220">④ 都找不到 → ClassNotFoundException</text>
+
+  <rect class="bx-r" x="400" y="40" width="340" height="140" rx="12"/>
+  <text class="ttl on-r" x="570" y="66" text-anchor="middle">为什么要绕这一圈？</text>
+  <text class="sm" x="570" y="92" text-anchor="middle">有人写了一个恶意的 java.lang.Object 放在 CLASSPATH 里</text>
+  <text class="sm" x="570" y="114" text-anchor="middle">系统加载器先交给父亲 → 一路到引导加载器</text>
+  <text class="sm" x="570" y="136" text-anchor="middle">引导加载器在核心库里找到了真正的 Object</text>
+  <text class="sm on-r" x="570" y="162" text-anchor="middle">→ 冒牌货永远没有机会被加载</text>
+
+  <rect class="bx-d" x="400" y="210" width="340" height="90" rx="12"/>
+  <text class="ttl" x="570" y="234" text-anchor="middle">Java 9 以后</text>
+  <text class="sm" x="570" y="256" text-anchor="middle">扩展机制被删除，换成「平台类加载器」Platform</text>
+  <text class="sm" x="570" y="276" text-anchor="middle">rt.jar 被拆成模块（java.base、java.sql…）</text>
+  <text class="sm" x="570" y="294" text-anchor="middle">「系统类加载器」也叫「应用类加载器」App</text>
+</svg>
+<figcaption>图 8-1　类加载器层次与双亲委派模型</figcaption>
+</figure>
+
+<p>你可以继承 <code>java.lang.ClassLoader</code> 写自己的类加载器。Tomcat 需要自定义类加载器的理由有三：</p>
+<ul>
+  <li><strong>指定加载规则</strong>：Servlet 只能使用 <code>WEB-INF/classes</code> 和 <code>WEB-INF/lib</code> 里的类，不能随意访问 JVM CLASSPATH 上的其他类（比如容器自己的内部类）。</li>
+  <li><strong>缓存</strong>已加载的类，也缓存「找不到」的类名，避免重复查找。</li>
+  <li><strong>预加载</strong>和<strong>自动重载</strong>：类文件被重新编译后，不重启 Tomcat 就能生效。</li>
+</ul>
+
+<p>本章两个术语：<strong>仓库（repository）</strong>是类加载器会去搜索的位置；<strong>资源（resources）</strong>指类加载器中的一个 <code>DirContext</code> 对象，它的文档根目录指向 Context 的 docBase。</p>
+
+<h2 id="interfaces">Loader 与 Reloader 接口</h2>
+
+<p>注意区分：Tomcat 的 <strong>Loader 是「Web 应用载入器」，不是类加载器</strong>。它内部持有一个类加载器，通过 <code>getClassLoader()</code> 取得。</p>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/Loader.java（Tomcat 4）">
+<pre>
+public interface Loader {
+    public ClassLoader getClassLoader();
+    public Container getContainer();
+    public void setContainer(Container container);
+    public DefaultContext getDefaultContext();
+    public void setDefaultContext(DefaultContext defaultContext);
+    public boolean getDelegate();                 // 是否先委派给父加载器
+    public void setDelegate(boolean delegate);
+    public String getInfo();
+    public boolean getReloadable();               // 是否支持自动重载
+    public void setReloadable(boolean reloadable);
+    public void addPropertyChangeListener(PropertyChangeListener listener);
+    public void addRepository(String repository);
+    public String[] findRepositories();
+    public boolean modified();                    // 仓库里有类被改过吗？
+    public void removePropertyChangeListener(PropertyChangeListener listener);
+}
+
+// 支持自动重载的类加载器必须实现它
+public interface Reloader {
+    public void addRepository(String repository);
+    public String[] findRepositories();
+    public boolean modified();
+}
+</pre>
+</div>
+
+<p>Loader 只负责<strong>发现</strong>修改，自己不做重载，而是调用 Context 的 <code>reload()</code>（第 12 章）。<code>StandardContext</code> 默认不开启重载，需要在 <code>server.xml</code> 里写：</p>
+
+<div class="code" data-lang="xml">
+<pre>
+&lt;Context path="/myApp" docBase="myApp" debug="0" reloadable="true"/&gt;
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 220" role="img" aria-label="Loader 接口、WebappLoader 与 WebappClassLoader 的关系">
+  <rect class="bx-d" x="20" y="20" width="170" height="40" rx="8"/><text class="mono" x="105" y="45" text-anchor="middle">«interface» Loader</text>
+  <rect class="bx-d" x="230" y="20" width="170" height="40" rx="8"/><text class="mono" x="315" y="45" text-anchor="middle">Lifecycle, Runnable</text>
+  <rect class="bx-a" x="100" y="110" width="220" height="60" rx="10"/>
+  <text class="ttl on-a" x="210" y="136" text-anchor="middle">WebappLoader</text>
+  <text class="sm" x="210" y="156" text-anchor="middle">Web 应用载入器 · 后台检查线程</text>
+  <path class="ln-d" d="M150 108 L110 62" marker-end="url(#ar)"/>
+  <path class="ln-d" d="M260 108 L300 62" marker-end="url(#ar)"/>
+
+  <rect class="bx-b" x="440" y="110" width="300" height="60" rx="10"/>
+  <text class="ttl on-b" x="590" y="136" text-anchor="middle">WebappClassLoader</text>
+  <text class="sm" x="590" y="156" text-anchor="middle">extends URLClassLoader implements Reloader</text>
+  <path class="ln" d="M322 140 H436" marker-end="url(#ar)"/>
+  <text class="sm" x="380" y="132" text-anchor="middle">持有</text>
+  <rect class="bx-d" x="490" y="20" width="200" height="40" rx="8"/><text class="mono" x="590" y="45" text-anchor="middle">«interface» Reloader</text>
+  <path class="ln-d" d="M590 108 V62" marker-end="url(#ar)"/>
+  <text class="sm" x="380" y="204" text-anchor="middle">容器需要 Servlet 类时：loader.getClassLoader().loadClass(name)（第 11 章）</text>
+</svg>
+<figcaption>图 8-2　Loader 接口及其实现（对应原书图 8.1）</figcaption>
+</figure>
+
+<h2 id="webapploader">WebappLoader 启动时做了什么</h2>
+
+<p>WebappLoader 实现了 Lifecycle，由关联的容器启停。它的 <code>start()</code> 完成五件事：</p>
+
+<ol class="steps">
+  <li><strong>创建类加载器</strong>：没有 <code>setClassLoader</code>，而是用 <code>loaderClass</code> 属性（默认 <code>WebappClassLoader</code> 的类名）通过反射创建，想换成自己的类加载器就继承 WebappClassLoader 并调用 <code>setLoaderClass</code>。</li>
+  <li><strong>设置仓库</strong>：把 <code>WEB-INF/classes</code> 交给 <code>addRepository</code>，把 <code>WEB-INF/lib</code> 交给 <code>setJarPath</code>。</li>
+  <li><strong>设置类路径</strong>：把类路径字符串存进 ServletContext 属性，供 Jasper JSP 编译器使用。</li>
+  <li><strong>设置权限</strong>：启用了安全管理器时，授予访问 <code>WEB-INF/classes</code>、<code>WEB-INF/lib</code> 的权限。</li>
+  <li><strong>启动自动重载线程</strong>：如果 reloadable，每隔 <code>checkInterval</code>（默认 15）秒检查一次。</li>
+</ol>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/loader/WebappLoader.java（Tomcat 4，节选）">
+<pre>
+public void run() {
+    while (!threadDone) {
+        threadSleep();                       // 睡 checkInterval 秒
+        if (!started)
+            break;
+        try {
+            if (!classLoader.modified())     // 有类被修改吗？
+                continue;
+        } catch (Exception e) {
+            log(sm.getString("webappLoader.failModifiedCheck"), e);
+            continue;
+        }
+        notifyContext();                     // 通知 Context 重载
+        break;
+    }
+}
+
+private void notifyContext() {
+    WebappContextNotifier notifier = new WebappContextNotifier();
+    (new Thread(notifier)).start();          // 另开一个线程！
+}
+
+protected class WebappContextNotifier implements Runnable {
+    public void run() {
+        ((Context) container).reload();
+    }
+}
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="自动重载流程：后台线程检查修改，另开线程调用 Context.reload，reload 停止并重新启动载入器">
+  <rect class="bx-b" x="20" y="20" width="220" height="100" rx="12"/>
+  <text class="ttl on-b" x="130" y="44" text-anchor="middle">WebappLoader 后台线程</text>
+  <text class="sm" x="130" y="68" text-anchor="middle">sleep(checkInterval)</text>
+  <text class="mono sm" x="130" y="88" text-anchor="middle">classLoader.modified() ?</text>
+  <text class="sm" x="130" y="108" text-anchor="middle">否 → 继续睡</text>
+  <path class="ln-a" d="M242 70 H300" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="270" y="62" text-anchor="middle">是</text>
+
+  <rect class="bx-a" x="302" y="20" width="200" height="100" rx="12"/>
+  <text class="ttl on-a" x="402" y="44" text-anchor="middle">新线程</text>
+  <text class="mono sm" x="402" y="66" text-anchor="middle">WebappContextNotifier</text>
+  <text class="mono sm" x="402" y="88" text-anchor="middle">context.reload()</text>
+  <path class="ln" d="M504 70 H550" marker-end="url(#ar)"/>
+
+  <rect class="bx-g" x="552" y="20" width="188" height="230" rx="12"/>
+  <text class="ttl on-g" x="646" y="44" text-anchor="middle">Context.reload()</text>
+  <text class="sm" x="646" y="72" text-anchor="middle">停止 Wrapper</text>
+  <text class="sm" x="646" y="90" text-anchor="middle">（Servlet.destroy）</text>
+  <text class="sm" x="646" y="114" text-anchor="middle">停止 WebappLoader</text>
+  <text class="sm" x="646" y="132" text-anchor="middle">（丢弃旧类加载器）</text>
+  <text class="sm" x="646" y="156" text-anchor="middle">启动 WebappLoader</text>
+  <text class="sm" x="646" y="174" text-anchor="middle">（新的类加载器）</text>
+  <text class="sm" x="646" y="198" text-anchor="middle">启动 Wrapper</text>
+  <text class="sm" x="646" y="222" text-anchor="middle">下次请求加载新类</text>
+
+  <rect class="bx-r" x="20" y="150" width="482" height="100" rx="12"/>
+  <text class="ttl on-r" x="261" y="174" text-anchor="middle">为什么不在后台线程里直接调 reload()？</text>
+  <text class="sm" x="261" y="198" text-anchor="middle">reload() 会停止 WebappLoader，而停止 WebappLoader 要结束这个后台线程。</text>
+  <text class="sm" x="261" y="218" text-anchor="middle">如果后台线程自己去调用，就成了「自己等自己结束」。</text>
+  <text class="sm" x="261" y="238" text-anchor="middle">所以检查线程只负责发现，交给另一个线程去执行重载。</text>
+</svg>
+<figcaption>图 8-3　自动重载的流程</figcaption>
+</figure>
+
+<div class="box note">
+  <div class="t">&#9432; Tomcat 5 的变化</div>
+  <p>Tomcat 5 起 WebappLoader 不再自己开线程，而是由 <code>ContainerBase</code> 里唯一一个后台线程定期调用各容器的 <code>backgroundProcess()</code>，再由 StandardContext 调用 <code>loader.backgroundProcess()</code> 检查修改。这样一整个 Tomcat 只需要一个后台线程（第 12 章）。</p>
+</div>
+
+<h2 id="classloader">WebappClassLoader</h2>
+
+<p>WebappClassLoader 继承 <code>URLClassLoader</code>，设计上兼顾了性能和安全。</p>
+
+<h3>安全：有些类必须交给父加载器</h3>
+
+<div class="code" data-lang="java" data-file="WebappClassLoader.java（Tomcat 4，节选）">
+<pre>
+// 这些类绝不允许 Web 应用自己加载
+private static final String[] triggers = {
+    "javax.servlet.Servlet"                // Servlet API
+};
+
+// 这些包（及其子包）的类必须先委派给父加载器
+private static final String[] packageTriggers = {
+    "javax",                               // Java 扩展
+    "org.xml.sax",                         // SAX 1 &amp; 2
+    "org.w3c.dom",                         // DOM 1 &amp; 2
+    "org.apache.xerces",                   // Xerces 1 &amp; 2
+    "org.apache.xalan"                     // Xalan
+};
+</pre>
+</div>
+
+<p>道理很简单：如果某个 Web 应用在 <code>WEB-INF/lib</code> 里放了一个自己的 <code>servlet-api.jar</code>，而容器又用它加载了 <code>javax.servlet.Servlet</code>，那么这个应用里的 Servlet 和容器认识的 Servlet 就是「两个不同的类」，强转时会抛 <code>ClassCastException</code>。</p>
+
+<h3>性能：两级缓存</h3>
+
+<p>每个可被加载的类（无论来自目录还是 JAR）在 Tomcat 里叫一个<strong>资源</strong>，用 <code>ResourceEntry</code> 表示：</p>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/loader/ResourceEntry.java">
+<pre>
+public class ResourceEntry {
+    public long lastModified = -1;           // 修改时间：判断是否需要重载
+    public byte[] binaryContent = null;      // 类的字节码
+    public Class loadedClass = null;
+    public URL source = null;
+    public URL codeBase = null;
+    public Manifest manifest = null;
+    public Certificate[] certificates = null;
+}
+</pre>
+</div>
+
+<p>已加载的资源放在 <code>HashMap resourceEntries</code> 中；找不到的类名放在 <code>HashMap notFoundResources</code> 中，下次直接抛 <code>ClassNotFoundException</code>。此外 <code>java.lang.ClassLoader</code> 自身也会记住加载过的类（<code>findLoadedClass</code>）。</p>
+
+<h3>加载顺序</h3>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 450" role="img" aria-label="WebappClassLoader.loadClass 的查找顺序流程图">
+  <rect class="bx" x="250" y="10" width="260" height="36" rx="8"/>
+  <text class="mono" x="380" y="33" text-anchor="middle">loadClass("com.shop.CartServlet")</text>
+
+  <rect class="bx-b" x="250" y="62" width="260" height="34" rx="8"/><text class="sm" x="380" y="84" text-anchor="middle">① 本地缓存 resourceEntries</text>
+  <rect class="bx-b" x="250" y="106" width="260" height="34" rx="8"/><text class="sm" x="380" y="128" text-anchor="middle">② JVM 缓存 findLoadedClass()</text>
+  <rect class="bx-b" x="250" y="150" width="260" height="34" rx="8"/><text class="sm" x="380" y="172" text-anchor="middle">③ 系统类加载器（防止覆盖 J2SE 类）</text>
+  <rect class="bx-r" x="250" y="194" width="260" height="34" rx="8"/><text class="sm" x="380" y="216" text-anchor="middle">④ 安全管理器：允许加载吗？</text>
+  <rect class="bx-p" x="250" y="238" width="260" height="48" rx="8"/>
+  <text class="sm" x="380" y="258" text-anchor="middle">⑤ delegate=true 或属于 packageTriggers</text>
+  <text class="sm" x="380" y="276" text-anchor="middle">→ 先问父加载器</text>
+  <rect class="bx-a" x="250" y="296" width="260" height="40" rx="8"/>
+  <text class="ttl on-a" x="380" y="321" text-anchor="middle">⑥ 在自己的仓库里找</text>
+  <rect class="bx-p" x="250" y="346" width="260" height="34" rx="8"/><text class="sm" x="380" y="368" text-anchor="middle">⑦ 没找到且 ⑤ 没问过 → 问父加载器</text>
+  <rect class="bx-r" x="250" y="390" width="260" height="34" rx="8"/><text class="sm" x="380" y="412" text-anchor="middle">⑧ ClassNotFoundException</text>
+  <path class="ln" d="M380 48 V60" marker-end="url(#ar)"/>
+  <path class="ln" d="M380 98 V104" marker-end="url(#ar)"/>
+  <path class="ln" d="M380 142 V148" marker-end="url(#ar)"/>
+  <path class="ln" d="M380 186 V192" marker-end="url(#ar)"/>
+  <path class="ln" d="M380 230 V236" marker-end="url(#ar)"/>
+  <path class="ln" d="M380 288 V294" marker-end="url(#ar)"/>
+  <path class="ln" d="M380 338 V344" marker-end="url(#ar)"/>
+  <path class="ln" d="M380 382 V388" marker-end="url(#ar)"/>
+
+  <path class="ln-g" d="M512 79 H600" marker-end="url(#ar-g)"/>
+  <path class="ln-g" d="M512 123 H600"/>
+  <path class="ln-g" d="M512 167 H600"/>
+  <path class="ln-g" d="M512 262 H600"/>
+  <path class="ln-g" d="M512 316 H600"/>
+  <path class="ln-g" d="M512 363 H600"/>
+  <path class="ln-g" d="M600 363 V79"/>
+  <rect class="bx-g" x="610" y="60" width="130" height="40" rx="8"/>
+  <text class="ttl on-g" x="675" y="85" text-anchor="middle">找到 → 返回</text>
+
+  <rect class="bx-d" x="20" y="238" width="210" height="130" rx="10"/>
+  <text class="ttl" x="125" y="262" text-anchor="middle">默认 delegate=false</text>
+  <text class="sm" x="125" y="286" text-anchor="middle">Web 应用自己的类优先</text>
+  <text class="sm" x="125" y="306" text-anchor="middle">（child-first）</text>
+  <text class="sm" x="125" y="330" text-anchor="middle">这与 JVM 默认的</text>
+  <text class="sm" x="125" y="350" text-anchor="middle">「父亲优先」正好相反</text>
+  <path class="ln-d" d="M232 300 H246"/>
+</svg>
+<figcaption>图 8-4　WebappClassLoader 的加载顺序</figcaption>
+</figure>
+
+<div class="box key">
+  <div class="t">&#128273; 为什么 Web 应用要「子优先」？</div>
+  <p>两个 Web 应用可能依赖同一个库的不同版本（比如一个用 Jackson 2.9，一个用 2.17）。如果先问父加载器，大家只能共用父加载器里那一个版本。子优先让每个应用优先使用自己 <code>WEB-INF/lib</code> 里的版本，而 Servlet API、JDK 核心类这些「必须统一」的类则通过 packageTriggers 强制交给父加载器。</p>
+</div>
+
+<h2 id="app">本章应用</h2>
+
+<p>从本章开始，应用使用 Tomcat 的真实组件：<code>StandardContext</code>（第 12 章详讲）和 <code>WebappLoader</code>，同时保留第 5 章的 <code>SimpleWrapper</code> 等类。Servlet 必须放在应用目录 <code>myApp/WEB-INF/classes</code> 下。</p>
+
+<p>StandardContext 启动时要求有人把它标记为「已配置」，否则不会启动。正式的 Tomcat 里这是 <code>ContextConfig</code>（第 15 章）的工作，本章用一个极简的监听器代替：</p>
+
+<div class="code" data-lang="java" data-file="ex08/pyrmont/core/SimpleContextConfig.java">
+<pre>
+public class SimpleContextConfig implements LifecycleListener {
+    public void lifecycleEvent(LifecycleEvent event) {
+        if (Lifecycle.START_EVENT.equals(event.getType())) {
+            Context context = (Context) event.getLifecycle();
+            context.setConfigured(true);
+        }
+    }
+}
+</pre>
+</div>
+
+<div class="code" data-lang="java" data-file="ex08/pyrmont/startup/Bootstrap.java（节选）">
+<pre>
+System.setProperty("catalina.base", System.getProperty("user.dir"));
+Connector connector = new HttpConnector();
+...
+Context context = new StandardContext();
+context.setPath("/myApp");                    // 等价于 &lt;Context path="/myApp" docBase="myApp"/&gt;
+context.setDocBase("myApp");
+context.addChild(wrapper1);
+context.addChild(wrapper2);
+context.addServletMapping("/Primitive", "Primitive");
+context.addServletMapping("/Modern", "Modern");
+((Lifecycle) context).addLifecycleListener(new SimpleContextConfig());
+
+Loader loader = new WebappLoader();
+context.setLoader(loader);
+connector.setContainer(context);
+connector.initialize();
+((Lifecycle) connector).start();
+((Lifecycle) context).start();
+
+WebappClassLoader classLoader = (WebappClassLoader) loader.getClassLoader();
+System.out.println("Resources' docBase: " + ((ProxyDirContext) classLoader.getResources()).getDocBase());
+String[] repositories = classLoader.findRepositories();
+for (int i = 0; i &lt; repositories.length; i++) {
+    System.out.println("  repository: " + repositories[i]);
+}
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+Resources' docBase: C:\HowTomcatWorks\myApp
+  repository: /WEB-INF/classes/
+</pre>
+</div>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch08/loader/</code><code>core/SimpleContext.java</code><code>startup/Bootstrap.java</code><code>tomcat/EmbeddedReload.java</code><code>java17/myApp/</code></div>
+
+<p>Java 17 版自己实现了一个精简的 <code>WebappClassLoader</code> 和 <code>WebappLoader</code>，接在前几章的迷你容器上，完整演示「隔离 + 子优先 + 自动重载」；另外用 Tomcat 11 部署同一个 <code>myApp</code> 做对照。</p>
+
+<h3>① WebappClassLoader：七步加载</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch08/loader/WebappClassLoader.java（节选）">
+<pre>
+static {
+    registerAsParallelCapable();         // Java 7：按类名分别加锁，可以并行加载不同的类
+}
+
+record ResourceEntry(Class&lt;?&gt; loadedClass, Path source, long lastModified) { }
+
+private final Map&lt;String, ResourceEntry&gt; resourceEntries = new ConcurrentHashMap&lt;&gt;();
+private final Set&lt;String&gt; notFoundResources = ConcurrentHashMap.newKeySet();
+
+@Override
+protected Class&lt;?&gt; loadClass(String name, boolean resolve) throws ClassNotFoundException {
+    synchronized (getClassLoadingLock(name)) {
+        ResourceEntry entry = resourceEntries.get(name);                         // ①
+        if (entry != null) return entry.loadedClass();
+        Class&lt;?&gt; clazz = findLoadedClass(name);                                  // ②
+        if (clazz != null) return clazz;
+        if (notFoundResources.contains(name)) throw new ClassNotFoundException(name);   // ③
+
+        boolean delegateFirst = delegate || PACKAGE_TRIGGERS.stream().anyMatch(name::startsWith);
+        if (delegateFirst) {                                                     // ④
+            try { return getParent().loadClass(name); } catch (ClassNotFoundException ignored) { }
+        }
+        try {                                                                    // ⑤ 子优先
+            clazz = findClass(name);
+            resourceEntries.put(name, new ResourceEntry(clazz, sourceOf(name), lastModified(sourceOf(name))));
+            return clazz;
+        } catch (ClassNotFoundException ignored) { }
+        if (!delegateFirst) {                                                    // ⑥
+            try { return getParent().loadClass(name); } catch (ClassNotFoundException ignored) { }
+        }
+        notFoundResources.add(name);                                             // ⑦
+        throw new ClassNotFoundException(name);
+    }
+}
+
+public boolean modified() {
+    for (ResourceEntry entry : resourceEntries.values()) {
+        if (entry.source() != null &amp;&amp; lastModified(entry.source()) != entry.lastModified()) {
+            return true;
+        }
+    }
+    return false;
+}
+</pre>
+</div>
+
+<p>其中 <code>PACKAGE_TRIGGERS = List.of("java.", "javax.", "jakarta.", "org.xml.sax.", "org.w3c.dom.")</code>。注意 Tomcat 10 起 Servlet API 在 <code>jakarta</code> 包里，所以触发列表里一定要有它。</p>
+
+<h3>② 用一个「过滤型」父加载器实现隔离</h3>
+
+<p>WebappClassLoader 的父加载器是 <code>SharedClassLoader</code>：它以 JDK 的平台类加载器为父，只额外放行 <code>jakarta.*</code>。于是 Web 应用能看到 JDK 和 Servlet API，却看不到容器自己的类：</p>
+
+<div class="code" data-lang="java" data-file="java17/.../ch08/loader/SharedClassLoader.java（节选）">
+<pre>
+public SharedClassLoader() {
+    super("shared", ClassLoader.getPlatformClassLoader());   // Java 9 的平台类加载器
+}
+
+@Override
+protected Class&lt;?&gt; findClass(String name) throws ClassNotFoundException {
+    if (name.startsWith("jakarta.")) {
+        return application.loadClass(name);                   // Servlet API 放行
+    }
+    throw new ClassNotFoundException(name);                   // 容器内部类：看不见
+}
+</pre>
+</div>
+
+<h3>③ 后台检查：ScheduledExecutorService</h3>
+
+<div class="vs">
+  <div class="old"><div class="h">原书：Runnable + 自己管理线程</div>
+<div class="code" data-lang="java">
+<pre>
+public void run() {
+    while (!threadDone) {
+        threadSleep();
+        if (!started) break;
+        if (!classLoader.modified()) continue;
+        notifyContext();
+        break;
+    }
+}
+// start() 里 threadStart()，stop() 里
+// threadStop()：设标志、interrupt、join……
+</pre>
+</div>
+  </div>
+  <div class="new"><div class="h">Java 17：定时任务</div>
+<div class="code" data-lang="java">
+<pre>
+checker = Executors.newSingleThreadScheduledExecutor(r -&gt; {
+    var t = new Thread(r, "WebappLoader[myApp]");
+    t.setDaemon(true);
+    return t;
+});
+checker.scheduleWithFixedDelay(this::check,
+        checkInterval, checkInterval, TimeUnit.SECONDS);
+
+private void check() {
+    if (classLoader.modified()) {
+        new Thread(reloadAction, "WebappContextNotifier").start();
+    }
+}
+// stop()：checker.shutdownNow(); classLoader.close();
+</pre>
+</div>
+  </div>
+</div>
+
+<p><code>URLClassLoader.close()</code>（Java 7 新增）会释放打开的 JAR 文件句柄。在 Windows 上，不关闭类加载器就无法删除或覆盖 <code>WEB-INF/lib</code> 里的 JAR——这曾是 Tomcat 重载、重新部署时的一大顽疾。</p>
+
+<h3>④ Context.reload()</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch08/core/SimpleContext.java（节选）">
+<pre>
+public synchronized void reload() {
+    System.out.println("===== 检测到类被修改，重新加载 Context =====");
+    try {
+        stop();        // Wrapper 调用 Servlet.destroy()，载入器关闭旧的类加载器
+        start();       // 载入器创建新的类加载器，Servlet 在下次请求时用新类重新加载
+    } catch (LifecycleException e) {
+        e.printStackTrace();
+    }
+}
+</pre>
+</div>
+
+<div class="box tip">
+  <div class="t">&#128161; 同名的类，为什么能加载两次？</div>
+  <p>JVM 用「类名 + 加载它的类加载器」来唯一确定一个类。旧类加载器里的 <code>HelloServlet</code> 和新类加载器里的 <code>HelloServlet</code> 是两个不同的类。旧的类加载器、旧的类、旧的 Servlet 实例没有引用之后会一起被垃圾回收——前提是没有东西还引用着它们（比如 ThreadLocal、JDBC 驱动注册表），否则就会造成著名的「重载内存泄漏」。</p>
+</div>
+
+<h3>⑤ Tomcat 11 的做法</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch08/tomcat/EmbeddedReload.java（节选）">
+<pre>
+tomcat.getEngine().setBackgroundProcessorDelay(3);   // 唯一的后台线程，每 3 秒巡检一次
+Context context = tomcat.addContext("/myApp", myApp.toString());
+var config = new ContextConfig();                     // 读 WEB-INF/web.xml
+config.setDefaultWebXml(Constants.NoDefaultWebXml);
+context.addLifecycleListener(config);
+context.setReloadable(true);                          // 等价于 reloadable="true"
+tomcat.start();
+
+var loader = (WebappClassLoaderBase) context.getLoader().getClassLoader();
+// → org.apache.catalina.loader.ParallelWebappClassLoader, delegate = false
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="独立部署的 Tomcat 11 类加载器层次：Bootstrap、System、Common、各 Web 应用">
+  <rect class="bx-p" x="270" y="16" width="220" height="40" rx="8"/>
+  <text class="mono" x="380" y="41" text-anchor="middle">Bootstrap / Platform（JDK）</text>
+  <rect class="bx-b" x="270" y="76" width="220" height="40" rx="8"/>
+  <text class="mono" x="380" y="96" text-anchor="middle">System</text>
+  <text class="sm" x="380" y="110" text-anchor="middle">bootstrap.jar、tomcat-juli.jar</text>
+  <rect class="bx-g" x="270" y="136" width="220" height="40" rx="8"/>
+  <text class="mono" x="380" y="156" text-anchor="middle">Common</text>
+  <text class="sm" x="380" y="170" text-anchor="middle">$CATALINA_HOME/lib/*.jar</text>
+  <rect class="bx-a" x="120" y="196" width="220" height="40" rx="8"/>
+  <text class="mono" x="230" y="221" text-anchor="middle">WebappClassLoader（app1）</text>
+  <rect class="bx-a" x="420" y="196" width="220" height="40" rx="8"/>
+  <text class="mono" x="530" y="221" text-anchor="middle">WebappClassLoader（app2）</text>
+  <path class="ln" d="M380 74 V58" marker-end="url(#ar)"/>
+  <path class="ln" d="M380 134 V118" marker-end="url(#ar)"/>
+  <path class="ln" d="M260 194 L330 178" marker-end="url(#ar)"/>
+  <path class="ln" d="M500 194 L430 178" marker-end="url(#ar)"/>
+  <text class="sm" x="530" y="96">箭头指向父加载器</text>
+  <text class="sm" x="530" y="150">Tomcat 4/5 还有 catalina、</text>
+  <text class="sm" x="530" y="166">shared 两层，Tomcat 6 起</text>
+  <text class="sm" x="530" y="182">默认合并进 Common</text>
+</svg>
+<figcaption>图 8-5　独立部署的 Tomcat 11 类加载器层次</figcaption>
+</figure>
+
+<div class="box warn">
+  <div class="t">&#9888; 嵌入式 Tomcat 没有这层隔离</div>
+  <p>嵌入式运行时，Tomcat 自己和你的代码都在同一个 CLASSPATH 上，WebappClassLoader 的父加载器就是应用类加载器，所以 <code>HelloServlet</code> 在 Tomcat 11 版本里输出的是「能看到容器的内部类」。这也是 Spring Boot 这类「一个 JAR 一个应用」的部署方式不再强调类隔离的原因。</p>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch08.startup.Bootstrap                    # 迷你容器 + 自己写的 WebappLoader
+curl http://localhost:8080/Hello
+
+# 另开一个终端：修改 webroot/HelloServlet.java 里的 MESSAGE，重新编译
+sed -i 's/version 1/version 2/' webroot/HelloServlet.java
+./compile-servlets.sh
+sleep 5; curl http://localhost:8080/Hello          # 不用重启，已经是 version 2
+
+./run.sh ch08.tomcat.EmbeddedReload                # Tomcat 11：http://localhost:8080/myApp/Hello
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+docBase: /home/ubuntu/how-tomcat-works/java17/myApp
+  repository: file:/home/ubuntu/how-tomcat-works/java17/myApp/WEB-INF/classes/
+
+$ curl http://localhost:8080/Hello
+Hello, version 1
+loaded by: WebappClassLoader[webapp:myApp, delegate=false]
+看不到容器的内部类 modern.ch08.startup.Bootstrap（隔离生效）
+
+（重新编译后，服务器控制台）
+WebappClassLoader: HelloServlet.class 已被修改
+===== 检测到类被修改，重新加载 Context =====
+Stopping wrapper Primitive
+Stopping wrapper Hello
+Stopping wrapper Modern
+Starting Wrapper Primitive
+Starting Wrapper Hello
+Starting Wrapper Modern
+
+$ curl http://localhost:8080/Hello
+Hello, version 2
+</pre>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>JVM 用双亲委派保证核心类不会被冒名顶替；Tomcat 为了隔离、缓存和重载，需要自己的类加载器。</li>
+  <li>Loader（WebappLoader）是 Web 应用载入器，内部持有类加载器（WebappClassLoader）；它负责发现修改，重载由 Context 执行。</li>
+  <li>WebappClassLoader 的仓库是 <code>WEB-INF/classes</code> 和 <code>WEB-INF/lib</code>；默认子优先，但 Servlet API 和 JDK 类必须交给父加载器。</li>
+  <li>它缓存已加载的类和找不到的类名，并记录修改时间供 <code>modified()</code> 判断。</li>
+  <li>重载 = 丢弃旧类加载器、创建新类加载器；同名类因为类加载器不同而成为不同的类。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>在 Java 17 版里把 <code>delegate</code> 设为 <code>true</code>，再在 webroot 外（应用类路径上）放一个同名的 <code>HelloServlet</code>，观察到底加载了哪一个。</li>
+    <li>用 <code>java.nio.file.WatchService</code> 改写 <code>WebappLoader</code>：不再定时轮询，而是在 <code>WEB-INF/classes</code> 有文件变化时立刻触发重载。想一想：一次 <code>javac</code> 会写多个文件，怎样避免连续触发多次重载？</li>
+    <li>给 <code>HelloServlet</code> 加一个 <code>static ThreadLocal&lt;byte[]&gt;</code>，在请求线程里放入 1MB 数据且不清除。反复重载十几次后用 <code>jcmd &lt;pid&gt; GC.class_histogram</code> 观察 <code>HelloServlet</code> 类的数量，理解「重载内存泄漏」。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

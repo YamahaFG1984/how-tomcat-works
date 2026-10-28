@@ -1,0 +1,591 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 15 章 · Digester — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="15">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 15 章</span>
+<h1>Digester</h1>
+<p class="lede">
+  前面所有的启动类都是把组件「写死」在代码里：new 一个连接器，new 一个 Context，调一串 setter……改一个端口号都要重新编译。
+  真正的 Tomcat 把这些写在 <code>server.xml</code> 和 <code>web.xml</code> 里，靠一个叫 <strong>Digester</strong> 的库把 XML 元素变成 Java 对象。
+  这一章先学 Digester 的用法和原理，再看 <code>ContextConfig</code> 如何用它解析 web.xml、配置 Context。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>理解 Digester 的三个核心概念：模式（pattern）、规则（rule）、对象栈</li>
+    <li>会用 <code>addObjectCreate</code>、<code>addSetProperties</code>、<code>addSetNext</code>、<code>addCallMethod</code>、<code>RuleSet</code></li>
+    <li>亲手实现一个迷你 Digester，弄懂它在 SAX 事件上是怎么运转的</li>
+    <li>理解 <code>ContextConfig</code> 的工作：解析默认 web.xml 和应用 web.xml、安装认证器、设置 configured</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="why">从硬编码到 XML 配置</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="把 Java 代码中的对象创建和 setter 调用换成 XML 元素和属性">
+  <rect class="bx-r" x="20" y="20" width="330" height="190" rx="12"/>
+  <text class="ttl on-r" x="40" y="44">以前：写死在 Bootstrap 里</text>
+  <text class="mono sm" x="40" y="72">Context context = new StandardContext();</text>
+  <text class="mono sm" x="40" y="92">context.setPath("/myApp");</text>
+  <text class="mono sm" x="40" y="112">context.setDocBase("myApp");</text>
+  <text class="mono sm" x="40" y="132">context.setLoader(new WebappLoader());</text>
+  <text class="mono sm" x="40" y="152">host.addChild(context);</text>
+  <text class="sm on-r" x="40" y="190">改任何东西都要重新编译</text>
+
+  <path class="ln-a" d="M354 115 H406" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="380" y="105" text-anchor="middle">Digester</text>
+
+  <rect class="bx-g" x="410" y="20" width="330" height="190" rx="12"/>
+  <text class="ttl on-g" x="430" y="44">现在：写在 server.xml 里</text>
+  <text class="mono sm" x="430" y="80">&lt;Host name="localhost"&gt;</text>
+  <text class="mono sm" x="446" y="102">&lt;Context path="/myApp"</text>
+  <text class="mono sm" x="510" y="122">docBase="myApp"/&gt;</text>
+  <text class="mono sm" x="430" y="144">&lt;/Host&gt;</text>
+  <text class="sm on-g" x="430" y="190">元素 → 对象；属性 → setter；嵌套 → addChild</text>
+</svg>
+<figcaption>图 15-1　每个 XML 元素变成一个 Java 对象，每个属性变成一次 setter 调用</figcaption>
+</figure>
+
+<p>Digester 原本是 Apache Jakarta Commons 的一个子项目（<code>commons-digester.jar</code>）。从 Tomcat 6 开始，Tomcat 把它复制进了自己的代码库，包名变成 <code>org.apache.tomcat.util.digester</code>，API 基本不变。</p>
+
+<h2 id="concepts">模式、规则与对象栈</h2>
+
+<h3>模式（pattern）</h3>
+
+<p>根元素的模式就是元素名；子元素的模式是「父元素的模式 + <code>/</code> + 元素名」：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="employee、employee/office、employee/office/address 三个模式">
+  <text class="mono sm" x="20" y="34">&lt;employee firstName="Brian" lastName="May"&gt;</text>
+  <text class="mono sm" x="40" y="62">&lt;office&gt;</text>
+  <text class="mono sm" x="60" y="90">&lt;address streetName="Wellington Street" streetNumber="110"/&gt;</text>
+  <text class="mono sm" x="40" y="118">&lt;/office&gt;</text>
+  <text class="mono sm" x="20" y="146">&lt;/employee&gt;</text>
+  <rect class="bx-a" x="520" y="18" width="220" height="26" rx="6"/><text class="mono sm on-a" x="630" y="36" text-anchor="middle">employee</text>
+  <rect class="bx-b" x="520" y="48" width="220" height="26" rx="6"/><text class="mono sm on-b" x="630" y="66" text-anchor="middle">employee/office</text>
+  <rect class="bx-p" x="520" y="78" width="220" height="26" rx="6"/><text class="mono sm on-p" x="630" y="96" text-anchor="middle">employee/office/address</text>
+  <path class="ln-d" d="M330 30 H516"/>
+  <path class="ln-d" d="M110 58 H516"/>
+  <path class="ln-d" d="M500 86 H516"/>
+  <text class="sm" x="380" y="186" text-anchor="middle">规则注册在模式上：遇到匹配模式的元素时，Digester 执行这个模式上的所有规则</text>
+</svg>
+<figcaption>图 15-2　元素与模式的对应关系</figcaption>
+</figure>
+
+<h3>规则（rule）</h3>
+
+<p>规则由 <code>Rule</code> 类表示，最重要的两个方法是 <code>begin</code>（遇到开始标签时调用）和 <code>end</code>（遇到结束标签时调用）。Digester 内部用 <code>Rules</code> 对象保存「模式 → 规则列表」。常用的预定义规则：</p>
+
+<div class="tw">
+<table>
+  <tr><th>方法</th><th>规则类</th><th>作用</th></tr>
+  <tr><td><code>addObjectCreate(pattern, className)</code></td><td>ObjectCreateRule</td><td>begin：创建对象并<strong>压栈</strong>；end：出栈。也可以用属性（如 <code>className</code>）在运行时指定类名</td></tr>
+  <tr><td><code>addSetProperties(pattern)</code></td><td>SetPropertiesRule</td><td>把元素的每个属性 <code>name="v"</code> 变成栈顶对象的 <code>setName("v")</code></td></tr>
+  <tr><td><code>addCallMethod(pattern, method)</code></td><td>CallMethodRule</td><td>调用栈顶对象的方法；带参数个数时，参数由子元素的 <code>addCallParam</code> 收集</td></tr>
+  <tr><td><code>addSetNext(pattern, method)</code></td><td>SetNextRule</td><td>end：调用<strong>次栈顶</strong>对象的 <code>method(栈顶对象)</code>，建立父子关系</td></tr>
+</table>
+</div>
+
+<h3>对象栈</h3>
+
+<p>Digester 内部有一个栈（原书比喻成一口井）。<code>addObjectCreate</code> 创建的对象被压进去，元素结束时弹出；<code>addSetNext</code> 在弹出之前把栈顶对象交给它下面的对象。下面是解析 <code>employee2.xml</code> 时栈的变化：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="解析过程中对象栈的变化：压入 Employee、Office、Address，结束 address 时 setAddress 并出栈，结束 office 时 addOffice 并出栈">
+  <text class="sm" x="80" y="20" text-anchor="middle">&lt;employee&gt;</text>
+  <rect class="bx-a" x="20" y="230" width="120" height="40" rx="4"/><text class="mono sm" x="80" y="255" text-anchor="middle">Employee</text>
+
+  <text class="sm" x="230" y="20" text-anchor="middle">&lt;office&gt;</text>
+  <rect class="bx-a" x="170" y="230" width="120" height="40" rx="4"/><text class="mono sm" x="230" y="255" text-anchor="middle">Employee</text>
+  <rect class="bx-b" x="170" y="186" width="120" height="40" rx="4"/><text class="mono sm" x="230" y="211" text-anchor="middle">Office</text>
+
+  <text class="sm" x="380" y="20" text-anchor="middle">&lt;address&gt;</text>
+  <rect class="bx-a" x="320" y="230" width="120" height="40" rx="4"/><text class="mono sm" x="380" y="255" text-anchor="middle">Employee</text>
+  <rect class="bx-b" x="320" y="186" width="120" height="40" rx="4"/><text class="mono sm" x="380" y="211" text-anchor="middle">Office</text>
+  <rect class="bx-p" x="320" y="142" width="120" height="40" rx="4"/><text class="mono sm" x="380" y="167" text-anchor="middle">Address</text>
+
+  <text class="sm" x="530" y="20" text-anchor="middle">&lt;/address&gt;</text>
+  <rect class="bx-a" x="470" y="230" width="120" height="40" rx="4"/><text class="mono sm" x="530" y="255" text-anchor="middle">Employee</text>
+  <rect class="bx-b" x="470" y="186" width="120" height="40" rx="4"/><text class="mono sm" x="530" y="211" text-anchor="middle">Office</text>
+  <rect class="bx-d" x="470" y="142" width="120" height="40" rx="4"/><text class="mono sm" x="530" y="167" text-anchor="middle">Address 出栈</text>
+  <text class="sm on-p" x="530" y="50" text-anchor="middle">① SetNext:</text>
+  <text class="mono sm on-p" x="530" y="68" text-anchor="middle">office.setAddress(addr)</text>
+  <text class="sm" x="530" y="86" text-anchor="middle">② ObjectCreate.end: pop</text>
+
+  <text class="sm" x="680" y="20" text-anchor="middle">&lt;/office&gt;</text>
+  <rect class="bx-a" x="620" y="230" width="120" height="40" rx="4"/><text class="mono sm" x="680" y="255" text-anchor="middle">Employee</text>
+  <rect class="bx-d" x="620" y="186" width="120" height="40" rx="4"/><text class="mono sm" x="680" y="211" text-anchor="middle">Office 出栈</text>
+  <text class="mono sm on-b" x="680" y="120" text-anchor="middle">emp.addOffice(office)</text>
+
+  <path class="ln" d="M20 280 H740"/>
+  <text class="sm" x="380" y="296" text-anchor="middle">栈底的 Employee 是第一个被压入的对象，也是 digester.parse() 的返回值</text>
+</svg>
+<figcaption>图 15-3　对象栈的变化</figcaption>
+</figure>
+
+<div class="box key">
+  <div class="t">&#128273; 为什么 end 要倒着执行</div>
+  <p>同一个模式上注册了 <code>ObjectCreate</code> 和 <code>SetNext</code> 两条规则。结束标签时如果先执行 ObjectCreate.end（出栈），SetNext 就找不到要交给父对象的那个子对象了。所以 Digester 按注册顺序调用 begin，按<strong>相反顺序</strong>调用 end——这样「先创建的最后清理」，和栈的性质一致。</p>
+</div>
+
+<h2 id="examples">三个例子</h2>
+
+<h3>例 1：创建对象、设置属性、调用方法</h3>
+
+<div class="code" data-lang="java" data-file="ex15/pyrmont/digestertest/Test01.java（节选）">
+<pre>
+Digester digester = new Digester();
+digester.addObjectCreate("employee", "ex15.pyrmont.digestertest.Employee");
+digester.addSetProperties("employee");
+digester.addCallMethod("employee", "printName");
+Employee employee = (Employee) digester.parse(file);   // etc/employee1.xml
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+Creating Employee                ← ObjectCreate：调用构造器
+Setting firstName : Brian        ← SetProperties：firstName="Brian" → setFirstName("Brian")
+Setting lastName : May
+My name is Brian May             ← CallMethod：printName()
+First name : Brian
+Last name : May
+</pre>
+</div>
+
+<h3>例 2：用 SetNext 建立对象关系</h3>
+
+<div class="code" data-lang="java" data-file="ex15/pyrmont/digestertest/Test02.java（节选）">
+<pre>
+digester.addObjectCreate("employee", "ex15.pyrmont.digestertest.Employee");
+digester.addSetProperties("employee");
+digester.addObjectCreate("employee/office", "ex15.pyrmont.digestertest.Office");
+digester.addSetProperties("employee/office");
+digester.addSetNext("employee/office", "addOffice");             // employee.addOffice(office)
+digester.addObjectCreate("employee/office/address", "ex15.pyrmont.digestertest.Address");
+digester.addSetProperties("employee/office/address");
+digester.addSetNext("employee/office/address", "setAddress");    // office.setAddress(address)
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+Creating Employee
+Setting firstName : Freddie
+Setting lastName : Mercury
+..Creating Office
+..Setting office description : Headquarters
+....Creating Address
+....Setting streetName : Wellington Avenue
+....Setting streetNumber : 223
+..Setting office address : ....223 Wellington Avenue
+Adding Office to this employee
+..Creating Office
+...
+-------------------------------------------------
+Headquarters
+Address : 223 Wellington Avenue
+</pre>
+</div>
+
+<h3>例 3：用 RuleSet 打包规则</h3>
+
+<p><code>RuleSet</code> 接口把一组规则封装起来，<code>digester.addRuleSet(ruleSet)</code> 会调用它的 <code>addRuleInstances(digester)</code>。Catalina 正是这样组织 server.xml、web.xml 的解析规则的（<code>WebRuleSet</code>、<code>ContextRuleSet</code>……）。</p>
+
+<div class="code" data-lang="java" data-file="ex15/pyrmont/digestertest/EmployeeRuleSet.java（节选）">
+<pre>
+public class EmployeeRuleSet extends RuleSetBase {
+    public void addRuleInstances(Digester digester) {
+        digester.addObjectCreate("employee", "ex15.pyrmont.digestertest.Employee");
+        digester.addSetProperties("employee");
+        ... // 和 Test02 相同的规则
+    }
+}
+
+// Test03
+Digester digester = new Digester();
+digester.addRuleSet(new EmployeeRuleSet());
+</pre>
+</div>
+
+<h3>规则是怎么实现的</h3>
+
+<p>所有 <code>addXxx</code> 方法最终都调用 <code>addRule(pattern, rule)</code>。以 ObjectCreateRule 为例：</p>
+
+<div class="code" data-lang="java" data-file="ObjectCreateRule（节选）">
+<pre>
+public void begin(Attributes attributes) throws Exception {
+    String realClassName = className;
+    if (attributeName != null) {                      // 允许 XML 里用属性指定类名
+        String value = attributes.getValue(attributeName);
+        if (value != null) realClassName = value;
+    }
+    Class clazz = digester.getClassLoader().loadClass(realClassName);
+    Object instance = clazz.newInstance();
+    digester.push(instance);
+}
+
+public void end() throws Exception {
+    Object top = digester.pop();
+}
+</pre>
+</div>
+
+<h2 id="contextconfig">ContextConfig</h2>
+
+<p>StandardContext 和其他容器不同，它<strong>必须</strong>有一个监听器来配置它。前几章用的是只会 <code>setConfigured(true)</code> 的 SimpleContextConfig；正式的 Tomcat 用 <code>org.apache.catalina.startup.ContextConfig</code>，它做的事情多得多：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="ContextConfig.start 的步骤">
+  <rect class="bx-a" x="20" y="20" width="250" height="40" rx="8"/>
+  <text class="mono sm on-a" x="145" y="45" text-anchor="middle">lifecycleEvent(START_EVENT)</text>
+  <path class="ln" d="M145 62 V80" marker-end="url(#ar)"/>
+  <rect class="bx" x="20" y="82" width="250" height="32" rx="6"/><text class="mono sm" x="145" y="103" text-anchor="middle">context.setConfigured(false)</text>
+  <rect class="bx-b" x="20" y="122" width="250" height="40" rx="6"/>
+  <text class="mono sm" x="145" y="140" text-anchor="middle">defaultConfig()</text>
+  <text class="sm" x="145" y="155" text-anchor="middle">解析 $CATALINA_BASE/conf/web.xml</text>
+  <rect class="bx-b" x="20" y="170" width="250" height="40" rx="6"/>
+  <text class="mono sm" x="145" y="188" text-anchor="middle">applicationConfig()</text>
+  <text class="sm" x="145" y="203" text-anchor="middle">解析 /WEB-INF/web.xml</text>
+  <rect class="bx" x="20" y="218" width="250" height="32" rx="6"/><text class="sm" x="145" y="239" text-anchor="middle">validateSecurityRoles · tldScan</text>
+  <rect class="bx-p" x="20" y="258" width="250" height="32" rx="6"/><text class="sm" x="145" y="279" text-anchor="middle">certificatesConfig · authenticatorConfig</text>
+  <rect class="bx-g" x="20" y="298" width="250" height="28" rx="6"/><text class="mono sm" x="145" y="317" text-anchor="middle">ok ? setConfigured(true)</text>
+  <path class="ln" d="M145 116 V120"/><path class="ln" d="M145 164 V168"/><path class="ln" d="M145 212 V216"/><path class="ln" d="M145 252 V256"/><path class="ln" d="M145 292 V296"/>
+
+  <rect class="bx-d" x="320" y="122" width="420" height="88" rx="10"/>
+  <text class="ttl" x="530" y="144" text-anchor="middle">两个 web.xml，同一个 webDigester</text>
+  <text class="sm" x="530" y="166" text-anchor="middle">conf/web.xml：所有应用共享（默认 Servlet、JSP、MIME 类型、欢迎页、会话超时）</text>
+  <text class="sm" x="530" y="186" text-anchor="middle">WEB-INF/web.xml：应用自己的 Servlet、过滤器、安全约束……</text>
+  <text class="sm" x="530" y="204" text-anchor="middle">两个文件都不存在也没关系，ContextConfig 会继续</text>
+  <path class="ln-d" d="M272 166 H316"/>
+  <rect class="bx-d" x="320" y="236" width="420" height="58" rx="10"/>
+  <text class="sm" x="530" y="258" text-anchor="middle">authenticatorConfig 就是第 10 章 SimpleContextConfig 里那段：</text>
+  <text class="sm" x="530" y="278" text-anchor="middle">有安全约束 → 根据 auth-method 安装认证器阀</text>
+  <path class="ln-d" d="M272 274 H316"/>
+</svg>
+<figcaption>图 15-4　ContextConfig.start() 的步骤（对应原书 Listing 15.12）</figcaption>
+</figure>
+
+<div class="code" data-lang="java" data-file="ContextConfig.applicationConfig()（节选）">
+<pre>
+InputStream stream = servletContext.getResourceAsStream(Constants.ApplicationWebXml);   // "/WEB-INF/web.xml"
+if (stream == null) {
+    log(sm.getString("contextConfig.applicationMissing"));
+    return;
+}
+synchronized (webDigester) {                    // webDigester 是静态的，所有 Context 共用，所以要加锁
+    URL url = servletContext.getResource(Constants.ApplicationWebXml);
+    InputSource is = new InputSource(url.toExternalForm());
+    is.setByteStream(stream);
+    webDigester.clear();
+    webDigester.push(context);                  // ★ 先把 Context 压到栈底
+    webDigester.parse(is);                      // 规则会在 Context 上 addChild、addServletMapping……
+}
+</pre>
+</div>
+
+<h3>WebRuleSet：web.xml 的解析规则</h3>
+
+<p><code>webDigester</code> 由 <code>createWebDigester()</code> 创建，开启验证（注册了 Servlet 2.2/2.3 的 DTD），并添加 <code>WebRuleSet</code>。下面是和 Servlet 相关的部分：</p>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/startup/WebRuleSet.java（节选）">
+<pre>
+digester.addRule(prefix + "web-app/servlet", new WrapperCreateRule(digester));
+digester.addSetNext(prefix + "web-app/servlet", "addChild", "org.apache.catalina.Container");
+digester.addCallMethod(prefix + "web-app/servlet/init-param", "addInitParameter", 2);
+digester.addCallParam(prefix + "web-app/servlet/init-param/param-name", 0);
+digester.addCallParam(prefix + "web-app/servlet/init-param/param-value", 1);
+digester.addCallMethod(prefix + "web-app/servlet/load-on-startup", "setLoadOnStartupString", 0);
+digester.addCallMethod(prefix + "web-app/servlet/servlet-class", "setServletClass", 0);
+digester.addCallMethod(prefix + "web-app/servlet/servlet-name", "setName", 0);
+
+digester.addCallMethod(prefix + "web-app/servlet-mapping", "addServletMapping", 2);
+digester.addCallParam(prefix + "web-app/servlet-mapping/servlet-name", 1);
+digester.addCallParam(prefix + "web-app/servlet-mapping/url-pattern", 0);
+
+// WrapperCreateRule：不是 new 一个固定的类，而是让栈底的 Context 创建 Wrapper
+public void begin(Attributes attributes) throws Exception {
+    Context context = (Context) digester.peek(digester.getCount() - 1);
+    Wrapper wrapper = context.createWrapper();
+    digester.push(wrapper);
+}
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="web.xml 中的 servlet 和 servlet-mapping 元素如何被转换为对 Context 和 Wrapper 的调用">
+  <rect class="bx-d" x="20" y="20" width="330" height="220" rx="10"/>
+  <text class="mono sm" x="36" y="46">&lt;servlet&gt;</text>
+  <text class="mono sm" x="52" y="68">&lt;servlet-name&gt;Modern&lt;/servlet-name&gt;</text>
+  <text class="mono sm" x="52" y="90">&lt;servlet-class&gt;ModernServlet&lt;/…&gt;</text>
+  <text class="mono sm" x="36" y="112">&lt;/servlet&gt;</text>
+  <text class="mono sm" x="36" y="150">&lt;servlet-mapping&gt;</text>
+  <text class="mono sm" x="52" y="172">&lt;servlet-name&gt;Modern&lt;/servlet-name&gt;</text>
+  <text class="mono sm" x="52" y="194">&lt;url-pattern&gt;/Modern&lt;/url-pattern&gt;</text>
+  <text class="mono sm" x="36" y="216">&lt;/servlet-mapping&gt;</text>
+
+  <rect class="bx-a" x="410" y="20" width="330" height="110" rx="10"/>
+  <text class="mono sm" x="426" y="44">wrapper = context.createWrapper()  ← begin</text>
+  <text class="mono sm" x="426" y="66">wrapper.setName("Modern")</text>
+  <text class="mono sm" x="426" y="88">wrapper.setServletClass("ModernServlet")</text>
+  <text class="mono sm" x="426" y="110">context.addChild(wrapper)          ← end</text>
+  <rect class="bx-g" x="410" y="150" width="330" height="60" rx="10"/>
+  <text class="mono sm" x="426" y="174">context.addServletMapping(</text>
+  <text class="mono sm" x="442" y="196">"/Modern", "Modern")    ← 参数 0、1</text>
+  <path class="ln-a" d="M352 80 H406" marker-end="url(#ar-a)"/>
+  <path class="ln-g" d="M352 182 H406" marker-end="url(#ar-g)"/>
+</svg>
+<figcaption>图 15-5　WebRuleSet 把 web.xml 翻译成方法调用</figcaption>
+</figure>
+
+<h2 id="app">本章应用</h2>
+
+<p>应用只有一个 Bootstrap 类。和前几章最大的不同：<strong>不再手动创建 Wrapper</strong>，只给 Context 加一个 ContextConfig 监听器，Wrapper 全部来自 <code>webapps/app1/WEB-INF/web.xml</code>：</p>
+
+<div class="code" data-lang="java" data-file="ex15/pyrmont/startup/Bootstrap.java（节选）">
+<pre>
+Context context = new StandardContext();
+context.setPath("/app1");
+context.setDocBase("app1");
+LifecycleListener listener = new ContextConfig();      // 正式的 ContextConfig
+((Lifecycle) context).addLifecycleListener(listener);
+Host host = new StandardHost();
+host.addChild(context);                               // 必须有 Host（第 13 章）
+host.setName("localhost");
+host.setAppBase("webapps");
+context.setLoader(new WebappLoader());
+connector.setContainer(host);
+connector.initialize();
+((Lifecycle) connector).start();
+((Lifecycle) host).start();
+
+Container[] c = context.findChildren();               // 打印 ContextConfig 创建的 Wrapper
+for (int i = 0; i &lt; c.length; i++) {
+    System.out.println(c[i].getName());
+}
+</pre>
+</div>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch15/digestertest/</code><code>mini/MiniDigester.java</code><code>startup/ContextConfig.java</code><code>startup/Bootstrap.java</code><code>tomcat/EmbeddedContextConfig.java</code></div>
+
+<p>本章 Java 17 版分三部分：① 原书三个例子改用 Tomcat 11 自带的 Digester；② 自己写一个约 150 行的 <code>MiniDigester</code>；③ 用 MiniDigester 写一个迷你 ContextConfig，接到前几章的 Host 和 Context 上。</p>
+
+<h3>① Tomcat 11 的 Digester</h3>
+
+<div class="vs">
+  <div class="old"><div class="h">原书：commons-digester</div>
+<div class="code" data-lang="java">
+<pre>
+import org.apache.commons.digester.Digester;
+import org.apache.commons.digester.RuleSetBase;
+
+public class EmployeeRuleSet extends RuleSetBase {
+    public void addRuleInstances(Digester d) {
+        ...
+        d.addSetNext("employee/office", "addOffice");
+    }
+}
+</pre>
+</div>
+  </div>
+  <div class="new"><div class="h">Tomcat 11：org.apache.tomcat.util.digester</div>
+<div class="code" data-lang="java">
+<pre>
+import org.apache.tomcat.util.digester.Digester;
+import org.apache.tomcat.util.digester.RuleSet;
+
+public class EmployeeRuleSet implements RuleSet {   // 接口
+    @Override
+    public void addRuleInstances(Digester d) {
+        ...
+        d.addSetNext("employee/office", "addOffice",
+                     Office.class.getName());       // 必须给参数类型
+    }
+}
+</pre>
+</div>
+  </div>
+</div>
+
+<h3>② 迷你 Digester：SAX + 规则 + 栈</h3>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="MiniDigester 把 SAX 事件分派给匹配当前路径的规则">
+  <rect class="bx-b" x="20" y="30" width="170" height="150" rx="12"/>
+  <text class="ttl on-b" x="105" y="54" text-anchor="middle">SAX 解析器</text>
+  <text class="mono sm" x="105" y="84" text-anchor="middle">startElement</text>
+  <text class="mono sm" x="105" y="112" text-anchor="middle">characters</text>
+  <text class="mono sm" x="105" y="140" text-anchor="middle">endElement</text>
+  <path class="ln" d="M192 105 H246" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="250" y="30" width="230" height="150" rx="12"/>
+  <text class="ttl on-a" x="365" y="54" text-anchor="middle">MiniDigester</text>
+  <text class="sm" x="365" y="80" text-anchor="middle">path = [employee, office]</text>
+  <text class="sm" x="365" y="100" text-anchor="middle">→ 模式 "employee/office"</text>
+  <text class="sm" x="365" y="126" text-anchor="middle">rules.get(模式)</text>
+  <text class="sm" x="365" y="146" text-anchor="middle">begin 正序 · body · end 倒序</text>
+  <path class="ln" d="M482 105 H536" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="540" y="30" width="200" height="150" rx="12"/>
+  <text class="ttl on-g" x="640" y="54" text-anchor="middle">规则 + 对象栈</text>
+  <text class="mono sm" x="640" y="84" text-anchor="middle">ObjectCreate: push/pop</text>
+  <text class="mono sm" x="640" y="106" text-anchor="middle">SetProperties: setXxx</text>
+  <text class="mono sm" x="640" y="128" text-anchor="middle">SetNext: peek(1).m(peek(0))</text>
+  <text class="mono sm" x="640" y="150" text-anchor="middle">CallMethod / CallParam</text>
+</svg>
+<figcaption>图 15-6　MiniDigester 的结构</figcaption>
+</figure>
+
+<div class="code" data-lang="java" data-file="java17/.../ch15/mini/MiniDigester.java（节选）">
+<pre>
+public interface Rule {                          // 三个回调都有默认空实现
+    default void begin(MiniDigester digester, Attributes attributes) throws Exception { }
+    default void body(MiniDigester digester, String text) throws Exception { }
+    default void end(MiniDigester digester) throws Exception { }
+}
+
+public void addObjectCreate(String pattern, Supplier&lt;?&gt; factory) {   // 用构造器引用代替类名
+    addRule(pattern, new Rule() {
+        @Override public void begin(MiniDigester d, Attributes a) { d.push(factory.get()); }
+        @Override public void end(MiniDigester d) { d.pop(); }
+    });
+}
+
+public void addSetNext(String pattern, String methodName) {
+    addRule(pattern, new Rule() {
+        @Override public void end(MiniDigester d) throws Exception { invoke(d.peek(1), methodName, d.peek(0)); }
+    });
+}
+
+@Override
+public void startElement(String uri, String localName, String qName, Attributes attributes) {
+    path.add(localName);
+    bodies.push(new StringBuilder());
+    forEachRule(rule -&gt; rule.begin(this, attributes), false);
+}
+
+@Override
+public void endElement(String uri, String localName, String qName) {
+    String text = bodies.pop().toString();
+    forEachRule(rule -&gt; rule.body(this, text), false);
+    forEachRule(rule -&gt; rule.end(this), true);         // end 倒序
+    path.remove(path.size() - 1);
+}
+</pre>
+</div>
+
+<div class="code" data-lang="java" data-file="java17/.../ch15/mini/MiniDigesterTest.java（节选）">
+<pre>
+var digester = new MiniDigester();
+digester.addObjectCreate("employee", Employee::new);        // 构造器引用：编译期就能检查类是否存在
+digester.addSetProperties("employee");
+digester.addObjectCreate("employee/office", Office::new);
+digester.addSetProperties("employee/office");
+digester.addSetNext("employee/office", "addOffice");
+...
+Employee employee = digester.parse(Path.of("etc", "employee2.xml"));   // 泛型方法，不用强转
+</pre>
+</div>
+
+<h3>③ 迷你 ContextConfig</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch15/startup/ContextConfig.java（节选）">
+<pre>
+static MiniDigester createWebDigester() {
+    var digester = new MiniDigester();
+    digester.addRule("web-app/servlet", new MiniDigester.Rule() {          // WrapperCreateRule
+        @Override public void begin(MiniDigester d, Attributes a) { d.push(new SimpleWrapper()); }
+        @Override public void end(MiniDigester d) { d.pop(); }
+    });
+    digester.addSetNext("web-app/servlet", "addChild");
+    digester.addCallMethod("web-app/servlet/servlet-name", "setName", 0);
+    digester.addCallMethod("web-app/servlet/servlet-class", "setServletClass", 0);
+    digester.addCallMethod("web-app/servlet-mapping", "addServletMapping", 2);
+    digester.addCallParam("web-app/servlet-mapping/url-pattern", 0);
+    digester.addCallParam("web-app/servlet-mapping/servlet-name", 1);
+    return digester;
+}
+
+private void applicationConfig(StandardContext context) {
+    Path webXml = context.getDocBase().resolve("WEB-INF/web.xml");
+    var digester = createWebDigester();
+    digester.push(context);                      // 和原书一样：Context 压在栈底
+    digester.parse(webXml);
+}
+</pre>
+</div>
+
+<div class="box note">
+  <div class="t">&#9432; 现代 Tomcat 的 ContextConfig</div>
+  <p>Servlet 3.0 之后，一个应用的配置可能来自 web.xml、JAR 里的 <code>web-fragment.xml</code>、<code>@WebServlet</code> 等注解、<code>ServletContainerInitializer</code>。所以 Tomcat 7 起 ContextConfig 不再让 Digester 直接操作 Context，而是先把每个来源解析成一个 <code>WebXml</code> 对象（<code>org.apache.tomcat.util.descriptor.web</code>），按规则合并，最后调用 <code>webXml.configureContext(context)</code> 一次性配置。Digester 和 WebRuleSet 仍然在用，只是换了「栈底对象」。</p>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch15.digestertest.Test01            # Tomcat 11 的 Digester
+./run.sh ch15.digestertest.Test02
+./run.sh ch15.digestertest.Test03
+./run.sh ch15.mini.MiniDigesterTest          # 自己写的 Digester，输出与 Test02 相同
+./run.sh ch15.startup.Bootstrap              # 迷你容器 + 迷你 ContextConfig
+./run.sh ch15.tomcat.EmbeddedContextConfig   # Tomcat 11 的 ContextConfig
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+$ ./run.sh ch15.startup.Bootstrap
+Starting Wrapper Primitive
+Starting Wrapper Modern
+ContextConfig 创建的 Wrapper：
+  Primitive
+  Modern
+$ curl http://localhost:8080/app1/Primitive
+Hello. Roses are red.
+
+$ ./run.sh ch15.tomcat.EmbeddedContextConfig
+ContextConfig 创建的 Wrapper：
+  Primitive → StandardWrapper
+  Modern → StandardWrapper
+</pre>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>Digester 把 XML 元素按「模式 → 规则」转换成 Java 对象；规则通过一个对象栈协作。</li>
+  <li>四个常用规则：ObjectCreate（创建并压栈）、SetProperties（属性 → setter）、SetNext（子对象交给父对象）、CallMethod/CallParam（调用方法）。</li>
+  <li>begin 按注册顺序执行，end 按相反顺序执行；RuleSet 把一组规则打包复用。</li>
+  <li>ContextConfig 是 StandardContext 必需的监听器：解析默认和应用 web.xml、安装认证器阀，最后设置 configured。</li>
+  <li>WebRuleSet 把 <code>&lt;servlet&gt;</code> 变成 Wrapper，把 <code>&lt;servlet-mapping&gt;</code> 变成 <code>addServletMapping</code>；现代 Tomcat 先解析成 WebXml 再合并配置。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>给 MiniDigester 增加 <code>addObjectCreate(pattern, defaultClass, attributeName)</code>：如果元素上有 <code>className</code> 属性，就按它创建对象（反射），否则用默认类。</li>
+    <li>扩展迷你 ContextConfig，支持 <code>&lt;init-param&gt;</code>（配合第 11 章的 StandardWrapper）和 <code>&lt;session-config&gt;&lt;session-timeout&gt;</code>。</li>
+    <li>用 MiniDigester 解析一个精简版 server.xml（Server / Service / Connector / Engine / Host / Context），直接搭出第 14 章的整套组件——这正是第 17 章 Catalina 类做的事。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

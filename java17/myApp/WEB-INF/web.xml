@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- myApp 的部署描述符（Servlet 6.1）。第 8 章起的 Tomcat 11 示例会读取它。 -->
+<web-app xmlns="https://jakarta.ee/xml/ns/jakartaee"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="https://jakarta.ee/xml/ns/jakartaee https://jakarta.ee/xml/ns/jakartaee/web-app_6_1.xsd"
+         version="6.1">
+  <servlet>
+    <servlet-name>Primitive</servlet-name>
+    <servlet-class>PrimitiveServlet</servlet-class>
+  </servlet>
+  <servlet>
+    <servlet-name>Modern</servlet-name>
+    <servlet-class>ModernServlet</servlet-class>
+  </servlet>
+  <servlet>
+    <servlet-name>Session</servlet-name>
+    <servlet-class>SessionServlet</servlet-class>
+  </servlet>
+  <servlet>
+    <servlet-name>Hello</servlet-name>
+    <servlet-class>HelloServlet</servlet-class>
+  </servlet>
+  <servlet>
+    <servlet-name>WhoAmI</servlet-name>
+    <servlet-class>WhoAmIServlet</servlet-class>
+  </servlet>
+  <servlet-mapping>
+    <servlet-name>Primitive</servlet-name>
+    <url-pattern>/Primitive</url-pattern>
+  </servlet-mapping>
+  <servlet-mapping>
+    <servlet-name>Modern</servlet-name>
+    <url-pattern>/Modern</url-pattern>
+  </servlet-mapping>
+  <servlet-mapping>
+    <servlet-name>Session</servlet-name>
+    <url-pattern>/Session</url-pattern>
+  </servlet-mapping>
+  <servlet-mapping>
+    <servlet-name>Hello</servlet-name>
+    <url-pattern>/Hello</url-pattern>
+  </servlet-mapping>
+  <servlet-mapping>
+    <servlet-name>WhoAmI</servlet-name>
+    <url-pattern>/WhoAmI</url-pattern>
+  </servlet-mapping>
+</web-app>

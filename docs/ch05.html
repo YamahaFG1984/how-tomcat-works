@@ -1,0 +1,701 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 5 章 · 容器 — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="5">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 5 章</span>
+<h1>容器</h1>
+<p class="lede">
+  连接器把请求交给容器的 <code>invoke</code> 方法之后，发生了什么？
+  这一章揭开 Catalina 第二大模块的结构：四种层级的容器（Engine、Host、Context、Wrapper），
+  以及贯穿所有容器的<strong>管道（Pipeline）与阀（Valve）</strong>机制。
+  理解了管道和阀，你就理解了 Tomcat 处理请求的主干流程。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>认识四种容器以及它们的父子关系</li>
+    <li>理解管道、阀、基础阀、<code>ValveContext</code> 是如何配合的</li>
+    <li>理解 Wrapper 如何加载 Servlet，Context 如何把请求分派给 Wrapper</li>
+    <li>对比 Tomcat 4 的 <code>ValveContext</code> 和现代 Tomcat 的 <code>getNext()</code> 责任链</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="four">四种容器</h2>
+
+<p>容器是处理 Servlet 请求、填充响应对象的模块，由 <code>org.apache.catalina.Container</code> 接口表示。Catalina 中有四种不同层级的容器：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="四种容器的嵌套关系：Engine 包含 Host，Host 包含 Context，Context 包含 Wrapper">
+  <rect class="bx-p" x="20" y="20" width="720" height="290" rx="16"/>
+  <text class="ttl on-p" x="40" y="46">Engine：整个 Catalina Servlet 引擎</text>
+  <text class="sm" x="40" y="64">把请求交给对应的虚拟主机（第 13 章）</text>
+
+  <rect class="bx-b" x="40" y="80" width="680" height="214" rx="14"/>
+  <text class="ttl on-b" x="60" y="104">Host：一个虚拟主机，例如 www.example.com</text>
+  <text class="sm" x="60" y="122">包含若干个 Web 应用（第 13 章）</text>
+
+  <rect class="bx-g" x="60" y="136" width="310" height="142" rx="12"/>
+  <text class="ttl on-g" x="78" y="160">Context：一个 Web 应用</text>
+  <text class="sm mono" x="78" y="178">/shop</text>
+  <rect class="bx-a" x="78" y="190" width="130" height="36" rx="8"/>
+  <text class="mono on-a" x="143" y="213" text-anchor="middle">Wrapper: Cart</text>
+  <rect class="bx-a" x="220" y="190" width="134" height="36" rx="8"/>
+  <text class="mono on-a" x="287" y="213" text-anchor="middle">Wrapper: Order</text>
+  <text class="sm" x="215" y="254" text-anchor="middle">每个 Wrapper 代表一个 Servlet</text>
+
+  <rect class="bx-g" x="390" y="136" width="310" height="142" rx="12"/>
+  <text class="ttl on-g" x="408" y="160">Context：另一个 Web 应用</text>
+  <text class="sm mono" x="408" y="178">/blog</text>
+  <rect class="bx-a" x="408" y="190" width="130" height="36" rx="8"/>
+  <text class="mono on-a" x="473" y="213" text-anchor="middle">Wrapper: Post</text>
+  <rect class="bx-a" x="550" y="190" width="134" height="36" rx="8"/>
+  <text class="mono on-a" x="617" y="213" text-anchor="middle">Wrapper: Admin</text>
+  <text class="sm" x="545" y="254" text-anchor="middle">Wrapper 是最底层，不能有子容器</text>
+</svg>
+<figcaption>图 5-1　四种容器层层嵌套</figcaption>
+</figure>
+
+<div class="tw">
+<table>
+  <tr><th>容器</th><th>代表</th><th>接口</th><th>标准实现</th><th>详见</th></tr>
+  <tr><td>Engine</td><td>整个 Servlet 引擎</td><td><code>Engine</code></td><td><code>StandardEngine</code></td><td>第 13 章</td></tr>
+  <tr><td>Host</td><td>一个虚拟主机</td><td><code>Host</code></td><td><code>StandardHost</code></td><td>第 13 章</td></tr>
+  <tr><td>Context</td><td>一个 Web 应用</td><td><code>Context</code></td><td><code>StandardContext</code></td><td>第 12 章</td></tr>
+  <tr><td>Wrapper</td><td>一个 Servlet</td><td><code>Wrapper</code></td><td><code>StandardWrapper</code></td><td>第 11 章</td></tr>
+</table>
+</div>
+
+<p>四个接口都继承 <code>Container</code>，四个标准实现都继承抽象类 <code>ContainerBase</code>（位于 <code>org.apache.catalina.core</code>）。一个能工作的 Catalina 部署<strong>不需要四种容器齐全</strong>：本章第一个应用只有一个 Wrapper，第二个应用是一个 Context 加两个 Wrapper。</p>
+
+<p><code>Container</code> 接口提供了管理子容器的方法：<code>addChild</code>、<code>removeChild</code>、<code>findChild(name)</code>、<code>findChildren()</code>；以及关联辅助组件的 getter/setter：<code>Loader</code>（第 8 章）、<code>Logger</code>（第 7 章）、<code>Manager</code>（第 9 章）、<code>Realm</code>（第 10 章）、<code>Resources</code>。</p>
+
+<h2 id="pipeline">管道与阀</h2>
+
+<p>容器最巧妙的设计是：它<strong>不把「收到请求后做什么」写死在代码里</strong>，而是交给一条管道。管道里有若干个阀，每个阀完成一项任务；管道末尾总有一个<strong>基础阀（basic valve）</strong>，负责真正的处理。管理员可以通过编辑 <code>server.xml</code> 往管道里加阀，不用改代码。</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 220" role="img" aria-label="管道中有多个附加阀和一个基础阀，基础阀总是最后执行">
+  <rect class="bx-d" x="20" y="40" width="720" height="120" rx="60"/>
+  <text class="sm" x="380" y="30" text-anchor="middle">Pipeline（管道）</text>
+  <path class="ln-a" d="M0 100 H60" marker-end="url(#ar-a)"/>
+  <rect class="bx-b" x="64" y="70" width="140" height="60" rx="10"/>
+  <text class="ttl on-b" x="134" y="96" text-anchor="middle">Valve 1</text>
+  <text class="sm" x="134" y="116" text-anchor="middle">记录访问日志</text>
+  <path class="ln" d="M206 100 H234" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="238" y="70" width="140" height="60" rx="10"/>
+  <text class="ttl on-b" x="308" y="96" text-anchor="middle">Valve 2</text>
+  <text class="sm" x="308" y="116" text-anchor="middle">IP 访问控制</text>
+  <path class="ln" d="M380 100 H408" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="412" y="70" width="110" height="60" rx="10"/>
+  <text class="ttl on-b" x="467" y="105" text-anchor="middle">…</text>
+  <path class="ln" d="M524 100 H552" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="556" y="62" width="160" height="76" rx="12"/>
+  <text class="ttl on-a" x="636" y="92" text-anchor="middle">Basic Valve</text>
+  <text class="sm" x="636" y="112" text-anchor="middle">基础阀，永远最后</text>
+  <text class="sm" x="636" y="128" text-anchor="middle">做容器的本职工作</text>
+  <text class="sm" x="290" y="190" text-anchor="middle">「阀的数量」指附加阀的个数，不含基础阀</text>
+  <text class="sm" x="290" y="208" text-anchor="middle">类比：管道 ≈ 过滤器链（FilterChain），阀 ≈ 过滤器（Filter）</text>
+</svg>
+<figcaption>图 5-2　管道与阀（对应原书图 5.2）</figcaption>
+</figure>
+
+<p>容器的 <code>invoke</code> 只有一行——把活交给管道：</p>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/core/ContainerBase.java">
+<pre>
+public void invoke(Request request, Response response) throws IOException, ServletException {
+    pipeline.invoke(request, response);
+}
+</pre>
+</div>
+
+<h3>为什么需要 ValveContext</h3>
+
+<p>最直观的管道实现是一个 for 循环：</p>
+
+<div class="code" data-lang="java">
+<pre>
+for (int n = 0; n &lt; valves.length; n++) {
+    valves[n].invoke(...);
+}
+basicValve.invoke(...);
+</pre>
+</div>
+
+<p>但这样阀只能在「之前」做事，没法在后续步骤<strong>完成之后</strong>再做点什么（比如统计耗时、记录响应状态码），也无法中途拦截请求。Tomcat 的设计者引入了 <code>ValveContext</code>：管道创建一个 ValveContext 并调用它的 <code>invokeNext</code>；ValveContext 调用第一个阀，并把<strong>自己</strong>传进去；阀在合适的时机调用 <code>context.invokeNext()</code> 把请求传给下一个阀。</p>
+
+<div class="code" data-lang="java" data-file="Tomcat 4 StandardPipeline 的内部类">
+<pre>
+protected class StandardPipelineValveContext implements ValveContext {
+    protected int stage = 0;
+
+    public void invokeNext(Request request, Response response)
+            throws IOException, ServletException {
+        int subscript = stage;
+        stage = stage + 1;
+        if (subscript &lt; valves.length) {
+            valves[subscript].invoke(request, response, this);     // 把自己传给阀
+        } else if ((subscript == valves.length) &amp;&amp; (basic != null)) {
+            basic.invoke(request, response, this);                 // 附加阀都走完了，轮到基础阀
+        } else {
+            throw new ServletException(sm.getString("standardPipeline.noValve"));
+        }
+    }
+}
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="invokeNext 的调用栈：每个阀在 invokeNext 前后都可以做事">
+  <rect class="bx-b" x="20" y="20" width="720" height="290" rx="14"/>
+  <text class="ttl on-b" x="40" y="44">HeaderLoggerValve.invoke(req, res, ctx)</text>
+  <text class="mono sm" x="40" y="66">  // 前置处理（可选）</text>
+  <text class="mono" x="40" y="86">  ctx.invokeNext()   // stage 0 → 1</text>
+
+  <rect class="bx-p" x="60" y="98" width="660" height="160" rx="12"/>
+  <text class="ttl on-p" x="80" y="122">ClientIPLoggerValve.invoke(req, res, ctx)</text>
+  <text class="mono" x="80" y="144">  ctx.invokeNext()   // stage 1 → 2</text>
+
+  <rect class="bx-a" x="100" y="156" width="600" height="72" rx="10"/>
+  <text class="ttl on-a" x="120" y="180">SimpleWrapperValve（基础阀）.invoke(req, res, ctx)</text>
+  <text class="mono" x="120" y="202">  servlet.service(req, res)   // 不再调用 invokeNext</text>
+
+  <text class="mono" x="80" y="248">  System.out.println("Client IP ...")   // ② 后置处理</text>
+  <text class="mono" x="40" y="292">  System.out.println("Header ...")     // ③ 后置处理</text>
+</svg>
+<figcaption>图 5-3　ValveContext 让调用形成嵌套：后加入的阀先打印日志</figcaption>
+</figure>
+
+<div class="box key">
+  <div class="t">&#128273; 这就是「洋葱模型」</div>
+  <p>阀在 <code>invokeNext()</code> 之前写的代码按顺序执行，之后写的代码按<strong>相反顺序</strong>执行；不调用 <code>invokeNext()</code> 就等于拦截了请求。Servlet 的 <code>FilterChain.doFilter()</code>、Spring 的拦截器、Koa/Hono 的中间件都是同一个思想。</p>
+</div>
+
+<h3>四个接口</h3>
+
+<div class="code" data-lang="java" data-file="org.apache.catalina 包（Tomcat 4）">
+<pre>
+public interface Pipeline {
+    public Valve getBasic();
+    public void setBasic(Valve valve);
+    public void addValve(Valve valve);
+    public Valve[] getValves();
+    public void invoke(Request request, Response response) throws IOException, ServletException;
+    public void removeValve(Valve valve);
+}
+
+public interface Valve {
+    public String getInfo();
+    public void invoke(Request request, Response response, ValveContext context)
+        throws IOException, ServletException;
+}
+
+public interface ValveContext {
+    public String getInfo();
+    public void invokeNext(Request request, Response response) throws IOException, ServletException;
+}
+
+// 阀可以选择实现它：表示这个阀最多关联一个容器
+public interface Contained {
+    public Container getContainer();
+    public void setContainer(Container container);
+}
+</pre>
+</div>
+
+<p>Tomcat 5 把内部类换成了独立的 <code>StandardValveContext</code>，逻辑完全一样，只是多了一个 <code>set(basic, valves)</code> 方法以便复用。</p>
+
+<h2 id="wrapper-ctx">Wrapper 与 Context 接口</h2>
+
+<ul>
+  <li><strong>Wrapper</strong> 代表一个 Servlet 定义，负责它的生命周期（调用 <code>init</code>、<code>service</code>、<code>destroy</code>）。最重要的两个方法：<code>load()</code> 加载并初始化 Servlet，<code>allocate()</code> 返回一个已初始化的实例（还要考虑 <code>SingleThreadModel</code>，见第 11 章）。对 Wrapper 调用 <code>addChild</code> 会抛 <code>IllegalArgumentException</code>。</li>
+  <li><strong>Context</strong> 代表一个 Web 应用，通常有一个或多个 Wrapper 子容器。重要方法有 <code>addWrapper</code>、<code>createWrapper</code>、<code>addServletMapping</code> 等（第 12 章）。</li>
+</ul>
+
+<h2 id="app1">应用 1：只有一个 Wrapper 的容器</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="Wrapper 应用的结构">
+  <rect class="bx" x="20" y="100" width="150" height="50" rx="10"/>
+  <text class="mono" x="95" y="130" text-anchor="middle">HttpConnector</text>
+  <path class="ln" d="M172 125 H216" marker-end="url(#ar)"/>
+  <text class="sm" x="194" y="117" text-anchor="middle">invoke</text>
+
+  <rect class="bx-a" x="220" y="20" width="520" height="230" rx="14"/>
+  <text class="ttl on-a" x="240" y="44">SimpleWrapper（servletClass = "ModernServlet"）</text>
+  <rect class="bx-d" x="240" y="60" width="480" height="96" rx="10"/>
+  <text class="sm" x="256" y="78">SimplePipeline</text>
+  <rect class="bx-b" x="256" y="88" width="140" height="52" rx="8"/>
+  <text class="mono on-b" x="326" y="110" text-anchor="middle">HeaderLogger</text>
+  <text class="mono on-b" x="326" y="128" text-anchor="middle">Valve</text>
+  <rect class="bx-b" x="410" y="88" width="140" height="52" rx="8"/>
+  <text class="mono on-b" x="480" y="110" text-anchor="middle">ClientIPLogger</text>
+  <text class="mono on-b" x="480" y="128" text-anchor="middle">Valve</text>
+  <rect class="bx-g" x="564" y="88" width="140" height="52" rx="8"/>
+  <text class="mono on-g" x="634" y="110" text-anchor="middle">SimpleWrapper</text>
+  <text class="mono on-g" x="634" y="128" text-anchor="middle">Valve（基础）</text>
+  <path class="ln" d="M398 114 H406" marker-end="url(#ar)"/>
+  <path class="ln" d="M552 114 H560" marker-end="url(#ar)"/>
+
+  <rect class="bx-p" x="240" y="176" width="200" height="56" rx="10"/>
+  <text class="mono on-p" x="340" y="200" text-anchor="middle">SimpleLoader</text>
+  <text class="sm" x="340" y="220" text-anchor="middle">从 webroot 加载类</text>
+  <rect class="bx" x="504" y="176" width="200" height="56" rx="10"/>
+  <text class="mono" x="604" y="200" text-anchor="middle">ModernServlet</text>
+  <text class="sm" x="604" y="220" text-anchor="middle">allocate() 得到的实例</text>
+  <path class="ln-g" d="M634 142 V172" marker-end="url(#ar-g)"/>
+  <path class="ln-p" d="M442 204 H500" marker-end="url(#ar-p)"/>
+</svg>
+<figcaption>图 5-4　应用 1：Wrapper 自己就是容器（对应原书图 5.3）</figcaption>
+</figure>
+
+<p>几个要点：</p>
+<ul>
+  <li><code>SimpleLoader</code>：构造时创建一个指向 webroot 的 <code>URLClassLoader</code>，<code>getClassLoader()</code> 返回它。</li>
+  <li><code>SimpleWrapper.getLoader()</code>：自己有 Loader 就用自己的，否则<strong>向父容器要</strong>：</li>
+</ul>
+
+<div class="code" data-lang="java" data-file="ex05/pyrmont/core/SimpleWrapper.java（节选）">
+<pre>
+private SimplePipeline pipeline = new SimplePipeline(this);
+
+public SimpleWrapper() {
+    pipeline.setBasic(new SimpleWrapperValve());     // 基础阀在构造时就装好
+}
+
+public Loader getLoader() {
+    if (loader != null)
+        return (loader);
+    if (parent != null)
+        return (parent.getLoader());
+    return (null);
+}
+</pre>
+</div>
+
+<p>基础阀 <code>SimpleWrapperValve</code> 是真正调用 Servlet 的地方——注意，<strong>调用 <code>service</code> 的是 Wrapper 管道的基础阀，而不是 Wrapper 本身</strong>：</p>
+
+<div class="code" data-lang="java" data-file="ex05/pyrmont/core/SimpleWrapperValve.java（节选）">
+<pre>
+public void invoke(Request request, Response response, ValveContext valveContext)
+        throws IOException, ServletException {
+    SimpleWrapper wrapper = (SimpleWrapper) getContainer();
+    ServletRequest sreq = request.getRequest();
+    ServletResponse sres = response.getResponse();
+    ...
+    servlet = wrapper.allocate();
+    if (hres != null &amp;&amp; hreq != null) {
+        servlet.service(hreq, hres);
+    } else {
+        servlet.service(sreq, sres);
+    }
+}
+</pre>
+</div>
+
+<p>两个日志阀都是「先放行，再打印」：</p>
+
+<div class="code" data-lang="java" data-file="ex05/pyrmont/valves/ClientIPLoggerValve.java（节选）">
+<pre>
+public void invoke(Request request, Response response, ValveContext valveContext)
+        throws IOException, ServletException {
+    valveContext.invokeNext(request, response);      // 先让后面的阀和 Servlet 执行
+    System.out.println("Client IP Logger Valve");
+    ServletRequest sreq = request.getRequest();
+    System.out.println(sreq.getRemoteAddr());
+    System.out.println("-----------------------------------");
+}
+</pre>
+</div>
+
+<div class="code" data-lang="java" data-file="ex05/pyrmont/startup/Bootstrap1.java（节选）">
+<pre>
+HttpConnector connector = new HttpConnector();
+Wrapper wrapper = new SimpleWrapper();
+wrapper.setServletClass("ModernServlet");
+Loader loader = new SimpleLoader();
+Valve valve1 = new HeaderLoggerValve();
+Valve valve2 = new ClientIPLoggerValve();
+wrapper.setLoader(loader);
+((Pipeline) wrapper).addValve(valve1);
+((Pipeline) wrapper).addValve(valve2);
+connector.setContainer(wrapper);
+connector.initialize();
+connector.start();
+</pre>
+</div>
+
+<p>访问 <code>http://localhost:8080</code>（任何路径都行），控制台先打印 <code>Client IP Logger Valve</code>，再打印 <code>Header Logger Valve</code>——和加入顺序相反，正是图 5-3 的效果。</p>
+
+<h2 id="app2">应用 2：Context + 两个 Wrapper</h2>
+
+<p>大多数 Web 应用不止一个 Servlet，需要用 Context 管理多个 Wrapper。多了 Wrapper，就需要一个组件决定「这个请求交给哪个 Wrapper」——Tomcat 4 中这个组件叫 <strong>Mapper</strong>（Tomcat 5 起取消了 Mapper 接口，改用别的方式查找子容器）。</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 420" role="img" aria-label="Context 应用中请求的完整流转路径">
+  <rect class="bx" x="20" y="20" width="150" height="44" rx="10"/>
+  <text class="mono" x="95" y="47" text-anchor="middle">HttpConnector</text>
+  <path class="ln" d="M95 66 V90" marker-end="url(#ar)"/>
+  <text class="sm" x="105" y="82">① context.invoke()</text>
+
+  <rect class="bx-g" x="20" y="92" width="720" height="140" rx="14"/>
+  <text class="ttl on-g" x="40" y="116">SimpleContext 的管道</text>
+  <rect class="bx-b" x="40" y="130" width="150" height="48" rx="8"/>
+  <text class="mono on-b" x="115" y="159" text-anchor="middle">HeaderLoggerValve</text>
+  <rect class="bx-b" x="210" y="130" width="150" height="48" rx="8"/>
+  <text class="mono on-b" x="285" y="159" text-anchor="middle">ClientIPLoggerValve</text>
+  <rect class="bx-g" x="380" y="122" width="340" height="96" rx="10"/>
+  <text class="ttl on-g" x="550" y="144" text-anchor="middle">SimpleContextValve（基础阀）</text>
+  <text class="sm" x="550" y="166" text-anchor="middle">② 禁止访问 /WEB-INF、/META-INF</text>
+  <text class="sm" x="550" y="186" text-anchor="middle">③ wrapper = context.map(request)</text>
+  <text class="sm" x="550" y="206" text-anchor="middle">找不到 → 404</text>
+  <path class="ln" d="M192 154 H206" marker-end="url(#ar)"/>
+  <path class="ln" d="M362 154 H376" marker-end="url(#ar)"/>
+
+  <rect class="bx-d" x="40" y="250" width="320" height="92" rx="10"/>
+  <text class="ttl" x="200" y="274" text-anchor="middle">servletMappings</text>
+  <text class="mono" x="200" y="298" text-anchor="middle">"/Primitive" → "Primitive"</text>
+  <text class="mono" x="200" y="320" text-anchor="middle">"/Modern"    → "Modern"</text>
+  <path class="ln-d" d="M420 220 C420 290 380 296 364 296" marker-end="url(#ar)"/>
+  <text class="sm" x="430" y="262">findServletMapping</text>
+  <text class="sm" x="430" y="278">+ findChild(name)</text>
+
+  <rect class="bx-a" x="420" y="296" width="320" height="104" rx="12"/>
+  <text class="ttl on-a" x="440" y="320">SimpleWrapper "Modern" 的管道</text>
+  <rect class="bx-a" x="440" y="334" width="280" height="50" rx="8"/>
+  <text class="mono on-a" x="580" y="356" text-anchor="middle">SimpleWrapperValve（基础阀）</text>
+  <text class="sm" x="580" y="374" text-anchor="middle">⑤ allocate() → service()</text>
+  <path class="ln-a" d="M640 220 V292" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="650" y="262">④ wrapper.invoke()</text>
+  <text class="sm" x="200" y="372" text-anchor="middle">Loader 挂在 Context 上，</text>
+  <text class="sm" x="200" y="390" text-anchor="middle">两个 Wrapper 都通过 parent.getLoader() 使用它</text>
+</svg>
+<figcaption>图 5-5　一个请求先走完 Context 的管道，再走 Wrapper 的管道</figcaption>
+</figure>
+
+<p>整个流程可以归纳为四句话：</p>
+<ol class="steps">
+  <li>容器有一条管道，容器的 <code>invoke</code> 调用管道的 <code>invoke</code>。</li>
+  <li>管道依次调用所有附加阀，最后调用基础阀。</li>
+  <li>Wrapper 的基础阀负责加载 Servlet 并调用它。</li>
+  <li>有子容器的 Context，其基础阀用 Mapper 找到子容器，调用子容器的 <code>invoke</code>——于是回到第 1 步。</li>
+</ol>
+
+<div class="code" data-lang="java" data-file="ex05/pyrmont/core/SimpleContextMapper.java（节选）">
+<pre>
+public Container map(Request request, boolean update) {
+    String contextPath = ((HttpServletRequest) request.getRequest()).getContextPath();
+    String requestURI = ((HttpRequest) request).getDecodedRequestURI();
+    String relativeURI = requestURI.substring(contextPath.length());
+    Wrapper wrapper = null;
+    String name = context.findServletMapping(relativeURI);
+    if (name != null)
+        wrapper = (Wrapper) context.findChild(name);
+    return (wrapper);
+}
+</pre>
+</div>
+
+<div class="code" data-lang="java" data-file="ex05/pyrmont/startup/Bootstrap2.java（节选）">
+<pre>
+Wrapper wrapper1 = new SimpleWrapper();
+wrapper1.setName("Primitive");
+wrapper1.setServletClass("PrimitiveServlet");
+Wrapper wrapper2 = new SimpleWrapper();
+wrapper2.setName("Modern");
+wrapper2.setServletClass("ModernServlet");
+
+Context context = new SimpleContext();
+context.addChild(wrapper1);
+context.addChild(wrapper2);
+((Pipeline) context).addValve(new HeaderLoggerValve());
+((Pipeline) context).addValve(new ClientIPLoggerValve());
+
+Mapper mapper = new SimpleContextMapper();
+mapper.setProtocol("http");
+context.addMapper(mapper);
+context.setLoader(new SimpleLoader());        // 加在 Context 上，两个 Wrapper 共用
+context.addServletMapping("/Primitive", "Primitive");
+context.addServletMapping("/Modern", "Modern");
+connector.setContainer(context);
+</pre>
+</div>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch05/core/</code><code>valves/</code><code>startup/Bootstrap1.java</code><code>startup/Bootstrap2.java</code><code>tomcat/EmbeddedBootstrap.java</code></div>
+
+<p>Java 17 版分两部分：<code>core</code> 包是一个精简的「迷你 Catalina」，接在第 4 章的连接器后面，和原书的 Simple* 类一一对应；<code>tomcat</code> 包用<strong>真正的 Tomcat 11 嵌入式 API</strong> 搭出同样的结构，让你看到这些概念在今天的样子。</p>
+
+<h3>① 阀是函数式接口</h3>
+
+<p>去掉 <code>getInfo()</code> 后，<code>Valve</code> 只剩一个抽象方法，可以直接写成 lambda：</p>
+
+<div class="vs">
+  <div class="old"><div class="h">原书：一个阀一个类</div>
+<div class="code" data-lang="java">
+<pre>
+public class ClientIPLoggerValve
+        implements Valve, Contained {
+    protected Container container;
+    public void invoke(Request request,
+            Response response, ValveContext ctx)
+            throws IOException, ServletException {
+        ctx.invokeNext(request, response);
+        System.out.println(...);
+    }
+    public String getInfo() { return null; }
+    public Container getContainer() { ... }
+    public void setContainer(Container c) { ... }
+}
+</pre>
+</div>
+  </div>
+  <div class="new"><div class="h">Java 17：lambda 阀</div>
+<div class="code" data-lang="java">
+<pre>
+@FunctionalInterface
+public interface Valve {
+    void invoke(HttpRequest request, HttpResponse response,
+                ValveContext context) throws Exception;
+}
+
+// Bootstrap2 里：统计每个请求的耗时
+context.getPipeline().addValve((req, res, ctx) -&gt; {
+    long start = System.nanoTime();
+    ctx.invokeNext(req, res);
+    System.out.printf("%s 耗时 %.1f ms%n",
+        req.getRequestURI(),
+        (System.nanoTime() - start) / 1e6);
+});
+</pre>
+</div>
+  </div>
+</div>
+
+<h3>② 管道：CopyOnWriteArrayList + 模式匹配</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch05/core/SimplePipeline.java（节选）">
+<pre>
+private final List&lt;Valve&gt; valves = new CopyOnWriteArrayList&lt;&gt;();   // 读多写少，运行时增删阀也安全
+
+@Override
+public void addValve(Valve valve) {
+    if (valve instanceof Contained c) {        // Java 16 模式匹配，不用再强转
+        c.setContainer(container);
+    }
+    valves.add(valve);
+}
+
+@Override
+public void invoke(HttpRequest request, HttpResponse response) throws Exception {
+    new StandardValveContext(List.copyOf(valves), basic).invokeNext(request, response);
+}
+
+private static final class StandardValveContext implements ValveContext {
+    private final List&lt;Valve&gt; valves;
+    private final Valve basic;
+    private int stage;
+
+    @Override
+    public void invokeNext(HttpRequest request, HttpResponse response) throws Exception {
+        int subscript = stage++;
+        if (subscript &lt; valves.size()) {
+            valves.get(subscript).invoke(request, response, this);
+        } else if (subscript == valves.size() &amp;&amp; basic != null) {
+            basic.invoke(request, response, this);
+        } else {
+            throw new ServletException("No valve");
+        }
+    }
+}
+</pre>
+</div>
+
+<h3>③ Wrapper：线程安全的懒加载</h3>
+
+<p>原书的 <code>allocate()</code> 用一个普通字段缓存实例，多个线程同时第一次访问时可能加载出多个实例。Java 17 版用 <code>volatile</code> + 双重检查锁定：</p>
+
+<div class="code" data-lang="java" data-file="java17/.../ch05/core/SimpleWrapper.java（节选）">
+<pre>
+private volatile Servlet instance;
+
+public Servlet allocate() throws ServletException {
+    Servlet servlet = instance;
+    if (servlet == null) {
+        synchronized (this) {
+            servlet = instance;
+            if (servlet == null) {
+                instance = servlet = loadServlet();   // 加载、实例化、init(null)
+            }
+        }
+    }
+    return servlet;
+}
+</pre>
+</div>
+
+<p>其他：<code>SimpleLoader</code> 写成了 <code>record</code>；Context 不再有单独的 Mapper，映射逻辑直接写在 <code>SimpleContext.map()</code> 里（和 Tomcat 5 之后一致）；<code>SimpleContextValve</code> 真正实现了原书只算不用的 <code>/WEB-INF</code>、<code>/META-INF</code> 访问禁止。</p>
+
+<h3>④ Tomcat 11 的阀：从 ValveContext 到 getNext()</h3>
+
+<p>从 Tomcat 5.5/6 开始，<code>ValveContext</code> 被删掉了。每个阀直接持有下一个阀的引用，形成一条单向链表：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="Tomcat 4 用 ValveContext 的 stage 计数器调度阀，Tomcat 6 之后每个阀用 getNext 指向下一个阀">
+  <text class="ttl" x="20" y="24">Tomcat 4/5：ValveContext 当调度员</text>
+  <rect class="bx-p" x="20" y="36" width="170" height="44" rx="8"/>
+  <text class="mono on-p" x="105" y="57" text-anchor="middle">ValveContext</text>
+  <text class="sm" x="105" y="73" text-anchor="middle">stage = 0, 1, 2 …</text>
+  <rect class="bx-b" x="260" y="40" width="110" height="36" rx="8"/><text class="mono" x="315" y="63" text-anchor="middle">Valve 1</text>
+  <rect class="bx-b" x="400" y="40" width="110" height="36" rx="8"/><text class="mono" x="455" y="63" text-anchor="middle">Valve 2</text>
+  <rect class="bx-a" x="540" y="40" width="130" height="36" rx="8"/><text class="mono" x="605" y="63" text-anchor="middle">Basic</text>
+  <path class="ln-p" d="M192 52 C220 30 240 30 258 50" marker-end="url(#ar-p)"/>
+  <path class="ln-p" d="M192 58 C260 100 380 100 400 70" marker-end="url(#ar-p)"/>
+  <path class="ln-p" d="M192 64 C280 120 520 120 560 78" marker-end="url(#ar-p)"/>
+  <text class="sm" x="380" y="130" text-anchor="middle">阀调用 ctx.invokeNext()，由 ValveContext 决定下一个是谁</text>
+
+  <text class="ttl" x="20" y="164">Tomcat 6 – 11：阀组成链表</text>
+  <rect class="bx-b" x="20" y="176" width="140" height="36" rx="8"/><text class="mono" x="90" y="199" text-anchor="middle">Valve 1</text>
+  <rect class="bx-b" x="200" y="176" width="140" height="36" rx="8"/><text class="mono" x="270" y="199" text-anchor="middle">Valve 2</text>
+  <rect class="bx-a" x="380" y="176" width="160" height="36" rx="8"/><text class="mono" x="460" y="199" text-anchor="middle">Basic</text>
+  <path class="ln-a" d="M162 194 H196" marker-end="url(#ar-a)"/>
+  <path class="ln-a" d="M342 194 H376" marker-end="url(#ar-a)"/>
+  <text class="sm" x="570" y="190">getNext().invoke(req, res)</text>
+  <text class="sm" x="570" y="206">first → … → basic</text>
+</svg>
+<figcaption>图 5-6　两代管道实现的对比</figcaption>
+</figure>
+
+<div class="vs">
+  <div class="old"><div class="h">Tomcat 4</div>
+<div class="code" data-lang="java">
+<pre>
+public void invoke(Request request, Response response,
+                   ValveContext valveContext)
+        throws IOException, ServletException {
+    valveContext.invokeNext(request, response);
+    System.out.println("Header Logger Valve");
+    ...
+}
+</pre>
+</div>
+  </div>
+  <div class="new"><div class="h">Tomcat 11（java17/.../ch05/tomcat/）</div>
+<div class="code" data-lang="java">
+<pre>
+public class HeaderLoggerValve extends ValveBase {
+    @Override
+    public void invoke(Request request, Response response)
+            throws IOException, ServletException {
+        getNext().invoke(request, response);
+        System.out.println("Header Logger Valve (Tomcat 11)");
+        ...
+    }
+}
+</pre>
+</div>
+  </div>
+</div>
+
+<p>用嵌入式 Tomcat 11 搭出和 Bootstrap2 一模一样的结构，代码几乎可以逐行对照：</p>
+
+<div class="code" data-lang="java" data-file="java17/.../ch05/tomcat/EmbeddedBootstrap.java（节选）">
+<pre>
+var tomcat = new Tomcat();
+tomcat.setPort(port);
+Context context = tomcat.addContext("", null);           // 一个 Context
+
+Wrapper primitive = Tomcat.addServlet(context, "Primitive", newServlet(loader, "PrimitiveServlet"));
+Wrapper modern = Tomcat.addServlet(context, "Modern", newServlet(loader, "ModernServlet"));
+context.addServletMappingDecoded("/Primitive", primitive.getName());
+context.addServletMappingDecoded("/Modern", modern.getName());
+
+context.getPipeline().addValve(new HeaderLoggerValve());
+context.getPipeline().addValve(new ClientIPLoggerValve());
+
+tomcat.start();
+tomcat.getServer().await();
+</pre>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch05.startup.Bootstrap1          # 一个 Wrapper：任何路径都是 ModernServlet
+./run.sh ch05.startup.Bootstrap2          # Context + 两个 Wrapper：/Primitive、/Modern
+./run.sh ch05.tomcat.EmbeddedBootstrap    # 同样的结构，跑在真正的 Tomcat 11 上
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+$ curl http://localhost:8080/Primitive          # Bootstrap2
+Hello. Roses are red.
+Violets are blue.
+$ curl -o /dev/null -w '%{http_code}\n' http://localhost:8080/Nope
+404
+$ curl -o /dev/null -w '%{http_code}\n' http://localhost:8080/WEB-INF/web.xml
+404
+
+（服务器控制台）
+init
+from service
+/Primitive 耗时 39.9 ms          ← lambda 阀最后加入，最先打印
+Client IP Logger Valve
+127.0.0.1
+-----------------------------------
+Header Logger Valve
+host:localhost:8080
+user-agent:curl/8.5.0
+accept:*/*
+-----------------------------------
+</pre>
+</div>
+
+<div class="box note">
+  <div class="t">&#9432; 一个小发现</div>
+  <p>用 <code>curl -i</code> 请求 Tomcat 11 版本，状态行是 <code>HTTP/1.1 200</code>，后面没有 <code>OK</code>。从 Tomcat 8.5 起默认不再发送原因短语——RFC 7230 允许省略它，客户端本来就只看状态码。</p>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>四种容器：Engine ⊃ Host ⊃ Context ⊃ Wrapper；部署时不必四种齐全。</li>
+  <li>容器的 <code>invoke</code> 把请求交给管道；管道依次调用附加阀，最后调用基础阀。</li>
+  <li><code>ValveContext.invokeNext()</code> 让阀可以在后续处理前后各做一些事，形成嵌套调用。</li>
+  <li>Wrapper 的基础阀调用 Servlet；Context 的基础阀找到 Wrapper 并调用它的 <code>invoke</code>。</li>
+  <li>子容器没有 Loader 时使用父容器的 Loader。</li>
+  <li>现代 Tomcat 去掉了 ValveContext 和 Mapper，阀通过 <code>getNext()</code> 串成链表，但整体架构未变。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>写一个 lambda 阀：如果请求头里没有 <code>X-Token: secret</code>，直接 <code>response.sendError(403)</code> 并且<strong>不调用</strong> <code>invokeNext</code>。验证 Servlet 不会被执行。</li>
+    <li>把这个阀分别加到 Context 和某一个 Wrapper 的管道上，比较两种做法的影响范围。</li>
+    <li>给 <code>SimpleContext.map()</code> 增加前缀匹配：<code>addServletMapping("/api/*", "Modern")</code> 让 <code>/api/</code> 下的所有路径都交给 Modern。</li>
+    <li>在 Tomcat 11 版本里，用 <code>context.getPipeline().getFirst()</code> 和 <code>getNext()</code> 把整条阀链打印出来，看看 Tomcat 自己还装了哪些阀。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

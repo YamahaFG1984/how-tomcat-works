@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 14 章 · Server 与 Service — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="14">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 14 章</span>
+<h1>Server 与 Service</h1>
+<p class="lede">
+  到目前为止，我们总是手动创建一个连接器、一个容器，把它们连起来，然后「按回车停止」。
+  这一章引入最后两个组件：<strong>Service</strong> 把一个容器和多个连接器组合在一起；
+  <strong>Server</strong> 是整个 Catalina 的根，它提供了优雅的启动和关闭机制——在一个专门的端口上等待关闭命令。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>理解 Server、Service、Connector、Engine 之间的组合关系</li>
+    <li>弄清 initialize / start / await / stop 的调用顺序以及启停的先后</li>
+    <li>理解关闭端口的工作原理和它的安全考量</li>
+    <li>把这套结构对应到 Tomcat 的 <code>server.xml</code></li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="structure">组件全家福</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 360" role="img" aria-label="Server 包含 Service，Service 包含多个 Connector 和一个 Engine">
+  <rect class="bx-r" x="20" y="16" width="720" height="330" rx="16"/>
+  <text class="ttl on-r" x="40" y="42">Server（port=8005, shutdown="SHUTDOWN"）</text>
+  <text class="sm" x="40" y="60">整个 Catalina；await() 在 8005 端口等关闭命令</text>
+
+  <rect class="bx-p" x="40" y="74" width="680" height="256" rx="14"/>
+  <text class="ttl on-p" x="60" y="98">Service "Catalina"</text>
+  <text class="sm" x="60" y="116">一个容器 + 若干连接器；所有连接器共享这个容器</text>
+
+  <rect class="bx-b" x="60" y="134" width="190" height="56" rx="10"/>
+  <text class="ttl on-b" x="155" y="158" text-anchor="middle">Connector :8080</text>
+  <text class="sm" x="155" y="176" text-anchor="middle">HTTP/1.1</text>
+  <rect class="bx-b" x="60" y="200" width="190" height="56" rx="10"/>
+  <text class="ttl on-b" x="155" y="224" text-anchor="middle">Connector :8443</text>
+  <text class="sm" x="155" y="242" text-anchor="middle">HTTPS</text>
+  <rect class="bx-b" x="60" y="266" width="190" height="50" rx="10"/>
+  <text class="ttl on-b" x="155" y="288" text-anchor="middle">Connector :8009</text>
+  <text class="sm" x="155" y="304" text-anchor="middle">AJP（给 Apache httpd）</text>
+
+  <rect class="bx-a" x="330" y="134" width="370" height="182" rx="12"/>
+  <text class="ttl on-a" x="350" y="158">Engine "Catalina"</text>
+  <rect class="bx-g" x="350" y="172" width="330" height="128" rx="10"/>
+  <text class="ttl on-g" x="366" y="194">Host "localhost"</text>
+  <rect class="bx" x="366" y="208" width="140" height="36" rx="6"/><text class="mono sm" x="436" y="231" text-anchor="middle">Context /app1</text>
+  <rect class="bx" x="520" y="208" width="140" height="36" rx="6"/><text class="mono sm" x="590" y="231" text-anchor="middle">Context ""</text>
+  <text class="sm" x="515" y="276" text-anchor="middle">Wrapper …</text>
+
+  <path class="ln" d="M252 162 H326" marker-end="url(#ar)"/>
+  <path class="ln" d="M252 228 H326" marker-end="url(#ar)"/>
+  <path class="ln" d="M252 291 H326" marker-end="url(#ar)"/>
+</svg>
+<figcaption>图 14-1　Server → Service → (Connector × N + Engine)</figcaption>
+</figure>
+
+<p>这个结构和 Tomcat 的 <code>conf/server.xml</code> 一一对应：</p>
+
+<div class="code" data-lang="xml" data-file="conf/server.xml（简化）">
+<pre>
+&lt;Server port="8005" shutdown="SHUTDOWN"&gt;
+  &lt;Service name="Catalina"&gt;
+    &lt;Connector port="8080" protocol="HTTP/1.1" connectionTimeout="20000" /&gt;
+    &lt;Connector port="8443" protocol="HTTP/1.1" SSLEnabled="true" ... /&gt;
+    &lt;Engine name="Catalina" defaultHost="localhost"&gt;
+      &lt;Host name="localhost" appBase="webapps" autoDeploy="true"&gt;
+        &lt;Context path="/app1" docBase="app1" /&gt;
+      &lt;/Host&gt;
+    &lt;/Engine&gt;
+  &lt;/Service&gt;
+&lt;/Server&gt;
+</pre>
+</div>
+
+<h2 id="server">Server 接口与 StandardServer</h2>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/Server.java（节选）">
+<pre>
+public interface Server {
+    public int getPort();                       // 等待关闭命令的端口
+    public void setPort(int port);
+    public String getShutdown();                // 关闭命令字符串
+    public void setShutdown(String shutdown);
+    public void addService(Service service);
+    public Service findService(String name);
+    public Service[] findServices();
+    public void removeService(Service service);
+    public void await();                        // ★ 一直等到收到正确的关闭命令才返回
+    public void initialize() throws LifecycleException;
+    ...
+}
+</pre>
+</div>
+
+<p>StandardServer 中和生命周期相关的四个方法是 <code>initialize</code>、<code>start</code>、<code>stop</code>、<code>await</code>，用法固定为：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="Server 生命周期调用顺序：initialize、start、await 阻塞、收到关闭命令后 stop">
+  <rect class="bx-d" x="20" y="20" width="160" height="60" rx="10"/>
+  <text class="mono" x="100" y="46" text-anchor="middle">initialize()</text>
+  <text class="sm" x="100" y="66" text-anchor="middle">连接器绑定端口</text>
+  <rect class="bx-g" x="205" y="20" width="160" height="60" rx="10"/>
+  <text class="mono" x="285" y="46" text-anchor="middle">start()</text>
+  <text class="sm" x="285" y="66" text-anchor="middle">先容器，后连接器</text>
+  <rect class="bx-a" x="390" y="20" width="160" height="60" rx="10"/>
+  <text class="mono" x="470" y="46" text-anchor="middle">await()</text>
+  <text class="sm" x="470" y="66" text-anchor="middle">⏳ 阻塞在 8005 端口</text>
+  <rect class="bx-r" x="575" y="20" width="160" height="60" rx="10"/>
+  <text class="mono" x="655" y="46" text-anchor="middle">stop()</text>
+  <text class="sm" x="655" y="66" text-anchor="middle">先连接器，后容器</text>
+  <path class="ln" d="M182 50 H201" marker-end="url(#ar)"/>
+  <path class="ln" d="M367 50 H386" marker-end="url(#ar)"/>
+  <path class="ln" d="M552 50 H571" marker-end="url(#ar)"/>
+
+  <rect class="bx-b" x="300" y="150" width="200" height="50" rx="10"/>
+  <text class="mono" x="400" y="172" text-anchor="middle">Stopper / shutdown.sh</text>
+  <text class="sm" x="400" y="190" text-anchor="middle">连接 8005，发送 "SHUTDOWN"</text>
+  <path class="ln-b" d="M450 148 L470 84" marker-end="url(#ar-b)"/>
+  <text class="sm on-b" x="480" y="124">await() 返回</text>
+
+  <text class="sm" x="380" y="236" text-anchor="middle">initialize 用 initialized 标志防止重复初始化，stop 不会重置它：停止后再 start 不会再 initialize</text>
+  <text class="sm" x="380" y="256" text-anchor="middle">start / stop 用 started 标志防止重复启动、重复停止</text>
+  <text class="sm" x="380" y="276" text-anchor="middle">「先容器后连接器」：容器准备好了才开始接请求；「先连接器后容器」：先停止接新请求，再销毁应用</text>
+</svg>
+<figcaption>图 14-2　Server 的生命周期调用顺序</figcaption>
+</figure>
+
+<div class="code" data-lang="java" data-file="StandardServer.start() / stop()（节选）">
+<pre>
+public void start() throws LifecycleException {
+    if (started)
+        throw new LifecycleException(sm.getString("standardServer.start.started"));
+    lifecycle.fireLifecycleEvent(BEFORE_START_EVENT, null);
+    lifecycle.fireLifecycleEvent(START_EVENT, null);
+    started = true;
+    synchronized (services) {
+        for (int i = 0; i &lt; services.length; i++) {
+            if (services[i] instanceof Lifecycle)
+                ((Lifecycle) services[i]).start();         // 启动每个 Service
+        }
+    }
+    lifecycle.fireLifecycleEvent(AFTER_START_EVENT, null);
+}
+</pre>
+</div>
+
+<h3>await()：关闭端口</h3>
+
+<div class="code" data-lang="java" data-file="StandardServer.await()（对应原书 Listing 14.5，节选）">
+<pre>
+serverSocket = new ServerSocket(port, 1, InetAddress.getByName("127.0.0.1"));   // 只监听本机
+while (true) {
+    socket = serverSocket.accept();
+    socket.setSoTimeout(10 * 1000);                  // 连上来不说话？10 秒后放弃
+    stream = socket.getInputStream();
+
+    StringBuffer command = new StringBuffer();
+    int expected = 1024;                             // 最多读这么多：防止 DoS
+    while (expected &lt; shutdown.length()) {
+        if (random == null)
+            random = new Random(System.currentTimeMillis());
+        expected += (random.nextInt() % 1024);
+    }
+    while (expected &gt; 0) {
+        int ch = stream.read();
+        if (ch &lt; 32)                                  // 控制字符或 EOF：结束
+            break;
+        command.append((char) ch);
+        expected--;
+    }
+    socket.close();
+    if (command.toString().equals(shutdown))
+        break;                                       // 命令正确：跳出循环，await 返回
+    else
+        System.err.println("StandardServer.await: Invalid command '" + command + "' received");
+}
+serverSocket.close();
+</pre>
+</div>
+
+<div class="box warn">
+  <div class="t">&#9888; 关闭端口的安全性</div>
+  <p>任何能连上 8005 端口的人发一句 <code>SHUTDOWN</code> 就能关掉 Tomcat。所以它只监听 <code>127.0.0.1</code>。但同一台机器上的其他用户、或者通过 SSRF 漏洞让服务器自己访问 localhost，都能触发它。现代 Tomcat 的安全指南建议：把 <code>shutdown</code> 改成一个长随机字符串，或者干脆设置 <code>port="-1"</code> 关闭这个端口，改用操作系统信号（<code>kill</code>，见第 16 章的关闭钩子）停止 Tomcat。</p>
+</div>
+
+<h2 id="service">Service 接口与 StandardService</h2>
+
+<p>Service 持有一个容器和多个连接器。有多个连接器，Tomcat 就能同时服务多种协议——一个处理 HTTP，一个处理 HTTPS，所有连接器都把请求交给同一个容器。</p>
+
+<div class="code" data-lang="java" data-file="StandardService（节选）">
+<pre>
+private Container container = null;
+private Connector connectors[] = new Connector[0];
+
+public void setContainer(Container container) {
+    ...
+    this.container = container;
+    if ((this.container != null) &amp;&amp; (this.container instanceof Engine))
+        ((Engine) this.container).setService(this);
+    ...
+    synchronized (connectors) {
+        for (int i = 0; i &lt; connectors.length; i++)
+            connectors[i].setContainer(this.container);    // 告诉每个连接器：请求交给它
+    }
+}
+
+public void addConnector(Connector connector) {
+    synchronized (connectors) {
+        connector.setContainer(this.container);
+        connector.setService(this);
+        ... // 复制出新数组再追加（又是写时复制）
+        if (initialized) connector.initialize();         // Service 已经初始化/启动过，就补上
+        if (started &amp;&amp; (connector instanceof Lifecycle)) ((Lifecycle) connector).start();
+    }
+}
+
+public void start() throws LifecycleException {
+    ...
+    if (container != null) {
+        synchronized (container) {
+            if (container instanceof Lifecycle) ((Lifecycle) container).start();   // 先容器
+        }
+    }
+    synchronized (connectors) {
+        for (int i = 0; i &lt; connectors.length; i++) {
+            if (connectors[i] instanceof Lifecycle) ((Lifecycle) connectors[i]).start();   // 后连接器
+        }
+    }
+    ...
+}
+</pre>
+</div>
+
+<h2 id="app">本章应用</h2>
+
+<p>应用有三个类：沿用的 <code>SimpleContextConfig</code>、启动用的 <code>Bootstrap</code>、停止用的 <code>Stopper</code>。Bootstrap 的前半部分和第 13 章一样，区别在于连接器不再直接关联 Engine：</p>
+
+<div class="code" data-lang="java" data-file="ex14/pyrmont/startup/Bootstrap.java（节选）">
+<pre>
+Engine engine = new StandardEngine();
+engine.addChild(host);
+engine.setDefaultHost("localhost");
+
+Service service = new StandardService();
+service.setName("Stand-alone Service");
+Server server = new StandardServer();
+server.addService(service);
+service.addConnector(connector);
+service.setContainer(engine);            // setContainer 会调用连接器的 setContainer
+
+server.initialize();
+((Lifecycle) server).start();
+server.await();                          // 阻塞，直到收到关闭命令
+((Lifecycle) server).stop();
+</pre>
+</div>
+
+<div class="code" data-lang="java" data-file="ex14/pyrmont/startup/Stopper.java（节选）">
+<pre>
+// the following code is taken from the stop method of org.apache.catalina.startup.Catalina
+int port = 8005;
+Socket socket = new Socket("127.0.0.1", port);
+OutputStream stream = socket.getOutputStream();
+String shutdown = "SHUTDOWN";
+for (int i = 0; i &lt; shutdown.length(); i++)
+    stream.write(shutdown.charAt(i));
+stream.flush();
+stream.close();
+socket.close();
+</pre>
+</div>
+
+<div class="box note">
+  <div class="t">&#9432; 8005 还是 8085？</div>
+  <p>原书正文多处写「端口 8085」，但 Stopper 的代码和 Tomcat 默认的 server.xml 用的都是 <strong>8005</strong>。以 8005 为准。</p>
+</div>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch14/core/StandardServer.java</code><code>core/StandardService.java</code><code>startup/Bootstrap.java</code><code>startup/Stopper.java</code><code>tomcat/EmbeddedServer.java</code></div>
+
+<p>Java 17 版的 Service 真的挂了<strong>两个连接器</strong>（8080 和 8081），共享同一个 Engine，并复用前几章的 Host、Context。</p>
+
+<h3>① await()：更紧凑，也更谨慎</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch14/core/StandardServer.java（节选）">
+<pre>
+public void await() throws IOException {
+    if (port &lt; 0) {
+        return;                                   // port = -1：不开关闭端口
+    }
+    try (var serverSocket = new ServerSocket(port, 1, InetAddress.getLoopbackAddress())) {
+        while (true) {
+            String command;
+            try (Socket socket = serverSocket.accept()) {
+                socket.setSoTimeout(10_000);
+                command = readCommand(socket.getInputStream());     // 最多 1024 个字符，遇控制字符停止
+            } catch (IOException e) {
+                System.err.println("StandardServer.await: " + e);
+                continue;                         // 原书在这里 System.exit(1)
+            }
+            if (MessageDigest.isEqual(command.getBytes(UTF_8), shutdown.getBytes(UTF_8))) {
+                return;                           // 常数时间比较
+            }
+            System.err.println("StandardServer.await: Invalid command '" + command + "' received");
+        }
+    }
+}
+</pre>
+</div>
+
+<div class="vs">
+  <div class="old"><div class="h">原书：出错就退出整个 JVM</div>
+<div class="code" data-lang="java">
+<pre>
+catch (IOException e) {
+    System.err.println("StandardServer.await: accept: " + e);
+    e.printStackTrace();
+    System.exit(1);
+}
+</pre>
+</div>
+  </div>
+  <div class="new"><div class="h">Java 17：记一条日志，继续等</div>
+<div class="code" data-lang="java">
+<pre>
+catch (IOException e) {
+    System.err.println("StandardServer.await: " + e);
+    continue;
+}
+// 一个客户端读超时或断线，
+// 不应该让整个服务器退出
+</pre>
+</div>
+  </div>
+</div>
+
+<h3>② Stopper：try-with-resources</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch14/startup/Stopper.java（节选）">
+<pre>
+try (var socket = new Socket(InetAddress.getLoopbackAddress(), port);
+     var out = socket.getOutputStream()) {
+    out.write(shutdown.getBytes(StandardCharsets.US_ASCII));
+    out.flush();
+    System.out.println("The server was successfully shut down.");
+} catch (IOException e) {
+    System.out.println("Error. The server has not been started.");
+}
+</pre>
+</div>
+
+<h3>③ Tomcat 11：同样的 Server、Service、关闭端口</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch14/tomcat/EmbeddedServer.java（节选）">
+<pre>
+var second = new Connector();                     // 再加一个 HTTP 连接器
+second.setPort(port2);
+tomcat.getService().addConnector(second);
+
+var server = tomcat.getServer();                  // org.apache.catalina.core.StandardServer
+server.setPort(shutdownPort);
+server.setShutdown("SHUTDOWN");
+
+tomcat.start();
+server.await();                                   // 和原书一样：阻塞到收到关闭命令
+tomcat.stop();
+tomcat.destroy();
+</pre>
+</div>
+
+<p>嵌入式 Tomcat 默认 <code>server.getPort()</code> 为 -1（不开关闭端口），<code>await()</code> 会一直阻塞到主线程被中断。同一个 <code>Stopper</code> 可以关闭迷你服务器，也可以关闭 Tomcat 11——它们说的是同一种「协议」。</p>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch14.startup.Bootstrap 8080 8081 8005     # 两个 HTTP 端口 + 关闭端口
+curl http://localhost:8080/app1/Primitive
+curl http://localhost:8081/app1/Primitive          # 另一个连接器，同一个应用
+printf 'HELLO' | nc -q1 localhost 8005              # 错误的命令
+./run.sh ch14.startup.Stopper 8005                 # 正确的命令
+
+./run.sh ch14.tomcat.EmbeddedServer 8080 8081 8005
+./run.sh ch14.startup.Stopper 8005
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+Starting service Stand-alone Service
+Starting Wrapper Primitive
+Starting Wrapper Modern
+ch04 连接器启动：http://localhost:8080/  处理器 min=5 max=20     ← 先容器，后连接器
+ch04 连接器启动：http://localhost:8081/  处理器 min=5 max=20
+StandardServer: 在 127.0.0.1:8005 等待关闭命令
+init
+from service
+from service
+StandardServer.await: Invalid command 'HELLO' received
+StandardServer: 收到关闭命令
+Stopping service Stand-alone Service
+ch04 连接器已停止                                               ← 先连接器，后容器
+ch04 连接器已停止
+Stopping wrapper Primitive
+destroy
+Stopping wrapper Modern
+服务器已优雅关闭
+
+（Tomcat 11）
+Server=StandardServer, Service=Tomcat, 连接器数量=2
+Tomcat 11 已优雅关闭
+</pre>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>Server 是整个 Catalina 的根，包含若干 Service；Service 包含一个容器（Engine）和多个连接器。</li>
+  <li>调用顺序：<code>initialize → start → await → stop</code>；启动先容器后连接器，停止先连接器后容器。</li>
+  <li><code>await()</code> 在关闭端口（默认 8005，只监听 127.0.0.1）等待关闭命令，读取有长度和超时限制。</li>
+  <li>Stopper（以及 Tomcat 的 <code>shutdown.sh</code>）就是连上关闭端口发一句 <code>SHUTDOWN</code>。</li>
+  <li>这套结构就是 <code>server.xml</code> 的骨架；生产环境应保护或关闭关闭端口。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>在 Java 17 版中把 shutdown 命令改成启动时随机生成的 UUID，并把它写进一个只有当前用户可读的文件（<code>PosixFilePermissions</code>），让 Stopper 从文件里读取。</li>
+    <li>在 Service 运行期间调用 <code>service.addConnector(new HttpConnector(8082))</code>，验证新连接器会被立即初始化并启动。</li>
+    <li>给 StandardServer 加一个关闭钩子（第 16 章）：用户按 Ctrl+C 时也能调用 <code>stop()</code>。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

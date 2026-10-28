@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 12 章 · StandardContext — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="12">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 12 章</span>
+<h1>StandardContext</h1>
+<p class="lede">
+  Context 代表一个 Web 应用。除了包含若干 Wrapper，它还要协调载入器、会话管理器、域、资源等一大堆组件。
+  这一章拆解 <code>StandardContext</code>：它如何启动、如何确认自己「配置好了」、
+  如何按照 Servlet 规范把 URL 映射到 Wrapper、如何在重载时暂停请求，
+  以及 Tomcat 5 引入的<strong>共享后台线程</strong>。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>理解 <code>configured</code> 与 <code>available</code> 两个标志，以及配置监听器的角色</li>
+    <li>按顺序说出 <code>StandardContext.start()</code> 做的事</li>
+    <li>掌握 Servlet URL 映射的四条规则：精确、前缀、扩展名、默认</li>
+    <li>理解 Tomcat 5 的 <code>backgroundProcess()</code> 如何让所有组件共用一个后台线程</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<div class="box note">
+  <div class="t">&#9432; 本章原书没有示例程序</div>
+  <p>原书本章只讲解 StandardContext 的源码，前几章的程序已经在用它了。Java 17 版专门为本章写了三个可运行的示例：映射规则演示 <code>MapperDemo</code>、组合了映射 + 重载暂停 + 共享后台线程的 <code>Bootstrap</code>，以及 Tomcat 11 的 <code>EmbeddedMapping</code>。</p>
+</div>
+
+<h2 id="config">配置：configured 与 available</h2>
+
+<p>StandardContext 构造之后必须调用 <code>start()</code> 才能处理请求。启动可能失败，失败时 <code>available</code> 属性为 false。启动成功的前提是 Context <strong>被正确配置</strong>：读取全局默认 web.xml（<code>%CATALINA_HOME%/conf/web.xml</code>）和应用自己的 web.xml、安装认证器阀等。</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="StandardContext 在 START 事件中由 ContextConfig 监听器配置，配置成功则设置 configured 为 true">
+  <rect class="bx-a" x="20" y="60" width="220" height="90" rx="12"/>
+  <text class="ttl on-a" x="130" y="86" text-anchor="middle">StandardContext.start()</text>
+  <text class="mono sm" x="130" y="110" text-anchor="middle">setConfigured(false)</text>
+  <text class="mono sm" x="130" y="130" text-anchor="middle">fire(START_EVENT)</text>
+  <path class="ln-a" d="M242 105 H330" marker-end="url(#ar-a)"/>
+  <rect class="bx-g" x="334" y="40" width="230" height="130" rx="12"/>
+  <text class="ttl on-g" x="449" y="64" text-anchor="middle">ContextConfig（监听器）</text>
+  <text class="sm" x="449" y="88" text-anchor="middle">解析默认 web.xml + 应用 web.xml</text>
+  <text class="sm" x="449" y="108" text-anchor="middle">创建 Wrapper、映射、过滤器…</text>
+  <text class="sm" x="449" y="128" text-anchor="middle">安装认证器阀</text>
+  <text class="mono sm on-g" x="449" y="152" text-anchor="middle">setConfigured(true)</text>
+  <path class="ln-g" d="M566 105 H620" marker-end="url(#ar-g)"/>
+  <rect class="bx" x="624" y="60" width="116" height="90" rx="12"/>
+  <text class="sm" x="682" y="88" text-anchor="middle">configured?</text>
+  <text class="sm on-g" x="682" y="112" text-anchor="middle">是 → available</text>
+  <text class="sm on-r" x="682" y="134" text-anchor="middle">否 → stop()</text>
+  <text class="sm" x="380" y="196" text-anchor="middle">前几章的 SimpleContextConfig 只做了最后一步「setConfigured(true)」，骗 StandardContext 说自己配置好了</text>
+</svg>
+<figcaption>图 12-1　配置监听器决定 Context 能否启动</figcaption>
+</figure>
+
+<p>构造器里最重要的一件事是给管道设置基础阀：</p>
+
+<div class="code" data-lang="java">
+<pre>
+public StandardContext() {
+    super();
+    pipeline.setBasic(new StandardContextValve());
+    namingResources.setContainer(this);
+}
+</pre>
+</div>
+
+<h2 id="start">start() 做了什么</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 470" role="img" aria-label="StandardContext.start 的步骤">
+  <rect class="bx-d" x="20" y="16" width="340" height="30" rx="6"/><text class="sm" x="190" y="36" text-anchor="middle">fire(BEFORE_START)；available = false；configured = false</text>
+  <rect class="bx-b" x="20" y="56" width="340" height="30" rx="6"/><text class="sm" x="190" y="76" text-anchor="middle">没有 Resources → FileDirContext 或 WARDirContext</text>
+  <rect class="bx-b" x="20" y="96" width="340" height="30" rx="6"/><text class="sm" x="190" y="116" text-anchor="middle">没有 Loader → new WebappLoader(...)</text>
+  <rect class="bx-b" x="20" y="136" width="340" height="30" rx="6"/><text class="sm" x="190" y="156" text-anchor="middle">没有 Manager → new StandardManager()</text>
+  <rect class="bx-d" x="20" y="176" width="340" height="30" rx="6"/><text class="sm" x="190" y="196" text-anchor="middle">字符集映射、工作目录、JNDI 命名上下文</text>
+  <rect class="bx-p" x="20" y="216" width="340" height="30" rx="6"/><text class="sm" x="190" y="236" text-anchor="middle">添加默认 Mapper（Tomcat 4）；started = true</text>
+  <rect class="bx-p" x="20" y="256" width="340" height="30" rx="6"/><text class="sm" x="190" y="276" text-anchor="middle">启动 Loader、Logger、Cluster、Realm、Resources</text>
+  <rect class="bx-p" x="20" y="296" width="340" height="30" rx="6"/><text class="sm" x="190" y="316" text-anchor="middle">启动 Mapper、子容器（Wrapper）、管道</text>
+  <rect class="bx-a" x="20" y="336" width="340" height="30" rx="6"/><text class="sm on-a" x="190" y="356" text-anchor="middle">fire(START) → ContextConfig 配置；启动 Manager</text>
+  <rect class="bx-g" x="20" y="376" width="340" height="40" rx="6"/>
+  <text class="sm" x="190" y="392" text-anchor="middle">configured 为真：欢迎页、监听器、过滤器、</text>
+  <text class="sm" x="190" y="408" text-anchor="middle">load-on-startup 的 Servlet → available = true</text>
+  <rect class="bx-d" x="20" y="426" width="340" height="30" rx="6"/><text class="sm" x="190" y="446" text-anchor="middle">fire(AFTER_START)</text>
+
+  <text class="ttl" x="420" y="80">缺什么补什么</text>
+  <text class="sm" x="420" y="100">Resources 是 Loader 需要的；Loader 是</text>
+  <text class="sm" x="420" y="118">Manager 需要的（反序列化会话要用</text>
+  <text class="sm" x="420" y="136">Web 应用的类）。所以按这个顺序创建。</text>
+  <path class="ln-d" d="M410 96 H366"/>
+
+  <text class="ttl" x="420" y="300">bindThread() / unbindThread()</text>
+  <text class="sm" x="420" y="320">启动子组件前，把当前线程的上下文类</text>
+  <text class="sm" x="420" y="338">加载器换成 Web 应用的类加载器，结束</text>
+  <text class="sm" x="420" y="356">后换回来，保证应用代码加载到自己的类。</text>
+  <path class="ln-d" d="M410 316 H366"/>
+
+  <text class="ttl on-r" x="420" y="400">configured 为假</text>
+  <text class="sm" x="420" y="420">记录 standardContext.startFailed，</text>
+  <text class="sm" x="420" y="438">调用 stop() 清理，available = false</text>
+  <path class="ln-d" d="M410 400 H366"/>
+</svg>
+<figcaption>图 12-2　StandardContext.start() 的步骤（Tomcat 4，对应原书 Listing 12.1）</figcaption>
+</figure>
+
+<h2 id="invoke">invoke 与重载暂停</h2>
+
+<p>Tomcat 4 中，StandardContext 的 <code>invoke</code> 先检查应用是否正在重载，是的话就一直等到重载结束：</p>
+
+<div class="code" data-lang="java" data-file="StandardContext.invoke()（Tomcat 4）">
+<pre>
+public void invoke(Request request, Response response) throws IOException, ServletException {
+    while (getPaused()) {               // 正在重载：每秒检查一次
+        try {
+            Thread.sleep(1000);
+        } catch (InterruptedException e) {
+        }
+    }
+    if (swallowOutput) {                // 把 System.out 的输出捕获进日志
+        try {
+            SystemLogHandler.startCapture();
+            super.invoke(request, response);
+        } finally {
+            String log = SystemLogHandler.stopCapture();
+            if (log != null &amp;&amp; log.length() &gt; 0) log(log);
+        }
+    } else {
+        super.invoke(request, response);
+    }
+}
+</pre>
+</div>
+
+<p>Tomcat 5 去掉了这个 <code>invoke</code> 覆盖，检查重载的逻辑移到了 <code>StandardContextValve.invoke</code> 里。</p>
+
+<h2 id="mapper">映射：四条规则</h2>
+
+<p>StandardContextValve 首先要找到处理请求的 Wrapper。Tomcat 4 中这由 <code>StandardContextMapper</code> 完成：ContainerBase 的 <code>addDefaultMapper()</code> 通过反射创建它，<code>map()</code> 方法按 Servlet 规范依次尝试四条规则：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 360" role="img" aria-label="四条映射规则依次尝试：精确、最长前缀、扩展名、默认">
+  <rect class="bx" x="20" y="16" width="240" height="36" rx="8"/>
+  <text class="mono sm" x="140" y="39" text-anchor="middle">relativeURI = /modern/admin/x</text>
+
+  <rect class="bx-a" x="20" y="76" width="240" height="50" rx="8"/>
+  <text class="ttl on-a" x="140" y="98" text-anchor="middle">① 精确匹配</text>
+  <text class="mono sm" x="140" y="116" text-anchor="middle">findServletMapping(uri)</text>
+  <rect class="bx-b" x="20" y="146" width="240" height="64" rx="8"/>
+  <text class="ttl on-b" x="140" y="168" text-anchor="middle">② 前缀匹配（最长优先）</text>
+  <text class="mono sm" x="140" y="186" text-anchor="middle">/modern/admin/x/* ✗</text>
+  <text class="mono sm" x="140" y="202" text-anchor="middle">/modern/admin/* ✓</text>
+  <rect class="bx-p" x="20" y="230" width="240" height="50" rx="8"/>
+  <text class="ttl on-p" x="140" y="252" text-anchor="middle">③ 扩展名匹配</text>
+  <text class="mono sm" x="140" y="270" text-anchor="middle">*.jsp、*.do</text>
+  <rect class="bx-g" x="20" y="300" width="240" height="50" rx="8"/>
+  <text class="ttl on-g" x="140" y="322" text-anchor="middle">④ 默认</text>
+  <text class="mono sm" x="140" y="340" text-anchor="middle">"/"</text>
+  <path class="ln" d="M140 54 V72" marker-end="url(#ar)"/>
+  <path class="ln" d="M140 128 V142" marker-end="url(#ar)"/>
+  <path class="ln" d="M140 212 V226" marker-end="url(#ar)"/>
+  <path class="ln" d="M140 282 V296" marker-end="url(#ar)"/>
+  <text class="sm" x="150" y="138">没找到</text>
+
+  <rect class="bx-d" x="310" y="76" width="430" height="274" rx="12"/>
+  <text class="ttl" x="525" y="100" text-anchor="middle">映射表与结果</text>
+  <text class="mono sm" x="330" y="126">/Primitive        → Primitive</text>
+  <text class="mono sm" x="330" y="146">/modern/*         → Modern</text>
+  <text class="mono sm" x="330" y="166">/modern/admin/*   → Admin</text>
+  <text class="mono sm" x="330" y="186">*.hello           → Hello</text>
+  <text class="mono sm" x="330" y="206">/                 → Default</text>
+  <text class="mono sm" x="330" y="240">/Primitive        ① Primitive</text>
+  <text class="mono sm" x="330" y="260">/modern/users/42  ② Modern  pathInfo=/users/42</text>
+  <text class="mono sm" x="330" y="280">/modern/admin/x   ② Admin   pathInfo=/x</text>
+  <text class="mono sm" x="330" y="300">/a/b/index.hello  ③ Hello</text>
+  <text class="mono sm" x="330" y="320">/modern/x.hello   ② Modern（前缀优先于扩展名）</text>
+  <text class="mono sm" x="330" y="340">/nothing/here     ④ Default</text>
+</svg>
+<figcaption>图 12-3　Servlet URL 映射的四条规则（结果来自 Java 17 版 MapperDemo 的真实输出）</figcaption>
+</figure>
+
+<div class="code" data-lang="java" data-file="StandardContextMapper.map()（Tomcat 4，节选）">
+<pre>
+// Rule 2 -- Prefix Match
+if (wrapper == null) {
+    servletPath = relativeURI;
+    while (true) {
+        name = context.findServletMapping(servletPath + "/*");
+        if (name != null)
+            wrapper = (Wrapper) context.findChild(name);
+        if (wrapper != null) {
+            pathInfo = relativeURI.substring(servletPath.length());
+            if (pathInfo.length() == 0)
+                pathInfo = null;
+            break;
+        }
+        int slash = servletPath.lastIndexOf('/');    // 去掉最后一段再试
+        if (slash &lt; 0)
+            break;
+        servletPath = servletPath.substring(0, slash);
+    }
+}
+</pre>
+</div>
+
+<p>匹配成功的同时确定了 <code>servletPath</code> 和 <code>pathInfo</code>：前缀匹配时 servletPath 是匹配上的前缀，剩下的部分是 pathInfo。Tomcat 5 删除了 Mapper 接口，映射改由连接器阶段的 <code>org.apache.tomcat.util.http.mapper.Mapper</code> 完成，结果直接保存在请求对象中：<code>Wrapper wrapper = request.getWrapper();</code></p>
+
+<h2 id="reload">重载支持</h2>
+
+<p><code>reloadable</code> 属性决定是否开启重载：web.xml 被修改或 <code>WEB-INF/classes</code> 中的类被重新编译时重新加载应用。Context 依赖载入器发现修改（第 8 章）。Tomcat 4 中，<code>WebappLoader.setContainer()</code> 会把 Context 的 reloadable 值同步给自己，并注册为 Context 的属性变化监听器；<code>setReloadable()</code> 从 false 变 true 时 <code>threadStart()</code>，从 true 变 false 时 <code>threadStop()</code>。</p>
+
+<h2 id="background">Tomcat 5 的 backgroundProcess</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="Tomcat 4 每个组件一个后台线程，Tomcat 5 所有组件共用一个后台线程">
+  <text class="ttl" x="20" y="24">Tomcat 4：各自开线程</text>
+  <rect class="bx-b" x="20" y="36" width="160" height="36" rx="8"/><text class="sm" x="100" y="58" text-anchor="middle">WebappLoader 线程</text>
+  <rect class="bx-b" x="20" y="80" width="160" height="36" rx="8"/><text class="sm" x="100" y="102" text-anchor="middle">StandardManager 线程</text>
+  <rect class="bx-b" x="20" y="124" width="160" height="36" rx="8"/><text class="sm" x="100" y="146" text-anchor="middle">StoreBase 线程</text>
+  <rect class="bx-b" x="20" y="168" width="160" height="36" rx="8"/><text class="sm" x="100" y="190" text-anchor="middle">… × 每个 Web 应用</text>
+  <text class="sm on-r" x="100" y="226" text-anchor="middle">100 个应用 → 几百个线程</text>
+
+  <text class="ttl" x="300" y="24">Tomcat 5：一个线程巡检整棵树</text>
+  <rect class="bx-a" x="300" y="36" width="200" height="44" rx="10"/>
+  <text class="mono sm on-a" x="400" y="54" text-anchor="middle">ContainerBackground</text>
+  <text class="mono sm on-a" x="400" y="70" text-anchor="middle">Processor（Engine 上）</text>
+  <text class="sm" x="400" y="98" text-anchor="middle">每 backgroundProcessorDelay 秒</text>
+  <rect class="bx-p" x="300" y="110" width="200" height="34" rx="8"/><text class="mono sm" x="400" y="132" text-anchor="middle">engine.backgroundProcess()</text>
+  <rect class="bx-p" x="330" y="152" width="200" height="34" rx="8"/><text class="mono sm" x="430" y="174" text-anchor="middle">host.backgroundProcess()</text>
+  <rect class="bx-g" x="360" y="194" width="200" height="34" rx="8"/><text class="mono sm" x="460" y="216" text-anchor="middle">context.backgroundProcess()</text>
+  <rect class="bx" x="390" y="236" width="200" height="28" rx="8"/><text class="mono sm" x="490" y="255" text-anchor="middle">wrapper.backgroundProcess()</text>
+  <path class="ln" d="M400 82 V106" marker-end="url(#ar)"/>
+  <path class="ln" d="M315 146 V169 H326" marker-end="url(#ar)"/>
+  <path class="ln" d="M345 188 V211 H356" marker-end="url(#ar)"/>
+  <path class="ln" d="M375 230 V250 H386" marker-end="url(#ar)"/>
+
+  <rect class="bx-g" x="590" y="150" width="160" height="80" rx="10"/>
+  <text class="sm" x="670" y="172" text-anchor="middle">每次：loader.modified()?</text>
+  <text class="sm" x="670" y="190" text-anchor="middle">→ reload()</text>
+  <text class="sm" x="670" y="212" text-anchor="middle">每 N 次：manager.</text>
+  <text class="sm" x="670" y="228" text-anchor="middle">backgroundProcess()</text>
+  <path class="ln-d" d="M562 211 H586"/>
+</svg>
+<figcaption>图 12-4　从「每个组件一个线程」到「一个共享的后台线程」</figcaption>
+</figure>
+
+<p>线程由 ContainerBase 的 <code>threadStart()</code> 创建（<code>backgroundProcessorDelay &gt; 0</code> 时）。<code>ContainerBackgroundProcessor</code> 循环睡眠，然后调用 <code>processChildren()</code>：切换上下文类加载器 → 调用当前容器的 <code>backgroundProcess()</code> → 递归处理那些自己没有设置 delay 的子容器。</p>
+
+<div class="code" data-lang="java" data-file="StandardContext.backgroundProcess()（Tomcat 5，对应原书 Listing 12.4）">
+<pre>
+public void backgroundProcess() {
+    if (!started)
+        return;
+    count = (count + 1) % managerChecksFrequency;
+    if ((getManager() != null) &amp;&amp; (count == 0)) {
+        getManager().backgroundProcess();             // 清理过期会话
+    }
+    if (getLoader() != null) {
+        if (reloadable &amp;&amp; (getLoader().modified())) {
+            reload();                                 // 类被修改了：重载
+        }
+        if (getLoader() instanceof WebappLoader) {
+            ((WebappLoader) getLoader()).closeJARs(false);
+        }
+    }
+}
+</pre>
+</div>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch12/core/</code><code>startup/MapperDemo.java</code><code>startup/Bootstrap.java</code><code>tomcat/EmbeddedMapping.java</code><code>webroot/MappingServlet.java</code></div>
+
+<h3>① 四条规则 + record 结果</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch12/core/StandardContextMapper.java（节选）">
+<pre>
+public record MappingResult(String wrapperName, Rule rule, String servletPath, String pathInfo) {
+    public enum Rule { EXACT, PREFIX, EXTENSION, DEFAULT }
+}
+
+public Optional&lt;MappingResult&gt; map(String relativeURI) {
+    String name = relativeURI.equals("/") ? null : findServletMapping.apply(relativeURI);
+    if (name != null) return Optional.of(new MappingResult(name, EXACT, relativeURI, null));
+
+    String servletPath = relativeURI;
+    while (true) {                                                  // 最长前缀优先
+        name = findServletMapping.apply(servletPath + "/*");
+        if (name != null) {
+            String pathInfo = relativeURI.substring(servletPath.length());
+            return Optional.of(new MappingResult(name, PREFIX, servletPath, pathInfo.isEmpty() ? null : pathInfo));
+        }
+        int slash = servletPath.lastIndexOf('/');
+        if (slash &lt; 0) break;
+        servletPath = servletPath.substring(0, slash);
+    }
+    ... // 扩展名、默认
+    name = findServletMapping.apply("/");
+    return Optional.ofNullable(name).map(n -&gt; new MappingResult(n, DEFAULT, relativeURI, null));
+}
+</pre>
+</div>
+
+<h3>② 重载期间暂停：一个 lambda 阀</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch12/core/StandardContext.java（节选）">
+<pre>
+public StandardContext() {
+    // Tomcat 5 起，「重载中就等待」从 invoke() 移进了管道
+    getPipeline().addValve((request, response, next) -&gt; {
+        while (paused) {
+            Thread.sleep(100);
+        }
+        next.invokeNext(request, response);
+    });
+}
+
+@Override
+public synchronized void reload() {
+    paused = true;
+    try {
+        super.reload();
+    } finally {
+        paused = false;              // 用 finally 保证即使重载失败也不会永远暂停
+    }
+}
+</pre>
+</div>
+
+<h3>③ 共享后台线程</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch12/core/ContainerBackgroundProcessor.java（节选）">
+<pre>
+public static ScheduledExecutorService start(Container top, int delaySeconds) {
+    ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(...);
+    executor.scheduleWithFixedDelay(() -&gt; processChildren(top), delaySeconds, delaySeconds, TimeUnit.SECONDS);
+    return executor;
+}
+
+static void processChildren(Container container) {
+    Thread thread = Thread.currentThread();
+    ClassLoader original = thread.getContextClassLoader();
+    try {
+        if (container.getLoader() != null) {
+            thread.setContextClassLoader(container.getLoader().getClassLoader());
+        }
+        if (container instanceof BackgroundProcessable bp) {
+            bp.backgroundProcess();
+        }
+    } finally {
+        thread.setContextClassLoader(original);
+    }
+    for (Container child : container.findChildren()) {
+        processChildren(child);
+    }
+}
+</pre>
+</div>
+
+<p>为此，第 8 章的 <code>WebappLoader</code> 增加了 <code>modified()</code> 方法，第 9 章的 <code>StandardManager</code> 在 <code>checkInterval = 0</code> 时不再启动自己的线程——它们的周期性工作统一由 Context 的 <code>backgroundProcess()</code> 驱动，和 Tomcat 5 的改造如出一辙。</p>
+
+<h3>④ Tomcat 11：HttpServletMapping</h3>
+
+<p>Servlet 4.0 新增了 <code>request.getHttpServletMapping()</code>，应用代码可以直接知道自己是按哪条规则被匹配到的。规范还新增了第五种情况 <code>CONTEXT_ROOT</code>（映射模式为空字符串 <code>""</code>，只匹配上下文根）：</p>
+
+<div class="code" data-lang="java" data-file="java17/webroot/MappingServlet.java（节选）">
+<pre>
+HttpServletMapping m = request.getHttpServletMapping();
+out.println("mappingMatch = " + m.getMappingMatch() + ", pattern = " + m.getPattern()
+        + ", matchValue = " + m.getMatchValue());
+</pre>
+</div>
+
+<div class="box tip">
+  <div class="t">&#128161; 现代 Tomcat 的后台线程</div>
+  <p>Tomcat 9 起，后台处理不再是一个裸线程，而是 Server 级别的一个<strong>工具线程池</strong>（<code>utilityThreads</code>，线程名 <code>Catalina-utility-N</code>），ContainerBase 用它调度 <code>backgroundProcess()</code>。运行 <code>EmbeddedMapping</code> 时你会在 periodic 事件里看到这个线程名。</p>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch12.startup.MapperDemo                 # 只打印映射结果
+./run.sh ch12.startup.Bootstrap 8080 3           # 第二个参数：会话超时 3 秒
+./run.sh ch12.tomcat.EmbeddedMapping
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+$ curl http://localhost:8080/modern/a/b          # 迷你容器
+requestURI   = /modern/a/b
+servletPath  = /modern
+pathInfo     = /a/b
+
+$ touch myApp/WEB-INF/classes/MappingServlet.class   # 模拟重新编译
+（服务器控制台，由共享后台线程触发）
+StandardManager: 会话 47C94225D31C9515DD4A624EE57819BD 已过期
+WebappClassLoader: MappingServlet.class 已被修改
+===== 检测到类被修改，重新加载 Context =====
+
+$ curl http://localhost:8080/myApp/modern/a/b    # Tomcat 11
+mappingMatch = PATH, pattern = /modern/*, matchValue = a/b
+$ curl http://localhost:8080/myApp/x.hello
+mappingMatch = EXTENSION, pattern = *.hello, matchValue = x
+$ curl http://localhost:8080/myApp/anything
+mappingMatch = DEFAULT, pattern = /, matchValue =
+$ curl http://localhost:8080/myApp/
+mappingMatch = CONTEXT_ROOT, pattern = , matchValue =
+（控制台）periodic 事件 #1，线程 Catalina-utility-2
+</pre>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>StandardContext 启动时补齐缺少的组件（Resources → Loader → Manager），启动子组件，并在 START 事件中由 ContextConfig 完成配置。</li>
+  <li><code>configured</code> 为真才会设置 <code>available</code>，否则调用 <code>stop()</code>。</li>
+  <li>URL 映射四条规则：精确 → 最长前缀 → 扩展名 → 默认；同时确定 servletPath 和 pathInfo。</li>
+  <li>重载期间 <code>paused</code> 为真，新请求等待重载完成。</li>
+  <li>Tomcat 5 引入共享后台线程，<code>backgroundProcess()</code> 代替了载入器和管理器各自的线程；Tomcat 9 起改为工具线程池调度。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>给 <code>StandardContextMapper</code> 写单元测试，覆盖「前缀与扩展名同时匹配」「/ 与 /* 的区别」「pathInfo 为空时返回 null」等边界情况。</li>
+    <li>在 Java 17 版的 <code>backgroundProcess()</code> 里加一项任务：每 10 次巡检打印一次当前活动会话数。</li>
+    <li>在 <code>reload()</code> 里加一个 <code>Thread.sleep(3000)</code>，重载期间用 curl 发请求，观察请求被阻塞到重载结束才返回。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

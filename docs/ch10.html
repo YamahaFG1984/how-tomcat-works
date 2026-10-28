@@ -1,0 +1,567 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 10 章 · 安全 — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="10">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 10 章</span>
+<h1>安全</h1>
+<p class="lede">
+  Web 应用里有些内容只能给特定的人看。Servlet 规范允许在 <code>web.xml</code> 里声明「安全约束」，
+  容器负责执行它。Tomcat 的做法再次用到了管道：它往 Context 的管道里装一个叫<strong>认证器（authenticator）</strong>的阀，
+  在请求到达 Servlet 之前检查用户的身份。认证器自己不知道谁是合法用户，它要去问<strong>域（Realm）</strong>。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>认识安全相关的几个对象：Realm、Principal、角色、SecurityConstraint、LoginConfig</li>
+    <li>理解认证器阀在管道中的位置，以及它如何拦截未认证的请求</li>
+    <li>弄清 HTTP Basic 认证的完整往返过程</li>
+    <li>理解 ContextConfig 如何根据 <code>auth-method</code> 动态安装认证器</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="overview">认证器是一个阀</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="认证器阀位于 Context 管道中，认证失败时直接返回 401，成功时继续调用下一个阀">
+  <rect class="bx-g" x="20" y="20" width="720" height="150" rx="14"/>
+  <text class="ttl on-g" x="40" y="44">StandardContext 的管道</text>
+  <path class="ln" d="M0 100 H36" marker-end="url(#ar)"/>
+  <rect class="bx-r" x="40" y="62" width="220" height="80" rx="10"/>
+  <text class="ttl on-r" x="150" y="86" text-anchor="middle">BasicAuthenticator</text>
+  <text class="sm" x="150" y="106" text-anchor="middle">认证器阀</text>
+  <text class="sm" x="150" y="124" text-anchor="middle">问 Realm：这人是谁？</text>
+  <path class="ln-g" d="M262 102 H316" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="289" y="94" text-anchor="middle">通过</text>
+  <rect class="bx-b" x="320" y="72" width="150" height="60" rx="10"/>
+  <text class="mono" x="395" y="106" text-anchor="middle">其他阀…</text>
+  <path class="ln" d="M472 102 H516" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="520" y="62" width="200" height="80" rx="10"/>
+  <text class="ttl on-a" x="620" y="92" text-anchor="middle">StandardContextValve</text>
+  <text class="sm" x="620" y="114" text-anchor="middle">→ Wrapper → Servlet</text>
+
+  <path class="ln-r" d="M150 144 V210" marker-end="url(#ar-r)"/>
+  <rect class="bx-r" x="40" y="212" width="300" height="38" rx="8"/>
+  <text class="sm" x="190" y="236" text-anchor="middle">失败：返回 401/403，不调用 invokeNext</text>
+  <rect class="bx-p" x="420" y="196" width="300" height="54" rx="10"/>
+  <text class="ttl on-p" x="570" y="218" text-anchor="middle">Realm</text>
+  <text class="sm" x="570" y="238" text-anchor="middle">拥有（或能访问）合法用户的名单</text>
+  <path class="ln-p" d="M250 140 C300 200 360 222 416 222" marker-end="url(#ar-p)"/>
+  <text class="sm on-p" x="330" y="190">authenticate(用户名, 密码)</text>
+</svg>
+<figcaption>图 10-1　认证器阀排在 Wrapper 之前</figcaption>
+</figure>
+
+<p>认证器阀在启动时被装进 Context 的管道。它调用 Context 关联的 Realm 的 <code>authenticate</code> 方法：认证成功就调用下一个阀，最终显示 Servlet；失败就直接返回，用户看不到 Servlet。</p>
+
+<h2 id="objects">安全相关的对象</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="web.xml 中的安全配置与 Catalina 对象的对应关系">
+  <rect class="bx-d" x="20" y="20" width="330" height="260" rx="12"/>
+  <text class="ttl" x="185" y="44" text-anchor="middle">web.xml</text>
+  <text class="mono sm" x="36" y="72">&lt;security-constraint&gt;</text>
+  <text class="mono sm" x="50" y="92">&lt;web-resource-collection&gt;</text>
+  <text class="mono sm" x="64" y="112">&lt;url-pattern&gt;/admin/*&lt;/url-pattern&gt;</text>
+  <text class="mono sm" x="64" y="132">&lt;http-method&gt;GET&lt;/http-method&gt;</text>
+  <text class="mono sm" x="50" y="152">&lt;/web-resource-collection&gt;</text>
+  <text class="mono sm" x="50" y="172">&lt;auth-constraint&gt;</text>
+  <text class="mono sm" x="64" y="192">&lt;role-name&gt;manager&lt;/role-name&gt;</text>
+  <text class="mono sm" x="36" y="212">&lt;login-config&gt;</text>
+  <text class="mono sm" x="50" y="232">&lt;auth-method&gt;BASIC&lt;/auth-method&gt;</text>
+  <text class="mono sm" x="50" y="252">&lt;realm-name&gt;Simple Realm&lt;/realm-name&gt;</text>
+
+  <rect class="bx-b" x="420" y="56" width="320" height="56" rx="10"/>
+  <text class="mono on-b" x="580" y="78" text-anchor="middle">SecurityCollection</text>
+  <text class="sm" x="580" y="98" text-anchor="middle">哪些 URL 模式、哪些 HTTP 方法</text>
+  <rect class="bx-b" x="420" y="124" width="320" height="56" rx="10"/>
+  <text class="mono on-b" x="580" y="146" text-anchor="middle">SecurityConstraint</text>
+  <text class="sm" x="580" y="166" text-anchor="middle">若干集合 + 允许的角色（authRole）</text>
+  <rect class="bx-a" x="420" y="204" width="320" height="56" rx="10"/>
+  <text class="mono on-a" x="580" y="226" text-anchor="middle">LoginConfig</text>
+  <text class="sm" x="580" y="246" text-anchor="middle">认证方式 + 域名（显示在登录框里）</text>
+  <path class="ln" d="M352 112 H416" marker-end="url(#ar)"/>
+  <path class="ln" d="M352 180 H416" marker-end="url(#ar)"/>
+  <path class="ln" d="M352 240 H416" marker-end="url(#ar)"/>
+  <text class="sm" x="384" y="290" text-anchor="middle">Tomcat 启动时读 web.xml，创建这些对象（第 15 章）</text>
+</svg>
+<figcaption>图 10-2　web.xml 的安全配置与对应的 Catalina 对象</figcaption>
+</figure>
+
+<h3>Realm</h3>
+
+<p>Realm（域）是用来认证用户的组件：给它用户名和密码，它告诉你对不对。一个容器只能有一个 Realm，通过 <code>setRealm</code> 关联，通常挂在 Context 上。Realm 里最重要的是四个 <code>authenticate</code> 重载（第一个最常用）和 <code>hasRole</code>：</p>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/Realm.java（节选）">
+<pre>
+public Principal authenticate(String username, String credentials);
+public Principal authenticate(String username, byte[] credentials);
+public Principal authenticate(String username, String digest, String nonce, String nc,
+                              String cnonce, String qop, String realm, String md5a2);   // DIGEST
+public Principal authenticate(X509Certificate certs[]);                                 // 客户端证书
+public boolean hasRole(Principal principal, String role);
+</pre>
+</div>
+
+<p>抽象类 <code>RealmBase</code> 提供基础实现，具体实现有 <code>JDBCRealm</code>（数据库）、<code>JNDIRealm</code>（LDAP）、<code>MemoryRealm</code>（默认，启动时读 <code>tomcat-users.xml</code>）、<code>UserDatabaseRealm</code>。</p>
+
+<h3>GenericPrincipal</h3>
+
+<p><code>java.security.Principal</code> 代表一个已认证的身份，Catalina 的实现是 <code>GenericPrincipal</code>：它总是关联一个 Realm，有名字、密码和一组角色。角色数组在构造时排好序，<code>hasRole</code> 用二分查找。Tomcat 5 支持 Servlet 2.4，角色 <code>*</code> 表示「任何人」：</p>
+
+<div class="code" data-lang="java" data-file="GenericPrincipal.hasRole（Tomcat 5）">
+<pre>
+public boolean hasRole(String role) {
+    if ("*".equals(role))          // Servlet 2.4：特殊角色，表示所有人
+        return true;
+    if (role == null)
+        return (false);
+    return (Arrays.binarySearch(roles, role) &gt;= 0);
+}
+</pre>
+</div>
+
+<h3>LoginConfig</h3>
+
+<p><code>org.apache.catalina.deploy.LoginConfig</code> 包含域名和认证方式。认证方式必须是 <code>BASIC</code>、<code>DIGEST</code>、<code>FORM</code>、<code>CLIENT-CERT</code> 之一；FORM 方式还要提供登录页和错误页的地址。认证器会把域名发给浏览器显示在登录对话框里，没有域名时发送「服务器名:端口」。</p>
+
+<h3>Authenticator</h3>
+
+<p><code>org.apache.catalina.Authenticator</code> 是一个<strong>没有任何方法的标记接口</strong>，让其他组件可以用 <code>instanceof</code> 判断某个阀是不是认证器。</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 240" role="img" aria-label="认证器类层次：AuthenticatorBase 继承 ValveBase 并实现 Authenticator，五个子类">
+  <rect class="bx-d" x="120" y="16" width="160" height="36" rx="8"/><text class="mono" x="200" y="39" text-anchor="middle">ValveBase</text>
+  <rect class="bx-d" x="480" y="16" width="200" height="36" rx="8"/><text class="mono" x="580" y="39" text-anchor="middle">«标记接口» Authenticator</text>
+  <rect class="bx-r" x="260" y="86" width="240" height="50" rx="10"/>
+  <text class="ttl on-r" x="380" y="108" text-anchor="middle">AuthenticatorBase</text>
+  <text class="sm" x="380" y="126" text-anchor="middle">invoke() 调用抽象方法 authenticate()</text>
+  <path class="ln" d="M330 84 L230 54" marker-end="url(#ar)"/>
+  <path class="ln-d" d="M430 84 L540 54" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="10" y="176" width="140" height="44" rx="8"/><text class="mono sm" x="80" y="196" text-anchor="middle">BasicAuthenticator</text><text class="sm" x="80" y="212" text-anchor="middle">BASIC</text>
+  <rect class="bx-b" x="160" y="176" width="140" height="44" rx="8"/><text class="mono sm" x="230" y="196" text-anchor="middle">FormAuthenticator</text><text class="sm" x="230" y="212" text-anchor="middle">FORM</text>
+  <rect class="bx-b" x="310" y="176" width="140" height="44" rx="8"/><text class="mono sm" x="380" y="196" text-anchor="middle">DigestAuthenticator</text><text class="sm" x="380" y="212" text-anchor="middle">DIGEST</text>
+  <rect class="bx-b" x="460" y="176" width="140" height="44" rx="8"/><text class="mono sm" x="530" y="196" text-anchor="middle">SSLAuthenticator</text><text class="sm" x="530" y="212" text-anchor="middle">CLIENT-CERT</text>
+  <rect class="bx-d" x="610" y="176" width="140" height="44" rx="8"/><text class="mono sm" x="680" y="196" text-anchor="middle">NonLogin…</text><text class="sm" x="680" y="212" text-anchor="middle">未指定（NONE）</text>
+  <path class="ln" d="M80 174 L320 138" marker-end="url(#ar)"/>
+  <path class="ln" d="M230 174 L350 138" marker-end="url(#ar)"/>
+  <path class="ln" d="M380 174 V138" marker-end="url(#ar)"/>
+  <path class="ln" d="M530 174 L410 138" marker-end="url(#ar)"/>
+  <path class="ln" d="M680 174 L440 138" marker-end="url(#ar)"/>
+</svg>
+<figcaption>图 10-3　认证器相关的类（对应原书图 10.2）。底部标注的是 auth-method 的取值</figcaption>
+</figure>
+
+<p><code>NonLoginAuthenticator</code> 用于没有指定 <code>auth-method</code> 的情况：它只检查安全约束，不做用户认证。</p>
+
+<h2 id="basic">HTTP Basic 认证的往返</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 360" role="img" aria-label="Basic 认证时序：第一次请求返回 401，浏览器弹出登录框，第二次请求带 Authorization 头，认证器调用 Realm 验证">
+  <rect class="bx-b" x="30" y="12" width="140" height="34" rx="8"/><text class="ttl on-b" x="100" y="34" text-anchor="middle">浏览器</text>
+  <rect class="bx-r" x="300" y="12" width="170" height="34" rx="8"/><text class="ttl on-r" x="385" y="34" text-anchor="middle">BasicAuthenticator</text>
+  <rect class="bx-p" x="590" y="12" width="140" height="34" rx="8"/><text class="ttl on-p" x="660" y="34" text-anchor="middle">Realm</text>
+  <path class="ln-d" d="M100 48 V350"/><path class="ln-d" d="M385 48 V350"/><path class="ln-d" d="M660 48 V350"/>
+
+  <path class="ln-b" d="M100 76 H381" marker-end="url(#ar-b)"/>
+  <text class="mono sm" x="240" y="70" text-anchor="middle">GET /Modern</text>
+  <path class="ln-r" d="M385 112 H104" marker-end="url(#ar-r)"/>
+  <text class="mono sm" x="240" y="100" text-anchor="middle">401 Unauthorized</text>
+  <text class="mono sm" x="240" y="128" text-anchor="middle">WWW-Authenticate: Basic realm="Simple Realm"</text>
+  <rect class="bx" x="20" y="142" width="160" height="40" rx="8"/>
+  <text class="sm" x="100" y="160" text-anchor="middle">弹出登录框</text>
+  <text class="sm" x="100" y="176" text-anchor="middle">输入 ken / blackcomb</text>
+
+  <path class="ln-b" d="M100 206 H381" marker-end="url(#ar-b)"/>
+  <text class="mono sm" x="240" y="200" text-anchor="middle">GET /Modern</text>
+  <text class="mono sm" x="240" y="222" text-anchor="middle">Authorization: Basic a2VuOmJsYWNrY29tYg==</text>
+  <path class="ln-p" d="M385 248 H656" marker-end="url(#ar-p)"/>
+  <text class="mono sm" x="520" y="242" text-anchor="middle">authenticate("ken", "blackcomb")</text>
+  <path class="ln-p" d="M660 276 H389" marker-end="url(#ar-p)"/>
+  <text class="mono sm" x="520" y="270" text-anchor="middle">GenericPrincipal(ken, [manager, programmer])</text>
+  <path class="ln-g" d="M385 316 H104" marker-end="url(#ar-g)"/>
+  <text class="mono sm" x="240" y="310" text-anchor="middle">200 OK（Servlet 的输出）</text>
+  <text class="sm" x="520" y="316" text-anchor="middle">有 manager 角色 → invokeNext()</text>
+  <text class="sm" x="380" y="346" text-anchor="middle">之后浏览器会自动在每个请求里带上 Authorization 头</text>
+</svg>
+<figcaption>图 10-4　Basic 认证的往返</figcaption>
+</figure>
+
+<div class="box warn">
+  <div class="t">&#9888; Base64 不是加密</div>
+  <p><code>a2VuOmJsYWNrY29tYg==</code> 只是 <code>ken:blackcomb</code> 的 Base64 编码，任何人截获都能还原。Basic 认证<strong>必须配合 HTTPS</strong> 使用。</p>
+</div>
+
+<h2 id="install">安装认证器阀</h2>
+
+<p>部署描述符里 <code>login-config</code> 只能出现一次，所以一个 Context 只有一个 LoginConfig、只用一种认证器。用哪个类取决于 <code>auth-method</code>：</p>
+
+<div class="tw">
+<table>
+  <tr><th>auth-method</th><th>认证器类</th></tr>
+  <tr><td><code>BASIC</code></td><td><code>BasicAuthenticator</code></td></tr>
+  <tr><td><code>FORM</code></td><td><code>FormAuthenticator</code></td></tr>
+  <tr><td><code>DIGEST</code></td><td><code>DigestAuthenticator</code></td></tr>
+  <tr><td><code>CLIENT-CERT</code></td><td><code>SSLAuthenticator</code></td></tr>
+  <tr><td>（未指定，即 NONE）</td><td><code>NonLoginAuthenticator</code></td></tr>
+</table>
+</div>
+
+<p>因为认证器类直到运行时才知道，所以要动态加载。正式的 Tomcat 里由 <code>ContextConfig</code>（第 15 章）完成；本章的 <code>SimpleContextConfig</code> 在 Context 的 START 事件里调用 <code>authenticatorConfig()</code>：</p>
+
+<div class="code" data-lang="java" data-file="ex10/pyrmont/core/SimpleContextConfig.java（节选）">
+<pre>
+private synchronized void authenticatorConfig() {
+    SecurityConstraint constraints[] = context.findConstraints();
+    if ((constraints == null) || (constraints.length == 0))
+        return;                                                   // ① 没有约束，不需要认证器
+    LoginConfig loginConfig = context.getLoginConfig();
+    if (loginConfig == null) {
+        loginConfig = new LoginConfig("NONE", null, null, null);
+        context.setLoginConfig(loginConfig);
+    }
+    Pipeline pipeline = ((StandardContext) context).getPipeline();
+    if (pipeline != null) {                                       // ② 已经装过认证器了吗？
+        Valve basic = pipeline.getBasic();
+        if ((basic != null) &amp;&amp; (basic instanceof Authenticator))
+            return;
+        Valve valves[] = pipeline.getValves();
+        for (int i = 0; i &lt; valves.length; i++) {
+            if (valves[i] instanceof Authenticator)
+                return;
+        }
+    } else {
+        return;
+    }
+    if (context.getRealm() == null)                               // ③ 没有 Realm 就无从认证
+        return;
+    String authenticatorName = "org.apache.catalina.authenticator.BasicAuthenticator";
+    try {                                                         // ④ 动态加载并装进管道
+        Class authenticatorClass = Class.forName(authenticatorName);
+        Valve authenticator = (Valve) authenticatorClass.newInstance();
+        ((StandardContext) context).addValve(authenticator);
+        System.out.println("Added authenticator valve to Context");
+    } catch (Throwable t) {
+    }
+}
+</pre>
+</div>
+
+<h2 id="app">本章应用</h2>
+
+<p>两个应用都沿用第 9 章的 SimplePipeline、SimpleWrapper、SimpleWrapperValve，运行 PrimitiveServlet 和 ModernServlet，区别在于 Realm：</p>
+
+<div class="cards">
+  <div class="card"><span class="ic">&#128100;</span><h4>Bootstrap1 + SimpleRealm</h4><p>用户写死在代码里：ken / blackcomb（manager、programmer）、cindy / bamboo（programmer）。</p></div>
+  <div class="card"><span class="ic">&#128196;</span><h4>Bootstrap2 + SimpleUserDatabaseRealm</h4><p>从 <code>conf/tomcat-users.xml</code> 读用户（借助 <code>MemoryUserDatabase</code>）：admin / password 有 manager 角色。</p></div>
+</div>
+
+<div class="code" data-lang="java" data-file="ex10/pyrmont/realm/SimpleRealm.java（节选）">
+<pre>
+public Principal authenticate(String username, String credentials) {
+    System.out.println("SimpleRealm.authenticate()");
+    if (username == null || credentials == null)
+        return null;
+    User user = getUser(username, credentials);     // 遍历列表，用户名和密码都 equals 才算
+    if (user == null)
+        return null;
+    return new GenericPrincipal(this, user.username, user.password, user.getRoles());
+}
+
+private void createUserDatabase() {
+    User user1 = new User("ken", "blackcomb");
+    user1.addRole("manager");
+    user1.addRole("programmer");
+    User user2 = new User("cindy", "bamboo");
+    user2.addRole("programmer");
+    users.add(user1);
+    users.add(user2);
+}
+</pre>
+</div>
+
+<div class="code" data-lang="java" data-file="ex10/pyrmont/startup/Bootstrap1.java（节选）">
+<pre>
+SecurityCollection securityCollection = new SecurityCollection();
+securityCollection.addPattern("/");
+securityCollection.addMethod("GET");               // 只约束 GET 请求
+SecurityConstraint constraint = new SecurityConstraint();
+constraint.addCollection(securityCollection);
+constraint.addAuthRole("manager");                 // 只有 manager 能访问
+LoginConfig loginConfig = new LoginConfig();
+loginConfig.setRealmName("Simple Realm");
+Realm realm = new SimpleRealm();
+context.setRealm(realm);
+context.addConstraint(constraint);
+context.setLoginConfig(loginConfig);
+</pre>
+</div>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch10/realm/</code><code>authenticator/</code><code>core/</code><code>startup/</code><code>tomcat/EmbeddedSecurity.java</code><code>java17/conf/tomcat-users.xml</code></div>
+
+<p>Java 17 版在迷你容器上完整实现了「约束 → 认证器阀 → 域 → Principal」这条链，同时修正了原书中几个今天看来不能接受的安全做法。</p>
+
+<h3>① 认证器阀的判断流程</h3>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="BasicAuthenticator 的判断流程">
+  <path class="bx-a" d="M120 20 L220 50 L120 80 L20 50 Z" style="stroke-width:1.5"/>
+  <text class="sm on-a" x="120" y="47" text-anchor="middle">有约束匹配</text>
+  <text class="sm on-a" x="120" y="62" text-anchor="middle">这个 URL+方法？</text>
+  <path class="ln-g" d="M222 50 H596" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="300" y="42">否</text>
+  <path class="ln" d="M120 82 V108" marker-end="url(#ar)"/>
+  <text class="sm" x="130" y="100">是</text>
+  <path class="bx-a" d="M120 110 L220 140 L120 170 L20 140 Z" style="stroke-width:1.5"/>
+  <text class="sm on-a" x="120" y="137" text-anchor="middle">Authorization 头</text>
+  <text class="sm on-a" x="120" y="152" text-anchor="middle">认证通过？</text>
+  <path class="ln-r" d="M222 140 H400" marker-end="url(#ar-r)"/>
+  <text class="sm on-r" x="300" y="132">否</text>
+  <rect class="bx-r" x="404" y="118" width="190" height="44" rx="8"/>
+  <text class="mono sm" x="499" y="137" text-anchor="middle">401 + WWW-Authenticate</text>
+  <text class="sm" x="499" y="153" text-anchor="middle">浏览器弹登录框</text>
+  <path class="ln" d="M120 172 V198" marker-end="url(#ar)"/>
+  <text class="sm" x="130" y="190">是</text>
+  <path class="bx-a" d="M120 200 L220 230 L120 260 L20 230 Z" style="stroke-width:1.5"/>
+  <text class="sm on-a" x="120" y="227" text-anchor="middle">拥有约束要求</text>
+  <text class="sm on-a" x="120" y="242" text-anchor="middle">的角色？</text>
+  <path class="ln-r" d="M222 220 H400" marker-end="url(#ar-r)"/>
+  <text class="sm on-r" x="300" y="212">否</text>
+  <rect class="bx-r" x="404" y="202" width="190" height="34" rx="8"/>
+  <text class="mono sm" x="499" y="224" text-anchor="middle">403 Forbidden</text>
+  <path class="ln-g" d="M222 244 H660 V72" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="300" y="258">是：记下 Principal</text>
+  <rect class="bx-g" x="600" y="30" width="140" height="40" rx="8"/>
+  <text class="mono sm on-g" x="670" y="55" text-anchor="middle">invokeNext()</text>
+</svg>
+<figcaption>图 10-5　Java 17 版 BasicAuthenticator 的判断流程</figcaption>
+</figure>
+
+<div class="code" data-lang="java" data-file="java17/.../ch10/authenticator/BasicAuthenticator.java（节选）">
+<pre>
+@Override
+public void invoke(HttpRequest request, HttpResponse response, ValveContext next) throws Exception {
+    Optional&lt;SecurityConstraint&gt; constraint = context.findConstraints().stream()
+            .filter(c -&gt; c.matches(request.getRequestURI(), request.getMethod()))
+            .findFirst();
+    if (constraint.isEmpty()) {
+        next.invokeNext(request, response);
+        return;
+    }
+    Principal principal = authenticate(request.getHeader("Authorization"));
+    if (principal == null) {
+        response.setHeader("WWW-Authenticate", "Basic realm=\"" + realmName + "\", charset=\"UTF-8\"");
+        response.sendError(HttpServletResponse.SC_UNAUTHORIZED, null);
+        return;                                       // 不调用 invokeNext：Servlet 不会被执行
+    }
+    boolean allowed = constraint.get().roles().stream()
+            .anyMatch(role -&gt; context.getRealm().hasRole(principal, role));
+    if (!allowed) {
+        response.sendError(HttpServletResponse.SC_FORBIDDEN, null);
+        return;
+    }
+    request.setUserPrincipal(principal, role -&gt; context.getRealm().hasRole(principal, role));
+    next.invokeNext(request, response);
+}
+
+private Principal authenticate(String authorization) {
+    if (authorization == null || !authorization.regionMatches(true, 0, "Basic ", 0, 6)) return null;
+    String decoded = new String(Base64.getDecoder().decode(authorization.substring(6).trim()), UTF_8);   // Java 8 Base64
+    int colon = decoded.indexOf(':');
+    return colon &lt; 0 ? null
+         : context.getRealm().authenticate(decoded.substring(0, colon), decoded.substring(colon + 1));
+}
+</pre>
+</div>
+
+<div class="box tip">
+  <div class="t">&#128161; 调试时发现的一个规范细节</div>
+  <p>第一次测试时，401 响应里竟然没有 <code>WWW-Authenticate</code> 头。原因是第 3 章 <code>HttpResponse.sendError()</code> 里调用了 <code>reset()</code>，把已经设置的响应头也清掉了。Servlet 规范说 <code>sendError</code> 只清空<strong>缓冲的正文</strong>，响应头要保留——改成 <code>resetBuffer()</code> 后就正常了。</p>
+</div>
+
+<h3>② 不再存储明文密码</h3>
+
+<div class="vs">
+  <div class="old"><div class="h">原书：明文 + equals</div>
+<div class="code" data-lang="java">
+<pre>
+User user1 = new User("ken", "blackcomb");
+...
+if (user.username.equals(username) &amp;&amp;
+    user.password.equals(password))
+    return user;
+// GenericPrincipal 里还存了一份密码
+new GenericPrincipal(this, user.username,
+                     user.password, user.getRoles());
+</pre>
+</div>
+  </div>
+  <div class="new"><div class="h">Java 17：PBKDF2 + 常数时间比较</div>
+<div class="code" data-lang="java">
+<pre>
+private final Map&lt;String, User&gt; users = Map.of(
+    "ken", new User(PasswordHasher.hash("blackcomb"),
+                    Set.of("manager", "programmer")),
+    "cindy", new User(PasswordHasher.hash("bamboo"),
+                      Set.of("programmer")));
+
+// 加盐慢哈希 + MessageDigest.isEqual（不会提前返回）
+PasswordHasher.matches(credentials, user.passwordHash())
+
+// Principal 不再保存密码
+public record GenericPrincipal(String name, Set&lt;String&gt; roles)
+        implements Principal { ... }
+</pre>
+</div>
+  </div>
+</div>
+
+<div class="code" data-lang="java" data-file="java17/.../ch10/realm/PasswordHasher.java（节选）">
+<pre>
+// 存储格式：pbkdf2$迭代次数$盐$哈希
+public static String hash(String password) {
+    byte[] salt = new byte[16];
+    RANDOM.nextBytes(salt);                                    // 每个用户不同的盐：彩虹表失效
+    byte[] hash = pbkdf2(password, salt, ITERATIONS);          // 21 万次迭代：暴力破解变慢
+    return "pbkdf2$" + ITERATIONS + "$" + b64(salt) + "$" + b64(hash);
+}
+
+public static boolean matches(String password, String stored) {
+    ...
+    return MessageDigest.isEqual(expected, actual);            // 常数时间比较，防时序攻击
+}
+</pre>
+</div>
+
+<h3>③ 读 tomcat-users.xml：防 XXE</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch10/realm/UserDatabaseRealm.java（节选）">
+<pre>
+var factory = DocumentBuilderFactory.newInstance();
+factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);   // 禁止 DTD → 杜绝 XXE
+var doc = factory.newDocumentBuilder().parse(path.toFile());
+</pre>
+</div>
+
+<h3>④ 按名字选择认证器：Map + 构造器引用</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch10/core/SimpleContextConfig.java（节选）">
+<pre>
+private static final Map&lt;String, Supplier&lt;Valve&gt;&gt; AUTHENTICATORS = Map.of(
+        "BASIC", BasicAuthenticator::new,
+        "NONE", NonLoginAuthenticator::new);
+...
+boolean installed = context.getPipeline().getBasic() instanceof Authenticator
+        || context.getPipeline().getValves().stream().anyMatch(v -&gt; v instanceof Authenticator);
+...
+context.getPipeline().addValve(AUTHENTICATORS.get(context.getLoginConfig().authMethod()).get());
+</pre>
+</div>
+
+<h3>⑤ Tomcat 11 的同等配置</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch10/tomcat/EmbeddedSecurity.java（节选）">
+<pre>
+var realm = new MemoryRealm();                               // 读 tomcat-users.xml
+realm.setPathname(Path.of("conf", "tomcat-users.xml").toAbsolutePath().toString());
+context.setRealm(realm);
+
+var collection = new SecurityCollection();                   // 包名变成了 org.apache.tomcat.util.descriptor.web
+collection.addPattern("/*");
+collection.addMethod("GET");
+var constraint = new SecurityConstraint();
+constraint.addCollection(collection);
+constraint.addAuthRole("manager");
+context.addConstraint(constraint);
+
+var loginConfig = new LoginConfig();
+loginConfig.setAuthMethod("BASIC");
+loginConfig.setRealmName("Tomcat 11 Realm");
+context.setLoginConfig(loginConfig);
+context.getPipeline().addValve(new BasicAuthenticator());
+</pre>
+</div>
+
+<div class="box note">
+  <div class="t">&#9432; 原书之后的变化</div>
+  <ul>
+    <li>Tomcat 8 引入 <code>CredentialHandler</code>：Realm 可以配置 <code>SecretKeyCredentialHandler</code>（PBKDF2）存储加盐哈希，而不是明文。</li>
+    <li>Servlet 3.0 增加了编程式安全：<code>request.login(user, pass)</code>、<code>logout()</code>、<code>authenticate(response)</code>，以及 <code>@ServletSecurity</code> 注解。</li>
+    <li><code>JDBCRealm</code> 已被删除，改用基于连接池的 <code>DataSourceRealm</code>；Jakarta Authentication（JASPIC）允许插入第三方认证模块。</li>
+    <li>现代应用更多使用 OAuth 2 / OpenID Connect、JWT，通常由 Spring Security 等框架在应用层实现。</li>
+  </ul>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch10.startup.Bootstrap1          # SimpleRealm：ken / blackcomb
+./run.sh ch10.startup.Bootstrap2          # tomcat-users.xml：admin / password
+./run.sh ch10.tomcat.EmbeddedSecurity     # Tomcat 11：http://localhost:8080/myApp/WhoAmI
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+$ curl -i http://localhost:8080/WhoAmI
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Basic realm="Simple Realm", charset="UTF-8"
+
+$ curl -o /dev/null -w '%{http_code}\n' -u ken:wrong http://localhost:8080/WhoAmI
+401
+$ curl -o /dev/null -w '%{http_code}\n' -u cindy:bamboo http://localhost:8080/WhoAmI
+403                                        ← 认证通过，但没有 manager 角色
+
+$ curl -u ken:blackcomb http://localhost:8080/WhoAmI
+authType   = BASIC
+remoteUser = ken
+manager?   = true
+programmer?= true
+
+$ curl -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/Modern
+200                                        ← 约束只针对 GET
+</pre>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>安全约束由一个认证器阀执行，它位于 Context 管道里、Wrapper 之前；认证失败就不调用下一个阀。</li>
+  <li>认证器调用 Realm 的 <code>authenticate</code>，成功时得到代表用户的 Principal（GenericPrincipal）。</li>
+  <li>SecurityConstraint 描述「哪些 URL/方法需要哪些角色」，LoginConfig 描述认证方式和域名。</li>
+  <li>认证器类由 <code>auth-method</code> 决定，在 Context 启动时由 ContextConfig 动态安装。</li>
+  <li>现代实践：密码加盐慢哈希、常数时间比较、HTTPS、禁用 XML 外部实体。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>在 Java 17 版里实现 <code>FormAuthenticator</code>：未登录时重定向到登录页，登录表单提交到 <code>j_security_check</code>，成功后把 Principal 存进会话（结合第 9 章）。</li>
+    <li>写一个小工具调用 <code>PasswordHasher.hash()</code> 生成哈希，把 <code>conf/tomcat-users.xml</code> 里 admin 的密码换成 <code>pbkdf2$...</code> 形式，验证 Bootstrap2 仍能登录。</li>
+    <li>给 SecurityConstraint 增加 <code>transport-guarantee</code>：值为 CONFIDENTIAL 时，非 HTTPS 请求一律重定向到 HTTPS 端口。</li>
+    <li>连续输错 5 次密码后锁定该用户 5 分钟（Tomcat 的 <code>LockOutRealm</code> 就是这么做的）。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

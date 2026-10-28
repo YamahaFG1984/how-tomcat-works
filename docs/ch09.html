@@ -1,0 +1,567 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 9 章 · Session 管理 — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="9">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 9 章</span>
+<h1>Session 管理</h1>
+<p class="lede">
+  HTTP 是无状态的：服务器分不清两个请求是不是同一个人发的。Servlet 用 <code>HttpSession</code> 解决这个问题，
+  而在 Catalina 里，负责创建、查找、销毁会话的组件叫<strong>管理器（Manager）</strong>。
+  它总是挂在 Context 上，还可以把会话保存到文件或数据库，让服务器重启后用户不用重新登录。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>理解 <code>request.getSession()</code> 背后发生了什么，以及 JSESSIONID Cookie 的往返</li>
+    <li>认识 <code>Session</code>、<code>StandardSession</code>、<code>StandardSessionFacade</code> 三者的关系</li>
+    <li>理解 <code>StandardManager</code> 如何清理过期会话、如何在重启前后保存和恢复会话</li>
+    <li>了解持久化管理器的「换出」「备份」以及 <code>FileStore</code>、<code>JDBCStore</code></li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="getsession">从 getSession() 说起</h2>
+
+<p>Servlet 调用 <code>request.getSession()</code>，默认连接器里的 <code>HttpRequestBase</code> 会这样处理：</p>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/connector/HttpRequestBase.java（节选）">
+<pre>
+private HttpSession doGetSession(boolean create) {
+    if (context == null)
+        return (null);                          // 还不知道属于哪个应用
+    if ((session != null) &amp;&amp; !session.isValid())
+        session = null;
+    if (session != null)
+        return (session.getSession());          // 本次请求已经拿过了
+
+    Manager manager = context.getManager();     // 通过 Context 找到管理器
+    if (manager == null)
+        return (null);                          // 这个应用不支持会话
+
+    if (requestedSessionId != null) {           // 浏览器带来了会话 ID（Cookie 或 URL 里的 jsessionid）
+        session = manager.findSession(requestedSessionId);
+        if ((session != null) &amp;&amp; !session.isValid())
+            session = null;
+        if (session != null)
+            return (session.getSession());
+    }
+    if (!create)
+        return (null);
+    session = manager.createSession();          // 新建一个
+    return (session.getSession());
+}
+</pre>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="会话 Cookie 的往返：第一次请求创建会话并 Set-Cookie，之后浏览器带着 Cookie 访问同一个会话">
+  <rect class="bx-b" x="40" y="14" width="140" height="36" rx="8"/><text class="ttl on-b" x="110" y="37" text-anchor="middle">浏览器</text>
+  <rect class="bx-a" x="320" y="14" width="140" height="36" rx="8"/><text class="ttl on-a" x="390" y="37" text-anchor="middle">Tomcat</text>
+  <rect class="bx-g" x="580" y="14" width="160" height="36" rx="8"/><text class="ttl on-g" x="660" y="37" text-anchor="middle">Manager</text>
+  <path class="ln-d" d="M110 52 V320"/><path class="ln-d" d="M390 52 V320"/><path class="ln-d" d="M660 52 V320"/>
+
+  <path class="ln-b" d="M110 80 H386" marker-end="url(#ar-b)"/>
+  <text class="mono sm" x="248" y="74" text-anchor="middle">GET /myApp/Session?value=hello</text>
+  <path class="ln-a" d="M390 106 H656" marker-end="url(#ar-a)"/>
+  <text class="mono sm" x="523" y="100" text-anchor="middle">createSession()</text>
+  <rect class="bx-g" x="600" y="114" width="120" height="30" rx="6"/><text class="mono sm" x="660" y="134" text-anchor="middle">id = 9670D1…</text>
+  <path class="ln-g" d="M386 168 H114" marker-end="url(#ar-g)"/>
+  <text class="mono sm" x="248" y="162" text-anchor="middle">Set-Cookie: JSESSIONID=9670D1…; Path=/myApp</text>
+
+  <path class="ln-b" d="M110 216 H386" marker-end="url(#ar-b)"/>
+  <text class="mono sm" x="248" y="210" text-anchor="middle">GET /myApp/Session  Cookie: JSESSIONID=9670D1…</text>
+  <path class="ln-a" d="M390 242 H656" marker-end="url(#ar-a)"/>
+  <text class="mono sm" x="523" y="236" text-anchor="middle">findSession("9670D1…")</text>
+  <path class="ln-g" d="M656 268 H394" marker-end="url(#ar-g)"/>
+  <text class="sm" x="523" y="262" text-anchor="middle">同一个会话：previous value = hello</text>
+  <text class="sm" x="248" y="304" text-anchor="middle">浏览器禁用 Cookie 时，ID 改由 URL 携带：/myApp/Session;jsessionid=9670D1…（第 3 章）</text>
+</svg>
+<figcaption>图 9-1　会话 ID 通过 Cookie 在浏览器和服务器之间往返</figcaption>
+</figure>
+
+<p>管理器默认把会话放在内存里，也可以持久化到文件或数据库。相关类型都在 <code>org.apache.catalina.session</code> 包里。</p>
+
+<h2 id="session">会话对象</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="StandardSession 同时实现 HttpSession 和 Session，交给 Servlet 的是 StandardSessionFacade">
+  <rect class="bx-d" x="40" y="20" width="220" height="44" rx="8"/>
+  <text class="mono" x="150" y="40" text-anchor="middle">«interface» HttpSession</text>
+  <text class="sm" x="150" y="56" text-anchor="middle">Servlet 程序员看到的</text>
+  <rect class="bx-d" x="500" y="20" width="220" height="44" rx="8"/>
+  <text class="mono" x="610" y="40" text-anchor="middle">«interface» Session</text>
+  <text class="sm" x="610" y="56" text-anchor="middle">Catalina 内部使用的</text>
+  <rect class="bx-a" x="270" y="110" width="220" height="56" rx="10"/>
+  <text class="ttl on-a" x="380" y="134" text-anchor="middle">StandardSession</text>
+  <text class="sm" x="380" y="154" text-anchor="middle">还实现了 Serializable</text>
+  <path class="ln-d" d="M320 108 L190 66" marker-end="url(#ar)"/>
+  <path class="ln-d" d="M440 108 L570 66" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="40" y="170" width="220" height="44" rx="8"/>
+  <text class="mono on-g" x="150" y="190" text-anchor="middle">StandardSessionFacade</text>
+  <text class="sm" x="150" y="206" text-anchor="middle">只暴露 HttpSession 的方法</text>
+  <path class="ln-d" d="M150 168 V66" marker-end="url(#ar)"/>
+  <path class="ln-g" d="M262 192 H330 V168" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="300" y="210">包装</text>
+  <text class="sm" x="610" y="140" text-anchor="middle">getSession() 返回外观</text>
+  <text class="sm" x="610" y="160" text-anchor="middle">Servlet 无法转型回来调 expire()</text>
+</svg>
+<figcaption>图 9-2　会话相关的类型（对应原书图 9.1）</figcaption>
+</figure>
+
+<p><code>org.apache.catalina.Session</code> 是 Catalina 内部的「外观」，管理器通过它操作会话：</p>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/Session.java（节选）">
+<pre>
+public interface Session {
+    public static final String SESSION_CREATED_EVENT = "createSession";
+    public static final String SESSION_DESTROYED_EVENT = "destroySession";
+
+    public String getId();
+    public void setId(String id);
+    public Manager getManager();
+    public void setManager(Manager manager);
+    public long getLastAccessedTime();          // 管理器用它判断是否过期
+    public int getMaxInactiveInterval();
+    public void setMaxInactiveInterval(int interval);
+    public HttpSession getSession();            // 返回给 Servlet 的外观
+    public void setValid(boolean isValid);
+    public boolean isValid();
+    public void access();                       // 每次被访问时调用，更新最后访问时间
+    public void expire();                       // 让会话过期
+    public Principal getPrincipal();            // 第 10 章：已认证的用户
+    ...
+}
+</pre>
+</div>
+
+<p><code>StandardSession</code> 的构造器要求传入 Manager，会话总有一个管理器。几个关键字段（<code>transient</code> 的不参与序列化）：</p>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/session/StandardSession.java（节选）">
+<pre>
+private HashMap attributes = new HashMap();              // setAttribute 存的东西
+private transient String authType = null;
+private long creationTime = 0L;
+private transient boolean expiring = false;
+private transient StandardSessionFacade facade = null;
+private String id = null;
+private long lastAccessedTime = creationTime;
+private transient ArrayList listeners = new ArrayList();
+private Manager manager = null;
+private int maxInactiveInterval = -1;
+private boolean isNew = false;
+private boolean isValid = false;
+
+public HttpSession getSession() {
+    if (facade == null)
+        facade = new StandardSessionFacade(this);
+    return (facade);
+}
+</pre>
+</div>
+
+<p><code>expire()</code> 做的事：标记 <code>expiring</code> → <code>setValid(false)</code> → 从管理器移除 → 逐个解除属性绑定 → 通知会话监听器（<code>SESSION_DESTROYED_EVENT</code>）→ 通知应用里的 <code>HttpSessionListener.sessionDestroyed</code> → 回收对象。</p>
+
+<h2 id="manager">管理器</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="Manager 接口及其实现类层次">
+  <rect class="bx-d" x="290" y="14" width="180" height="38" rx="8"/><text class="mono" x="380" y="38" text-anchor="middle">«interface» Manager</text>
+  <rect class="bx-a" x="280" y="80" width="200" height="44" rx="10"/>
+  <text class="ttl on-a" x="380" y="100" text-anchor="middle">ManagerBase（抽象）</text>
+  <text class="sm" x="380" y="116" text-anchor="middle">sessions 表 · 生成会话 ID</text>
+  <path class="ln-d" d="M380 78 V54" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="80" y="160" width="220" height="56" rx="10"/>
+  <text class="ttl on-g" x="190" y="182" text-anchor="middle">StandardManager</text>
+  <text class="sm" x="190" y="202" text-anchor="middle">内存；停止时存到 SESSIONS.ser</text>
+  <rect class="bx-b" x="440" y="150" width="240" height="44" rx="10"/>
+  <text class="ttl on-b" x="560" y="170" text-anchor="middle">PersistentManagerBase</text>
+  <text class="sm" x="560" y="186" text-anchor="middle">持有一个 Store</text>
+  <rect class="bx-b" x="400" y="214" width="150" height="36" rx="8"/><text class="mono" x="475" y="237" text-anchor="middle">PersistentManager</text>
+  <rect class="bx-b" x="570" y="214" width="170" height="36" rx="8"/><text class="mono" x="655" y="237" text-anchor="middle">DistributedManager</text>
+  <path class="ln" d="M190 158 L330 126" marker-end="url(#ar)"/>
+  <path class="ln" d="M560 148 L430 126" marker-end="url(#ar)"/>
+  <path class="ln" d="M475 212 L520 196" marker-end="url(#ar)"/>
+  <path class="ln" d="M655 212 L600 196" marker-end="url(#ar)"/>
+  <text class="sm" x="655" y="140" text-anchor="middle">DistributedManager 只在 Tomcat 4 中有</text>
+</svg>
+<figcaption>图 9-3　Manager 接口及其实现（对应原书图 9.2）</figcaption>
+</figure>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/Manager.java（节选）">
+<pre>
+public interface Manager {
+    public Container getContainer();
+    public void setContainer(Container container);
+    public int getMaxInactiveInterval();               // 秒
+    public void setMaxInactiveInterval(int interval);
+    public void add(Session session);
+    public Session createSession();
+    public Session findSession(String id) throws IOException;
+    public Session[] findSessions();
+    public void remove(Session session);
+    public void load() throws ClassNotFoundException, IOException;   // 从存储读回内存
+    public void unload() throws IOException;                         // 从内存写到存储
+    ...
+}
+</pre>
+</div>
+
+<h3>ManagerBase</h3>
+
+<p>所有活动会话放在一个 <code>HashMap sessions</code> 里，键是会话 ID。<code>add</code>、<code>remove</code>、<code>findSession</code> 都是对它加锁后的简单操作；<code>createSession</code> 调用受保护方法 <code>generateSessionId()</code> 生成唯一 ID。</p>
+
+<h3>StandardManager：内存 + 关机存盘</h3>
+
+<p>StandardManager 运行时把会话放在内存里。它实现了 Lifecycle：<code>stop()</code> 时调用 <code>unload()</code>，把仍然有效的会话序列化到 Context 工作目录下的 <code>SESSIONS.ser</code>；<code>start()</code> 时调用 <code>load()</code> 读回来。所以正常关闭再启动 Tomcat，用户的登录状态不会丢。</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="StandardManager 停止时把会话写入 SESSIONS.ser，启动时读回">
+  <rect class="bx-g" x="20" y="40" width="200" height="120" rx="12"/>
+  <text class="ttl on-g" x="120" y="64" text-anchor="middle">运行中（内存）</text>
+  <rect class="bx" x="40" y="78" width="160" height="22" rx="4"/><text class="mono sm" x="120" y="94" text-anchor="middle">9670… → value=hello</text>
+  <rect class="bx" x="40" y="106" width="160" height="22" rx="4"/><text class="mono sm" x="120" y="122" text-anchor="middle">A23F… → user=tom</text>
+  <text class="sm" x="120" y="148" text-anchor="middle">后台线程清理过期会话</text>
+
+  <path class="ln-a" d="M222 80 H300" marker-end="url(#ar-a)"/>
+  <text class="mono on-a sm" x="261" y="72" text-anchor="middle">stop() → unload()</text>
+  <rect class="bx-d" x="304" y="50" width="160" height="70" rx="10"/>
+  <text class="mono" x="384" y="80" text-anchor="middle">SESSIONS.ser</text>
+  <text class="sm" x="384" y="102" text-anchor="middle">work/…/myApp/</text>
+  <path class="ln-a" d="M466 80 H540" marker-end="url(#ar-a)"/>
+  <text class="mono on-a sm" x="503" y="72" text-anchor="middle">start() → load()</text>
+  <rect class="bx-g" x="542" y="40" width="200" height="120" rx="12"/>
+  <text class="ttl on-g" x="642" y="64" text-anchor="middle">重启后（内存）</text>
+  <rect class="bx" x="562" y="78" width="160" height="22" rx="4"/><text class="mono sm" x="642" y="94" text-anchor="middle">9670… → value=hello</text>
+  <rect class="bx" x="562" y="106" width="160" height="22" rx="4"/><text class="mono sm" x="642" y="122" text-anchor="middle">A23F… → user=tom</text>
+  <text class="sm" x="384" y="150" text-anchor="middle">读完即删除文件</text>
+  <text class="sm" x="380" y="194" text-anchor="middle">前提：会话里的每个属性都必须实现 Serializable，否则会被丢弃</text>
+</svg>
+<figcaption>图 9-4　StandardManager 在停止与启动之间保存会话</figcaption>
+</figure>
+
+<p>管理器还负责销毁过期会话。Tomcat 4 中 StandardManager 实现了 Runnable，后台线程每隔 <code>checkInterval</code>（默认 60）秒调用一次 <code>processExpires()</code>：如果「现在 − 最后访问时间」超过 <code>maxInactiveInterval</code>，就调用会话的 <code>expire()</code>。</p>
+
+<div class="code" data-lang="java" data-file="StandardManager.run()（Tomcat 4）">
+<pre>
+public void run() {
+    while (!threadDone) {
+        threadSleep();          // 睡 checkInterval 秒
+        processExpires();
+    }
+}
+</pre>
+</div>
+
+<div class="box note">
+  <div class="t">&#9432; 超时时间到底是多少？</div>
+  <p>StandardManager 自己的 <code>maxInactiveInterval</code> 默认是 60 秒，但别被骗了：<code>ContainerBase.setManager()</code> 会调用管理器的 <code>setContainer()</code>，后者把它覆盖为 <code>context.getSessionTimeout() * 60</code>。StandardContext 的 <code>sessionTimeout</code> 默认 30（分钟），也就是 web.xml 里的 <code>&lt;session-timeout&gt;</code>。Tomcat 5 起不再有独立线程，<code>processExpires()</code> 由 StandardContext 的 <code>backgroundProcess()</code> 周期性调用。</p>
+</div>
+
+<h3>PersistentManagerBase：换出与备份</h3>
+
+<p>持久化管理器和 StandardManager 的主要区别是多了一个 <strong>Store（存储）</strong>。会话可以被：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="持久化管理器：换出把会话移到存储，备份把会话复制到存储；findSession 先查内存再查存储">
+  <rect class="bx-g" x="20" y="30" width="240" height="160" rx="12"/>
+  <text class="ttl on-g" x="140" y="56" text-anchor="middle">内存中的活动会话</text>
+  <rect class="bx" x="40" y="74" width="200" height="26" rx="4"/><text class="mono sm" x="140" y="92" text-anchor="middle">S1（刚访问过）</text>
+  <rect class="bx" x="40" y="108" width="200" height="26" rx="4"/><text class="mono sm" x="140" y="126" text-anchor="middle">S2（空闲 20 分钟）</text>
+  <rect class="bx-d" x="40" y="142" width="200" height="26" rx="4"/><text class="mono sm" x="140" y="160" text-anchor="middle">S3（已换出）</text>
+
+  <rect class="bx-b" x="500" y="30" width="240" height="160" rx="12"/>
+  <text class="ttl on-b" x="620" y="56" text-anchor="middle">Store（文件 / 数据库）</text>
+  <rect class="bx" x="520" y="108" width="200" height="26" rx="4"/><text class="mono sm" x="620" y="126" text-anchor="middle">S2 的备份副本</text>
+  <rect class="bx" x="520" y="142" width="200" height="26" rx="4"/><text class="mono sm" x="620" y="160" text-anchor="middle">S3</text>
+
+  <path class="ln-p" d="M242 121 H516" marker-end="url(#ar-p)"/>
+  <text class="sm on-p" x="380" y="113" text-anchor="middle">备份 back up：复制，内存里还在（防宕机）</text>
+  <path class="ln-a" d="M242 155 H516" marker-end="url(#ar-a)"/>
+  <text class="sm on-a" x="380" y="147" text-anchor="middle">换出 swap out：移走，腾出内存</text>
+  <path class="ln-g" d="M516 172 C420 210 340 210 242 168" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="380" y="216" text-anchor="middle">换入 swap in：findSession 在内存里找不到时去 Store 找</text>
+  <text class="sm" x="380" y="242" text-anchor="middle">换出条件：活动会话数超过 maxActiveSessions，或空闲时间同时超过 minIdleSwap 和 maxIdleSwap</text>
+</svg>
+<figcaption>图 9-5　持久化管理器的换出、备份与换入</figcaption>
+</figure>
+
+<div class="code" data-lang="java" data-file="PersistentManagerBase（节选）">
+<pre>
+public void run() {                          // Tomcat 4
+    while (!threadDone) {
+        threadSleep();
+        processExpires();
+        processPersistenceChecks();          // = processMaxIdleSwaps + processMaxActiveSwaps + processMaxIdleBackups
+    }
+}
+
+public Session findSession(String id) throws IOException {
+    Session session = super.findSession(id); // 先在内存里找
+    if (session != null)
+        return (session);
+    session = swapIn(id);                    // 再去 Store 里找
+    return (session);
+}
+</pre>
+</div>
+
+<p><code>DistributedManager</code>（仅 Tomcat 4）用于集群：创建会话时把它序列化，通过 <code>ClusterSender</code> 发给其他节点；后台线程用 <code>ClusterReceiver</code> 接收其他节点的通知。现代 Tomcat 中这项工作由 <code>DeltaManager</code> / <code>BackupManager</code>（<code>org.apache.catalina.ha</code>）承担。</p>
+
+<h2 id="store">Store</h2>
+
+<div class="code" data-lang="java" data-file="org/apache/catalina/Store.java（节选）">
+<pre>
+public interface Store {
+    public Manager getManager();
+    public void setManager(Manager manager);
+    public int getSize() throws IOException;
+    public String[] keys() throws IOException;                 // 所有会话 ID
+    public Session load(String id) throws ClassNotFoundException, IOException;
+    public void save(Session session) throws IOException;
+    public void remove(String id) throws IOException;
+    public void clear() throws IOException;
+}
+</pre>
+</div>
+
+<ul>
+  <li><strong>StoreBase</strong>（抽象）：提供公共功能，包括清理存储中过期会话的 <code>processExpires()</code>；不实现 <code>save</code>/<code>load</code>。</li>
+  <li><strong>FileStore</strong>：每个会话一个文件，名为「会话 ID + <code>.session</code>」，用 <code>ObjectOutputStream</code> / <code>ObjectInputStream</code> 读写。</li>
+  <li><strong>JDBCStore</strong>：存进数据库，需要设置 <code>driverName</code> 和 <code>connectionURL</code>。</li>
+</ul>
+
+<h2 id="app">本章应用</h2>
+
+<p>应用和第 8 章类似：一个 StandardContext、一个运行 <code>SessionServlet</code> 的 Wrapper，新增一个 <code>StandardManager</code>：</p>
+
+<div class="code" data-lang="java" data-file="ex09/pyrmont/startup/Bootstrap.java（节选）">
+<pre>
+Wrapper wrapper1 = new SimpleWrapper();
+wrapper1.setName("Session");
+wrapper1.setServletClass("SessionServlet");
+Context context = new StandardContext();
+context.setPath("/myApp");
+context.setDocBase("myApp");
+context.addChild(wrapper1);
+// 注意：模式是 /myApp/Session 而不是 /Session。
+// 会话 Cookie 的 Path 是上下文路径 /myApp，浏览器只会把 Cookie 发回 /myApp 下的 URL
+context.addServletMapping("/myApp/Session", "Session");
+...
+Manager manager = new StandardManager();
+context.setManager(manager);
+</pre>
+</div>
+
+<p><code>SimpleWrapperValve</code> 多了两行：把 Context 交给请求对象，这样 <code>doGetSession()</code> 才能找到管理器：</p>
+
+<div class="code" data-lang="java" data-file="ex09/pyrmont/core/SimpleWrapperValve.java（节选）">
+<pre>
+// pass the Context to the Request object so that the Request object can call the Manager
+Context context = (Context) wrapper.getParent();
+request.setContext(context);
+servlet = wrapper.allocate();
+servlet.service(hreq, hres);
+</pre>
+</div>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch09/session/</code><code>core/</code><code>startup/Bootstrap.java</code><code>tomcat/EmbeddedSession.java</code></div>
+
+<h3>① 用 HttpServletRequestWrapper 实现 getSession</h3>
+
+<p>原书在连接器的请求类里实现 <code>getSession</code>，再在阀里 <code>request.setContext()</code>。Java 17 版换了一个更「Servlet 风格」的做法：基础阀用 Servlet API 自带的装饰器 <code>HttpServletRequestWrapper</code> 包一层，只覆盖会话相关的方法。</p>
+
+<div class="code" data-lang="java" data-file="java17/.../ch09/session/SessionRequest.java（节选）">
+<pre>
+public class SessionRequest extends HttpServletRequestWrapper {
+
+    @Override
+    public HttpSession getSession(boolean create) {
+        if (session != null &amp;&amp; session.isValid()) {
+            return session.getSession();
+        }
+        session = manager.findSession(getRequestedSessionId());   // 浏览器带来的 ID 还有效吗？
+        if (session != null) {
+            return session.getSession();
+        }
+        if (!create) {
+            return null;
+        }
+        session = manager.createSession();
+        var cookie = new Cookie("JSESSIONID", session.getId());
+        cookie.setPath(contextPath);       // /myApp
+        cookie.setHttpOnly(true);          // JavaScript 读不到，防止 XSS 偷走会话
+        response.addCookie(cookie);
+        return session.getSession();
+    }
+}
+</pre>
+</div>
+
+<h3>② 会话 ID：SecureRandom + HexFormat</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch09/session/StandardManager.java（节选）">
+<pre>
+private final Map&lt;String, StandardSession&gt; sessions = new ConcurrentHashMap&lt;&gt;();   // 代替 synchronized + HashMap
+private final SecureRandom random = new SecureRandom();
+
+public StandardSession createSession() {
+    byte[] bytes = new byte[16];                      // 128 位随机数
+    random.nextBytes(bytes);
+    var session = new StandardSession(this, HexFormat.of().withUpperCase().formatHex(bytes),   // Java 17
+                                      maxInactiveInterval);
+    sessions.put(session.getId(), session);
+    return session;
+}
+</pre>
+</div>
+
+<div class="box warn">
+  <div class="t">&#9888; 会话 ID 就是登录凭证</div>
+  <p>谁拿到了会话 ID，谁就「是」这个用户。所以 ID 必须用密码学安全的随机数生成（<code>SecureRandom</code>），长度足够（Tomcat 11 默认 16 字节），并且 Cookie 要带 <code>HttpOnly</code>，HTTPS 站点还要带 <code>Secure</code>。登录成功后还应调用 <code>request.changeSessionId()</code>（Servlet 3.1 新增），防止「会话固定」攻击。</p>
+</div>
+
+<h3>③ 过期清理：ScheduledExecutorService</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch09/session/StandardManager.java（节选）">
+<pre>
+public void processExpires() {
+    long now = System.currentTimeMillis();
+    sessions.values().stream().filter(s -&gt; s.isExpired(now)).forEach(StandardSession::expire);
+}
+
+@Override
+public void start() {
+    load();
+    expirer = Executors.newSingleThreadScheduledExecutor(...);
+    expirer.scheduleWithFixedDelay(this::processExpires, checkInterval, checkInterval, TimeUnit.SECONDS);
+}
+</pre>
+</div>
+
+<h3>④ 安全的反序列化</h3>
+
+<p>原书用 <code>ObjectInputStream</code> 直接读 <code>SESSIONS.ser</code>。Java 反序列化是历史上最严重的漏洞来源之一：精心构造的字节流可以在 <code>readObject</code> 过程中执行任意代码。Java 9 引入了 <code>ObjectInputFilter</code>，可以只放行预期的类：</p>
+
+<div class="code" data-lang="java" data-file="java17/.../ch09/session/StandardManager.java（节选）">
+<pre>
+private static final ObjectInputFilter FILTER = ObjectInputFilter.Config.createFilter(
+        "modern.ch09.session.StandardSession;java.lang.*;java.util.**;!*");   // 末尾 !* 拒绝其他一切
+
+try (var in = new ObjectInputStream(Files.newInputStream(pathname))) {
+    in.setObjectInputFilter(FILTER);
+    int count = in.readInt();
+    for (int i = 0; i &lt; count; i++) {
+        var session = (StandardSession) in.readObject();
+        session.setManager(this);                      // transient 字段读回后重新建立
+        sessions.put(session.getId(), session);
+    }
+}
+</pre>
+</div>
+
+<div class="box tip">
+  <div class="t">&#128161; 一个真实的小插曲</div>
+  <p>写这段代码时，过滤器一开始写的是 <code>java.util.*</code>，结果恢复会话时被拒绝了：<code>*</code> 只匹配 <code>java.util</code> 包本身，而会话属性表 <code>ConcurrentHashMap</code> 在 <code>java.util.concurrent</code> 子包里。改成 <code>java.util.**</code>（包含子包）才通过。白名单宁可写严，被拒绝了再放宽。</p>
+</div>
+
+<h3>⑤ Tomcat 11 的会话管理</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch09/tomcat/EmbeddedSession.java（节选）">
+<pre>
+Context context = tomcat.addContext("/myApp", myApp.toString());
+...
+context.setSessionTimeout(30);                 // 分钟
+var manager = new StandardManager();
+manager.setPathname("SESSIONS.ser");           // 位于 work/Tomcat/localhost/myApp/
+context.setManager(manager);
+
+tomcat.start();
+System.in.read();
+tomcat.stop();                                 // → StandardManager.unload()，会话写盘
+</pre>
+</div>
+
+<div class="tw">
+<table>
+  <tr><th>Tomcat 4</th><th>Tomcat 11</th></tr>
+  <tr><td>每个管理器一个后台线程</td><td>由 Context 的 <code>backgroundProcess()</code> 统一调用</td></tr>
+  <tr><td><code>generateSessionId()</code> 写在 ManagerBase 里</td><td>独立组件 <code>SessionIdGenerator</code>（默认 <code>StandardSessionIdGenerator</code>，可配置长度和算法）</td></tr>
+  <tr><td>DistributedManager</td><td><code>DeltaManager</code>（全量复制）/ <code>BackupManager</code>（主备复制）</td></tr>
+  <tr><td>FileStore、JDBCStore</td><td>FileStore、<code>DataSourceStore</code>（JDBCStore 已被移除，Tomcat 11 中不再存在）</td></tr>
+  <tr><td>—</td><td>Cookie 默认 <code>HttpOnly</code>，支持 <code>SameSite</code>（<code>Rfc6265CookieProcessor</code>）</td></tr>
+</table>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch09.startup.Bootstrap               # 迷你容器 + 自己写的 StandardManager
+curl -c cj.txt -b cj.txt 'http://localhost:8080/myApp/Session?value=hello'
+curl -c cj.txt -b cj.txt 'http://localhost:8080/myApp/Session?value=world'
+# 回车停止，再次 ./run.sh ch09.startup.Bootstrap，然后：
+curl -c cj.txt -b cj.txt 'http://localhost:8080/myApp/Session?value=again'
+
+./run.sh ch09.tomcat.EmbeddedSession          # 同样的实验，跑在 Tomcat 11 上
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+Set-Cookie: JSESSIONID=9670D116603C0613907EFFADBEEFD112; Path=/myApp; HttpOnly
+&lt;br&gt;the previous value is null
+&lt;br&gt;the current value is hello
+
+&lt;br&gt;the previous value is hello
+&lt;br&gt;the current value is world
+
+StandardManager: 把 1 个会话保存到 work/SESSIONS.ser          ← 按回车停止
+StandardManager: 从 SESSIONS.ser 恢复了 1 个会话               ← 重新启动
+&lt;br&gt;the previous value is world                            ← 会话还在！
+&lt;br&gt;the current value is again
+
+# 第二个参数是会话超时秒数：./run.sh ch09.startup.Bootstrap 8080 2
+StandardManager: 会话 02943F5C26F649609BB6F3124F68EF0D 已过期
+</pre>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>管理器挂在 Context 上；请求通过 Context 找到管理器，按请求带来的会话 ID 查找或新建会话。</li>
+  <li>StandardSession 同时实现 <code>HttpSession</code>、<code>Session</code> 和 <code>Serializable</code>；交给 Servlet 的是外观 StandardSessionFacade。</li>
+  <li>StandardManager 把会话放在内存，后台清理过期会话，停止时存盘、启动时恢复。</li>
+  <li>持久化管理器借助 Store（FileStore / JDBCStore）实现会话的换出、换入和备份；DistributedManager 用于集群复制。</li>
+  <li>现代实践：安全随机 ID、HttpOnly/Secure/SameSite Cookie、登录后更换会话 ID、反序列化白名单。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>在 SessionServlet 里存一个没有实现 <code>Serializable</code> 的对象，停止服务器，观察 Java 17 版的 <code>unload()</code> 发生了什么。参考 Tomcat 的做法，改成「跳过不可序列化的属性并打印警告」。</li>
+    <li>给 Java 17 版实现一个 <code>FileStore</code>：每个会话一个 <code>&lt;id&gt;.session</code> 文件；再实现「活动会话数超过 <code>maxActiveSessions</code> 时把最久未访问的会话换出到 FileStore」。</li>
+    <li>实现 <code>HttpSessionListener</code> 通知：会话创建和销毁时调用应用注册的监听器，并用它统计在线人数。</li>
+    <li>给会话 Cookie 加上 <code>SameSite=Lax</code>（提示：jakarta 6 的 <code>Cookie.setAttribute("SameSite", "Lax")</code>，同时修改第 3 章 HttpResponse 的 <code>addCookie</code> 输出所有属性）。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>
