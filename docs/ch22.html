@@ -1,0 +1,556 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 22 章 · 静态资源、错误页与字符编码 — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="22">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 22 章 · 补充篇</span>
+<h1>静态资源、错误页与字符编码</h1>
+<p class="lede">
+  第 1 章的服务器只会把文件原样读出来。真实的 Tomcat 在「读文件」这件小事上做了很多：
+  欢迎文件、目录重定向、<code>ETag</code> 与 <code>304</code>、断点续传用的 <code>Range</code>。
+  出错时它还要把请求转到应用自己的错误页。最后是让无数新手头疼的中文乱码：
+  一个请求里有三处地方各自决定用什么编码。这一章把这三件事讲清楚，并写一个迷你 DefaultServlet 和 Tomcat 的版本对照。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>知道 <code>DefaultServlet</code> 何时被调用，以及目录、欢迎文件的处理流程</li>
+    <li>理解条件请求（<code>ETag</code>、<code>Last-Modified</code>）如何让浏览器缓存生效</li>
+    <li>会用 <code>Range</code> 请求，理解 <code>206</code> 和 <code>416</code></li>
+    <li>说出异常和 <code>sendError</code> 是怎样被转到 error-page 的，没配置时谁来兜底</li>
+    <li>分清 URI、请求体、响应体三处编码各由什么决定，能定位乱码的原因</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="default">DefaultServlet：没人认领的请求</h2>
+
+<p>
+  第 12 章讲过映射规则的最后一条：前面都不匹配时，交给映射到 <code>/</code> 的<strong>默认 Servlet</strong>。
+  Tomcat 在全局的 <code>conf/web.xml</code> 里把 <code>org.apache.catalina.servlets.DefaultServlet</code> 注册为默认 Servlet，
+  所以每个应用不用写任何配置就能提供 HTML、CSS、图片。它的处理流程是这样的：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="DefaultServlet 处理文件、无斜杠目录和目录三种情况">
+  <rect class="bx" x="20" y="95" width="140" height="64" rx="10"/>
+  <text class="ttl" x="90" y="122" text-anchor="middle">GET /docs</text>
+  <text class="sm" x="90" y="142" text-anchor="middle">没有别的规则匹配</text>
+  <path class="ln" d="M162 127 H186" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="190" y="95" width="150" height="64" rx="10"/>
+  <text class="ttl on-a" x="265" y="122" text-anchor="middle">DefaultServlet</text>
+  <text class="mono sm" x="265" y="142" text-anchor="middle">映射到 "/"</text>
+  <path class="ln-a" d="M342 115 C360 115 360 42 376 42" marker-end="url(#ar-a)"/>
+  <path class="ln-a" d="M342 127 H376" marker-end="url(#ar-a)"/>
+  <path class="ln-a" d="M342 139 C360 139 360 212 376 212" marker-end="url(#ar-a)"/>
+  <rect class="bx-b" x="380" y="20" width="180" height="44" rx="8"/>
+  <text class="sm" x="470" y="47" text-anchor="middle">是普通文件</text>
+  <rect class="bx-b" x="380" y="105" width="180" height="44" rx="8"/>
+  <text class="sm" x="470" y="132" text-anchor="middle">是目录，但没有以 / 结尾</text>
+  <rect class="bx-b" x="380" y="190" width="180" height="44" rx="8"/>
+  <text class="sm" x="470" y="217" text-anchor="middle">是目录，以 / 结尾</text>
+  <path class="ln" d="M562 42 H586" marker-end="url(#ar)"/>
+  <path class="ln" d="M562 127 H586" marker-end="url(#ar)"/>
+  <path class="ln" d="M562 212 H586" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="590" y="20" width="150" height="44" rx="8"/>
+  <text class="sm" x="665" y="40" text-anchor="middle">200 / 304 / 206</text>
+  <text class="sm" x="665" y="55" text-anchor="middle">见下两节</text>
+  <rect class="bx-p" x="590" y="105" width="150" height="44" rx="8"/>
+  <text class="mono sm" x="665" y="125" text-anchor="middle">302</text>
+  <text class="mono sm" x="665" y="140" text-anchor="middle">Location: /docs/</text>
+  <rect class="bx-g" x="590" y="190" width="150" height="44" rx="8"/>
+  <text class="sm" x="665" y="210" text-anchor="middle">欢迎文件 index.html</text>
+  <text class="sm" x="665" y="225" text-anchor="middle">没有：列表或 404</text>
+</svg>
+<figcaption>图 22-1　DefaultServlet 的三条分支</figcaption>
+</figure>
+
+<p>
+  为什么目录一定要补上结尾的 <code>/</code>？因为浏览器按 URL 解析相对链接：在 <code>/docs</code> 页面里写
+  <code>&lt;link href="style.css"&gt;</code> 会请求 <code>/style.css</code>，而在 <code>/docs/</code> 里才会请求
+  <code>/docs/style.css</code>。欢迎文件列表来自 web.xml 的 <code>&lt;welcome-file-list&gt;</code>，
+  目录列表默认关闭（<code>listings=false</code>），生产环境也应该保持关闭。
+</p>
+
+<div class="box note">
+  <div class="t">&#128161; 欢迎文件其实分两步</div>
+  <p>
+    Tomcat 的欢迎文件处理大部分发生在 <code>Mapper</code> 里，而不是 DefaultServlet：请求 <code>/docs/</code> 时，
+    Mapper 依次尝试 <code>/docs/index.html</code> 等欢迎文件，如果对应的资源存在就直接映射过去。
+    所以欢迎文件也可以是一个 Servlet 路径，不一定是静态文件。
+  </p>
+</div>
+
+<h2 id="conditional">条件请求：ETag 与 304</h2>
+
+<p>
+  浏览器缓存了一个文件之后，下次还要不要下载？它会带上上次收到的「版本标识」去问服务器，
+  文件没变就只回一个 <code>304 Not Modified</code>，没有响应体。版本标识有两种：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="第一次请求返回 200 和 ETag，第二次带 If-None-Match 返回 304">
+  <rect class="bx" x="60" y="16" width="120" height="34" rx="8"/><text class="ttl" x="120" y="38" text-anchor="middle">浏览器</text>
+  <rect class="bx-a" x="580" y="16" width="120" height="34" rx="8"/><text class="ttl on-a" x="640" y="38" text-anchor="middle">DefaultServlet</text>
+  <path class="ln-d" d="M120 52 V252"/>
+  <path class="ln-d" d="M640 52 V252"/>
+  <path class="ln" d="M122 80 H636" marker-end="url(#ar)"/>
+  <text class="mono sm" x="380" y="72" text-anchor="middle">GET /big.txt</text>
+  <path class="ln-g" d="M638 118 H124" marker-end="url(#ar-g)"/>
+  <text class="mono sm on-g" x="380" y="110" text-anchor="middle">200 OK　ETag: W/"10000-1793149834314"　Last-Modified: …</text>
+  <text class="sm" x="380" y="136" text-anchor="middle">+ 10000 字节的响应体，浏览器把文件和 ETag 一起缓存</text>
+  <path class="ln" d="M122 180 H636" marker-end="url(#ar)"/>
+  <text class="mono sm" x="380" y="172" text-anchor="middle">GET /big.txt　If-None-Match: W/"10000-1793149834314"</text>
+  <path class="ln-b" d="M638 222 H124" marker-end="url(#ar-b)"/>
+  <text class="mono sm on-b" x="380" y="214" text-anchor="middle">304 Not Modified</text>
+  <text class="sm" x="380" y="242" text-anchor="middle">没有响应体：浏览器直接用缓存里的文件</text>
+</svg>
+<figcaption>图 22-2　条件请求省掉的是响应体，往返还在</figcaption>
+</figure>
+
+<div class="tw">
+<table>
+  <tr><th>服务器给出</th><th>浏览器下次带上</th><th>比较方式</th><th>特点</th></tr>
+  <tr><td><code>ETag: W/"长度-修改时间"</code></td><td><code>If-None-Match</code></td><td>字符串相等（弱比较忽略 <code>W/</code>）</td><td>精确；Tomcat 默认用文件长度和修改时间拼出来，所以是「弱」ETag</td></tr>
+  <tr><td><code>Last-Modified</code></td><td><code>If-Modified-Since</code></td><td>修改时间 ≤ 浏览器给的时间</td><td>只精确到秒，一秒内改两次会漏判</td></tr>
+</table>
+</div>
+
+<p>
+  两者同时出现时，<code>If-None-Match</code> 优先（RFC 9110 的规定）。如果想让浏览器连这一次往返也省掉，
+  要再配合 <code>Cache-Control: max-age=…</code>，那属于缓存策略，通常由过滤器或前端的 CDN 来设置。
+</p>
+
+<h2 id="range">范围请求：Range 与 206</h2>
+
+<p>
+  下载工具的断点续传、视频播放器的拖动进度条，靠的都是 <code>Range</code> 请求头：只要文件的一部分。
+  服务器用 <code>Accept-Ranges: bytes</code> 声明自己支持，然后用 <code>206 Partial Content</code> 和
+  <code>Content-Range</code> 回答；范围超出文件大小就返回 <code>416</code>。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="一个 10000 字节的文件上三种 Range 请求的结果">
+  <rect class="bx" x="60" y="70" width="600" height="40" rx="4"/>
+  <text class="sm" x="360" y="95" text-anchor="middle">big.txt：10000 字节（line 0001 … line 1000）</text>
+  <text class="mono sm" x="60" y="128" text-anchor="middle">0</text>
+  <text class="mono sm" x="644" y="128" text-anchor="end">9999</text>
+  <rect class="bx-g" x="60" y="70" width="18" height="40"/>
+  <path class="ln-g" d="M69 68 V40 H120"/>
+  <text class="mono sm on-g" x="126" y="36">bytes=0-19</text>
+  <text class="sm" x="126" y="52">→ 206，Content-Range: bytes 0-19/10000</text>
+  <rect class="bx-b" x="648" y="70" width="12" height="40"/>
+  <path class="ln-b" d="M654 112 V160 H560"/>
+  <text class="mono sm on-b" x="554" y="156" text-anchor="end">bytes=-10（最后 10 个字节）</text>
+  <text class="sm" x="554" y="172" text-anchor="end">→ 206，Content-Range: bytes 9990-9999/10000</text>
+  <rect class="bx-r" x="680" y="70" width="60" height="40" rx="4" style="stroke-dasharray:5 4"/>
+  <text class="mono sm on-r" x="710" y="64" text-anchor="middle">20000-</text>
+  <text class="sm on-r" x="710" y="196" text-anchor="middle">→ 416</text>
+  <path class="ln-r" d="M710 112 V182"/>
+</svg>
+<figcaption>图 22-3　三种范围请求：开头一段、末尾一段、超出范围</figcaption>
+</figure>
+
+<p>
+  还有一个容易忽略的细节：<code>If-Range</code>。客户端续传时会带上之前的 ETag，如果文件已经变了，
+  服务器必须忽略 <code>Range</code>、返回整个新文件——否则把新文件的后半段拼到旧文件的前半段上，下载结果就坏了。
+</p>
+
+<h2 id="errors">错误处理：从异常到错误页</h2>
+
+<p>
+  Servlet 抛出异常、或者调用 <code>response.sendError(404)</code> 之后，并不是直接把错误返回给浏览器。
+  请求会一路回到 Host 层，由 <code>StandardHostValve</code> 根据 web.xml 的 <code>&lt;error-page&gt;</code> 决定下一步：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="异常或 sendError 经 StandardHostValve 查找 error-page，找到则 ERROR 分派，找不到则 ErrorReportValve 输出默认页">
+  <rect class="bx-r" x="20" y="40" width="190" height="50" rx="10"/>
+  <text class="ttl on-r" x="115" y="62" text-anchor="middle">Servlet 抛出异常</text>
+  <text class="mono sm" x="115" y="80" text-anchor="middle">IllegalStateException</text>
+  <rect class="bx-a" x="20" y="130" width="190" height="50" rx="10"/>
+  <text class="ttl on-a" x="115" y="152" text-anchor="middle">sendError(404)</text>
+  <text class="sm" x="115" y="170" text-anchor="middle">DefaultServlet 找不到文件</text>
+  <path class="ln" d="M212 65 C240 65 240 100 262 104" marker-end="url(#ar)"/>
+  <path class="ln" d="M212 155 C240 155 240 122 262 118" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="266" y="70" width="210" height="80" rx="12"/>
+  <text class="ttl on-b" x="371" y="96" text-anchor="middle">StandardHostValve</text>
+  <text class="sm" x="371" y="117" text-anchor="middle">异常：按类型找，找不到再找父类</text>
+  <text class="sm" x="371" y="135" text-anchor="middle">sendError：按状态码找</text>
+  <path class="ln-g" d="M478 95 C505 95 505 60 528 58" marker-end="url(#ar-g)"/>
+  <path class="ln" d="M478 125 C505 125 505 160 528 162" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="532" y="24" width="208" height="70" rx="10"/>
+  <text class="ttl on-g" x="636" y="48" text-anchor="middle">找到 error-page</text>
+  <text class="sm" x="636" y="66" text-anchor="middle">ERROR 类型的分派</text>
+  <text class="sm" x="636" y="82" text-anchor="middle">→ 应用自己的错误页</text>
+  <rect class="bx-d" x="532" y="128" width="208" height="70" rx="10"/>
+  <text class="ttl" x="636" y="152" text-anchor="middle">没找到</text>
+  <text class="sm" x="636" y="170" text-anchor="middle">ErrorReportValve</text>
+  <text class="sm" x="636" y="186" text-anchor="middle">生成默认的 HTML 错误页</text>
+  <rect class="bx" x="20" y="226" width="720" height="56" rx="10"/>
+  <text class="sm" x="380" y="248" text-anchor="middle">错误页能拿到的属性：jakarta.servlet.error.status_code / exception / message / request_uri / servlet_name</text>
+  <text class="sm" x="380" y="268" text-anchor="middle">前提：响应还没有提交。已经提交了，状态码改不了，容器只能记日志并尽量结束连接</text>
+</svg>
+<figcaption>图 22-4　错误处理链：Host 阀查表，ERROR 分派兜住，ErrorReportValve 托底</figcaption>
+</figure>
+
+<div class="code" data-lang="xml" data-file="web.xml 里的 error-page">
+<pre>
+&lt;error-page&gt;
+  &lt;error-code&gt;404&lt;/error-code&gt;
+  &lt;location&gt;/errors/404&lt;/location&gt;
+&lt;/error-page&gt;
+&lt;error-page&gt;
+  &lt;exception-type&gt;java.lang.IllegalStateException&lt;/exception-type&gt;
+  &lt;location&gt;/errors/exception&lt;/location&gt;
+&lt;/error-page&gt;
+&lt;!-- Servlet 3.0 起可以不写 code 和 type，作为「默认错误页」 --&gt;
+</pre>
+</div>
+
+<p>
+  这和第 21 章的 forward 是同一套分派机制，只是 <code>DispatcherType</code> 换成了 <code>ERROR</code>。
+  第 13 章见过的 <code>ErrorReportValve</code> 是最后一道防线，它默认会输出异常消息和 Tomcat 版本号——
+  对攻击者来说是很有用的信息，第 28 章会把它关掉。
+</p>
+
+<h2 id="encoding">字符编码：一个请求里的三个决定</h2>
+
+<p>
+  乱码几乎都是「编码的人和解码的人用了不同的字符集」。一个 HTTP 交互里有三处需要把字节和字符互相转换，
+  它们<strong>各自独立</strong>决定用什么字符集：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="URI、请求体、响应体三处编码分别由什么决定">
+  <rect class="bx-b" x="20" y="20" width="330" height="34" rx="6"/>
+  <text class="mono sm" x="34" y="42">POST /echo?name=%E4%B8%AD HTTP/1.1</text>
+  <rect class="bx" x="20" y="60" width="330" height="34" rx="6"/>
+  <text class="mono sm" x="34" y="82">Content-Type: application/x-www-form-…</text>
+  <rect class="bx-a" x="20" y="100" width="330" height="34" rx="6"/>
+  <text class="mono sm" x="34" y="122">name=%E4%B8%AD%E6%96%87</text>
+  <rect class="bx-g" x="20" y="190" width="330" height="34" rx="6"/>
+  <text class="mono sm" x="34" y="212">Content-Type: text/plain;charset=UTF-8</text>
+  <rect class="bx" x="20" y="230" width="330" height="34" rx="6"/>
+  <text class="mono sm" x="34" y="252">中文……</text>
+  <text class="sm" x="185" y="165" text-anchor="middle">↓ 服务器处理后 ↓</text>
+
+  <path class="ln-b" d="M352 37 H384" marker-end="url(#ar-b)"/>
+  <text class="ttl on-b" x="390" y="34">① URI 里的 %XX</text>
+  <text class="sm" x="390" y="52">连接器的 URIEncoding，Tomcat 8 起默认 UTF-8</text>
+  <path class="ln-a" d="M352 117 H384" marker-end="url(#ar-a)"/>
+  <text class="ttl on-a" x="390" y="96">② 请求体里的表单参数</text>
+  <text class="sm" x="390" y="114">Content-Type 里的 charset</text>
+  <text class="sm" x="390" y="130">→ 应用的 request-character-encoding</text>
+  <text class="sm on-r" x="390" y="146">→ 都没有：ISO-8859-1（规范默认值）</text>
+  <path class="ln-g" d="M352 207 H384" marker-end="url(#ar-g)"/>
+  <text class="ttl on-g" x="390" y="196">③ 响应体</text>
+  <text class="sm" x="390" y="214">setContentType 里的 charset / setCharacterEncoding</text>
+  <text class="sm" x="390" y="230">→ 应用的 response-character-encoding</text>
+  <text class="sm on-r" x="390" y="246">→ 都没有：ISO-8859-1，中文变成 ?</text>
+  <text class="sm" x="380" y="288" text-anchor="middle">浏览器提交表单时通常不在 Content-Type 里写 charset，所以 ② 是最常见的乱码来源</text>
+</svg>
+<figcaption>图 22-5　URI、请求体、响应体：三处编码各管各的</figcaption>
+</figure>
+
+<p>
+  这正是下面运行结果里看到的现象：同一个「中文」，放在查询串里能正确解码，放在 POST 表单里就变成了
+  <code>ä¸­æ</code>——UTF-8 的 6 个字节被当作 6 个 ISO-8859-1 字符。修复方法从好到差：
+</p>
+
+<ol class="steps">
+  <li>在 web.xml 里声明 <code>&lt;request-character-encoding&gt;UTF-8&lt;/request-character-encoding&gt;</code> 和 <code>&lt;response-character-encoding&gt;</code>（Servlet 4.0 起），一次解决整个应用。</li>
+  <li>用一个最先执行的过滤器调用 <code>request.setCharacterEncoding("UTF-8")</code>（老项目常见的 <code>SetCharacterEncodingFilter</code> / Spring 的 <code>CharacterEncodingFilter</code>）。必须在第一次读参数<strong>之前</strong>调用，否则无效。</li>
+  <li>在每个 Servlet 里手动设置——容易漏，不推荐。</li>
+</ol>
+
+<div class="box tip">
+  <div class="t">&#9989; 静态文件的编码</div>
+  <p>
+    DefaultServlet 返回 <code>text/html</code> 时默认不带 charset，浏览器会去读页面里的
+    <code>&lt;meta charset="utf-8"&gt;</code>。也可以在 mime-mapping 里直接写
+    <code>text/html;charset=UTF-8</code>（本章验证过，Tomcat 11 会原样使用）。
+  </p>
+</div>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch22/mini/MiniDefaultServlet.java</code><code>tomcat/EmbeddedStatic.java</code></div>
+
+<p>
+  <code>MiniDefaultServlet</code> 不到 150 行，覆盖了前面讲的全部行为。它和 Tomcat 的 DefaultServlet 挂在同一个应用里、读同一个目录：
+  <code>/</code> 交给 Tomcat，<code>/mini/*</code> 交给我们，这样可以逐个响应头对照。
+</p>
+
+<h3>① 路径安全与目录处理</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch22/mini/MiniDefaultServlet.java（节选）">
+<pre>
+String rel = req.getPathInfo() == null ? "/" : req.getPathInfo();
+Path file = root.resolve(rel.substring(1)).normalize();
+if (!file.startsWith(root) || !Files.exists(file)) {              // 第 1 章就该有的路径穿越检查
+    resp.sendError(HttpServletResponse.SC_NOT_FOUND, rel);
+    return;
+}
+if (Files.isDirectory(file)) {
+    if (!rel.endsWith("/")) {                                     // /docs → /docs/
+        resp.sendRedirect(req.getRequestURI() + "/");
+        return;
+    }
+    file = file.resolve("index.html");                            // 欢迎文件
+    ...
+}
+</pre>
+</div>
+
+<h3>② ETag、Last-Modified 与 304</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch22/mini/MiniDefaultServlet.java（节选）">
+<pre>
+long length = Files.size(file);
+long lastModified = Files.getLastModifiedTime(file).toMillis() / 1000 * 1000;   // HTTP 日期只精确到秒
+String etag = "W/\"" + length + "-" + lastModified + "\"";        // 和 Tomcat 默认格式一样
+resp.setHeader("ETag", etag);
+resp.setDateHeader("Last-Modified", lastModified);
+resp.setHeader("Accept-Ranges", "bytes");
+
+if (notModified(req, etag, lastModified)) {
+    resp.setStatus(HttpServletResponse.SC_NOT_MODIFIED);
+    return;                                                       // 不写响应体
+}
+
+/** If-None-Match 优先；没有它时才看 If-Modified-Since */
+static boolean notModified(HttpServletRequest req, String etag, long lastModified) {
+    String inm = req.getHeader("If-None-Match");
+    if (inm != null) {
+        for (String tag : inm.split(",")) {
+            String t = tag.trim();
+            if (t.equals("*") || weakEquals(t, etag)) return true;
+        }
+        return false;
+    }
+    long ims = req.getDateHeader("If-Modified-Since");
+    return ims != -1 &amp;&amp; lastModified &lt;= ims;
+}
+</pre>
+</div>
+
+<h3>③ Range：只拷贝需要的字节</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch22/mini/MiniDefaultServlet.java（节选）">
+<pre>
+private static final Pattern RANGE = Pattern.compile("bytes=(\\d*)-(\\d*)");
+
+if (m.group(1).isEmpty()) {                                       // bytes=-500：最后 500 字节
+    start = Math.max(0, length - Long.parseLong(m.group(2)));
+} else {
+    start = Long.parseLong(m.group(1));
+    if (!m.group(2).isEmpty()) end = Math.min(end, Long.parseLong(m.group(2)));
+}
+if (start &gt; end) {
+    resp.setHeader("Content-Range", "bytes */" + length);
+    resp.sendError(HttpServletResponse.SC_REQUESTED_RANGE_NOT_SATISFIABLE);
+    return;
+}
+resp.setStatus(HttpServletResponse.SC_PARTIAL_CONTENT);
+resp.setHeader("Content-Range", "bytes " + start + "-" + end + "/" + length);
+resp.setContentLengthLong(end - start + 1);
+try (InputStream in = Files.newInputStream(file)) {
+    in.skipNBytes(start);                                         // Java 12+
+    ...                                                           // 循环拷贝 end - start + 1 个字节
+}
+</pre>
+</div>
+
+<p>
+  Tomcat 的 DefaultServlet 还支持多段范围（<code>bytes=0-9,100-109</code>，返回 <code>multipart/byteranges</code>）、
+  预压缩文件（存在 <code>a.js.gz</code> 时直接发送）、通过 <code>sendfile</code> 让操作系统零拷贝发送大文件，以及从 WAR 包内读资源。
+  这些都建立在同样的骨架上。
+</p>
+
+<h3>④ 错误页与编码：Tomcat 11 的配置方式</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch22/tomcat/EmbeddedStatic.java（节选）">
+<pre>
+Wrapper def = Tomcat.addServlet(ctx, "default", new DefaultServlet());
+def.addInitParameter("listings", "false");
+ctx.addServletMappingDecoded("/", "default");
+ctx.addWelcomeFile("index.html");
+
+ctx.addErrorPage(errorPage(404, null, "/errors/404"));
+ctx.addErrorPage(errorPage(0, IllegalStateException.class.getName(), "/errors/exception"));
+
+Context utf8 = tomcat.addContext("/utf8", docBase.toString());
+utf8.setRequestCharacterEncoding("UTF-8");      // = &lt;request-character-encoding&gt;
+utf8.setResponseCharacterEncoding("UTF-8");     // = &lt;response-character-encoding&gt;
+</pre>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch22.tomcat.EmbeddedStatic
+curl -i http://localhost:8080/docs              # 302 → /docs/
+curl -I http://localhost:8080/big.txt           # 看 ETag 和 Last-Modified
+curl -I http://localhost:8080/mini/big.txt      # 迷你版
+curl -i -H 'If-None-Match: W/"10000-…"' http://localhost:8080/big.txt   # 换成上面看到的 ETag
+curl -i -H 'Range: bytes=0-19' http://localhost:8080/mini/big.txt
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+== /big.txt（Tomcat）                     == /mini/big.txt（本章）
+HTTP/1.1 200                              HTTP/1.1 200
+Accept-Ranges: bytes                      ETag: W/"10000-1793149834000"
+ETag: W/"10000-1793149834314"             Last-Modified: Wed, 28 Oct 2026 01:10:34 GMT
+Last-Modified: … 01:10:34 GMT            Accept-Ranges: bytes
+Content-Type: text/plain                  Content-Type: text/plain;charset=UTF-8
+Content-Length: 10000                     Content-Length: 10000
+
+If-None-Match → 304            If-Modified-Since → 304
+Range: bytes=0-19  → 206  Content-Range: bytes 0-19/10000       （line 0001、line 0002）
+Range: bytes=-10   → 206  Content-Range: bytes 9990-9999/10000  （line 1000）
+Range: bytes=20000- → 416 Content-Range: bytes */10000
+</pre>
+</div>
+
+<p>
+  两边唯一的区别是 ETag 里的时间戳：Tomcat 用毫秒，我们截到了秒（和 <code>Last-Modified</code> 保持一致）。
+  再看错误页：
+</p>
+
+<div class="code" data-lang="bash">
+<pre>
+curl -i http://localhost:8080/nope      # 404 → /errors/404
+curl -i http://localhost:8080/boom      # IllegalStateException → /errors/exception
+curl -i http://localhost:8080/crash     # 没有映射的异常 → ErrorReportValve
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+HTTP/1.1 404
+出错了（这是应用自己的错误页 /404）
+dispatcherType = ERROR
+status_code    = 404
+request_uri    = /nope
+servlet_name   = default
+exception      = 无
+
+HTTP/1.1 500
+出错了（这是应用自己的错误页 /exception）
+dispatcherType = ERROR
+status_code    = 500
+request_uri    = /boom
+servlet_name   = boom
+exception      = IllegalStateException: 库存不足
+
+HTTP/1.1 500
+Content-Type: text/html;charset=utf-8
+&lt;title&gt;HTTP Status 500 – Internal Server Error&lt;/title&gt;
+&lt;p&gt;&lt;b&gt;Message&lt;/b&gt; 没有为这种异常配置错误页 …… Apache Tomcat/11.0.21
+</pre>
+</div>
+
+<p>迷你 Servlet 里的 <code>sendError(404)</code> 同样会被转到应用的错误页（<code>servlet_name = mini</code>），因为查表的是 Host 阀，不是 Servlet 自己。最后是编码：</p>
+
+<div class="code" data-lang="bash">
+<pre>
+curl 'http://localhost:8080/echo?name=%E4%B8%AD%E6%96%87'               # ① 查询串
+curl --data 'name=%E4%B8%AD%E6%96%87' http://localhost:8080/echo         # ② 表单，默认设置
+curl --data 'name=%E4%B8%AD%E6%96%87' http://localhost:8080/utf8/echo    # ② 表单，应用声明了 UTF-8
+curl 'http://localhost:8080/echo?name=%E4%B8%AD&amp;out=latin'               # ③ 响应不指定 charset
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+GET /echo                 POST /echo                POST /utf8/echo
+请求编码 = null           请求编码 = null           请求编码 = UTF-8
+name = 中文               name = ä¸­æ            name = 中文
+响应编码 = UTF-8          响应编码 = UTF-8          响应编码 = UTF-8
+
+out=latin：GET /echo\n???? = null\nname = ?\n???? = ISO-8859-1      ← 中文全部变成 ?
+</pre>
+</div>
+
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>兜底处理器</div>
+  <p>映射规则的最后一条永远是默认 Servlet，任何请求都有人处理，哪怕只是回一个 404。</p>
+  <dl>
+    <dt>取舍</dt><dd>不会出现「请求掉进黑洞」；但应用把 <code>/</code> 映射给自己的 Servlet 时，静态文件就没人管了（Spring MVC 早期的经典问题）。</dd>
+    <dt>还能用在</dt><dd>消息路由的死信队列、命令分派的 unknown 命令处理、规则引擎的默认规则。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>用版本号做缓存校验</div>
+  <p>ETag 用「长度 + 修改时间」快速算出一个版本号，客户端拿版本号来问「变了没有」。</p>
+  <dl>
+    <dt>取舍</dt><dd>不用读文件内容就能算出来，非常便宜；代价是弱校验——内容变了但长度和时间碰巧不变时会误判。</dd>
+    <dt>替代方案</dt><dd>内容哈希做强 ETag（准确，但要读完整个文件）。</dd>
+    <dt>还能用在</dt><dd>REST API 的乐观锁（<code>If-Match</code>）、增量同步、客户端配置拉取：用版本号避免重复传输。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>错误处理集中在上层</div>
+  <p>Servlet 只负责抛异常或 <code>sendError</code>，由 Host 阀统一查表、分派到错误页，最后由 ErrorReportValve 兜底。</p>
+  <dl>
+    <dt>取舍</dt><dd>错误页风格一致、业务代码干净；代价是错误流程跨越多层，响应一旦提交就无法再改。</dd>
+    <dt>还能用在</dt><dd>Spring 的 <code>@ControllerAdvice</code>、gRPC 的拦截器统一映射状态码、CLI 工具在 main 里统一捕获并输出友好提示。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch30.html">第 30 章 · 扩展点设计</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">4</span>显式声明编码，不依赖默认值</div>
+  <p>规范的默认编码是 ISO-8859-1，Tomcat 为兼容性保留了它，正确做法是在应用层显式声明 UTF-8。</p>
+  <dl>
+    <dt>取舍</dt><dd>保留默认值不会破坏老应用；代价是每个新应用都要记得配置。</dd>
+    <dt>还能用在</dt><dd>任何字节和字符转换的地方：<code>new String(bytes, UTF_8)</code>、<code>Files.readString(path, UTF_8)</code>。JDK 18 起默认字符集已改为 UTF-8（JEP 400），但显式写出来永远不会错。</dd>
+  </dl>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>DefaultServlet 映射到 <code>/</code>，处理所有没被认领的请求：目录补斜杠重定向、欢迎文件、关闭目录列表。</li>
+  <li>条件请求用 <code>ETag</code> / <code>Last-Modified</code> 判断文件是否变化，没变就回 <code>304</code> 省掉响应体；<code>If-None-Match</code> 优先。</li>
+  <li><code>Range</code> 请求返回 <code>206</code> 和 <code>Content-Range</code>，超出范围返回 <code>416</code>；<code>If-Range</code> 防止拼接出坏文件。</li>
+  <li>异常和 <code>sendError</code> 由 <code>StandardHostValve</code> 查 error-page，找到就用 ERROR 分派转过去，找不到由 <code>ErrorReportValve</code> 输出默认页。</li>
+  <li>URI、请求体、响应体三处编码各自独立：URI 默认 UTF-8，后两者默认 ISO-8859-1，应在应用级声明 UTF-8。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>给 <code>MiniDefaultServlet</code> 加上预压缩支持：请求头包含 <code>Accept-Encoding: gzip</code> 且存在 <code>xxx.gz</code> 时，直接发送压缩文件并加 <code>Content-Encoding: gzip</code> 和 <code>Vary: Accept-Encoding</code>。</li>
+    <li>把 ETag 改成文件内容的 SHA-256（强 ETag），比较大文件时两种方式的开销。</li>
+    <li>给 Tomcat 版增加一个没有 code 和 type 的「默认错误页」，然后访问 <code>/crash</code>，看看它是否取代了 ErrorReportValve 的页面。</li>
+    <li>写一个只拦截 REQUEST 的过滤器调用 <code>setCharacterEncoding("UTF-8")</code>，挂到根应用上，确认 <code>POST /echo</code> 不再乱码；再把它挪到读参数之后调用，观察失效。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

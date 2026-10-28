@@ -26,7 +26,9 @@
     { n: 17, t: 'Tomcat 的启动',          d: 'Bootstrap、Catalina 与启动脚本' },
     { n: 18, t: '部署器',                 d: 'HostConfig 如何发现并部署 Web 应用' },
     { n: 19, t: 'Manager Servlet',       d: 'ContainerServlet：让 Servlet 触碰容器内部' },
-    { n: 20, t: '基于 JMX 的管理',         d: 'MBean、MBeanServer 与 Commons Modeler' }
+    { n: 20, t: '基于 JMX 的管理',         d: 'MBean、MBeanServer 与 Commons Modeler' },
+    { n: 21, t: 'ServletContext 与 RequestDispatcher', d: 'forward、include 与三种作用域', part: '第六部分 · 补充：现代 Servlet 容器' },
+    { n: 22, t: '静态资源、错误页与字符编码', d: 'DefaultServlet、ETag/304/Range、error-page 与 UTF-8' }
   ];
 
   const pad = (n) => String(n).padStart(2, '0');

@@ -1,0 +1,602 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 21 章 · ServletContext 与 RequestDispatcher — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="21">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 21 章 · 补充篇</span>
+<h1>ServletContext 与 RequestDispatcher</h1>
+<p class="lede">
+  原书讲完了容器怎么把请求送到 Servlet，却没讲 Servlet 之间怎么协作。
+  这一章补上两块日常开发天天用到的拼图：代表整个 Web 应用的 <code>ServletContext</code>，
+  以及在服务器内部把请求「转交」给另一个 Servlet 的 <code>RequestDispatcher</code>。
+  我们会看到 forward 和 include 并不产生新请求，而是把同一个请求<strong>包一层</strong>再交出去。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>知道 <code>ServletContext</code> 在 Tomcat 里由谁实现、和 <code>StandardContext</code> 是什么关系</li>
+    <li>分清 request、session、application 三种作用域的生命周期</li>
+    <li>说出 forward、include、sendRedirect 的区别，以及各自对路径、参数、响应的影响</li>
+    <li>理解 Tomcat 如何用包装器（<code>ApplicationHttpRequest</code>）实现分派</li>
+    <li>知道过滤器为什么要声明 <code>DispatcherType</code></li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="context">ServletContext：一个应用一份</h2>
+
+<p>
+  第 12 章的 <code>StandardContext</code> 是容器眼里的 Web 应用；而 Servlet 眼里的 Web 应用是
+  <code>jakarta.servlet.ServletContext</code>。Tomcat 用 <code>org.apache.catalina.core.ApplicationContext</code>
+  实现这个接口，每个 <code>StandardContext</code> 持有一个。交给 Servlet 的不是它本身，而是外观
+  <code>ApplicationContextFacade</code>——第 2 章的外观模式又出现了。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 240" role="img" aria-label="StandardContext 持有 ApplicationContext，Servlet 拿到的是 ApplicationContextFacade">
+  <rect class="bx-a" x="20" y="40" width="210" height="150" rx="12"/>
+  <text class="ttl on-a" x="125" y="66" text-anchor="middle">StandardContext</text>
+  <text class="sm" x="125" y="88" text-anchor="middle">容器眼里的 Web 应用</text>
+  <text class="mono sm" x="125" y="114" text-anchor="middle">Wrapper × N</text>
+  <text class="mono sm" x="125" y="134" text-anchor="middle">Loader / Manager / Realm</text>
+  <text class="mono sm" x="125" y="154" text-anchor="middle">Pipeline / Mapper 规则</text>
+  <path class="ln-a" d="M232 115 H290" marker-end="url(#ar-a)"/>
+  <text class="lbl" x="261" y="106" text-anchor="middle">持有</text>
+  <rect class="bx-b" x="294" y="40" width="210" height="150" rx="12"/>
+  <text class="ttl on-b" x="399" y="66" text-anchor="middle">ApplicationContext</text>
+  <text class="sm" x="399" y="88" text-anchor="middle">ServletContext 的实现</text>
+  <text class="mono sm" x="399" y="114" text-anchor="middle">attributes（并发 Map）</text>
+  <text class="mono sm" x="399" y="134" text-anchor="middle">getInitParameter()</text>
+  <text class="mono sm" x="399" y="154" text-anchor="middle">getRequestDispatcher()</text>
+  <text class="mono sm" x="399" y="174" text-anchor="middle">getResource()</text>
+  <path class="ln-b" d="M506 115 H560" marker-end="url(#ar-b)"/>
+  <text class="lbl" x="533" y="106" text-anchor="middle">包一层</text>
+  <rect class="bx-g" x="564" y="65" width="176" height="100" rx="12"/>
+  <text class="ttl on-g" x="652" y="92" text-anchor="middle">ApplicationContext</text>
+  <text class="ttl on-g" x="652" y="110" text-anchor="middle">Facade</text>
+  <text class="sm" x="652" y="134" text-anchor="middle">getServletContext()</text>
+  <text class="sm" x="652" y="152" text-anchor="middle">拿到的就是它</text>
+  <text class="sm" x="380" y="222" text-anchor="middle">Servlet 只能通过外观调用规范里的方法，碰不到 StandardContext 的内部</text>
+</svg>
+<figcaption>图 21-1　ServletContext 在 Tomcat 里的三层</figcaption>
+</figure>
+
+<p>它主要提供四类能力：</p>
+
+<div class="tw">
+<table>
+  <tr><th>能力</th><th>方法</th><th>典型用途</th></tr>
+  <tr><td>应用级属性</td><td><code>get/setAttribute</code></td><td>全局缓存、计数器、Spring 的根容器（<code>WebApplicationContext</code> 就存在这里）</td></tr>
+  <tr><td>初始化参数</td><td><code>getInitParameter</code></td><td>web.xml 的 <code>&lt;context-param&gt;</code>，例如配置文件位置</td></tr>
+  <tr><td>资源访问</td><td><code>getResource</code>、<code>getResourceAsStream</code>、<code>getRealPath</code></td><td>读取 WAR 里的文件，不管它是目录还是压缩包</td></tr>
+  <tr><td>分派与注册</td><td><code>getRequestDispatcher</code>、<code>getNamedDispatcher</code>、<code>addServlet</code>…</td><td>本章主题；<code>addServlet</code> 等编程式注册见第 25 章</td></tr>
+</table>
+</div>
+
+<h3>三种作用域</h3>
+
+<p>
+  请求属性、会话属性、应用属性用的是同一组方法名，区别只在<strong>活多久、谁能看到</strong>。
+  选错作用域是新手最常见的 bug 来源之一：把用户数据放进 <code>ServletContext</code>，所有用户都会看到。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="application、session、request 三种作用域的生命周期对比">
+  <text class="ttl" x="20" y="50">application</text>
+  <rect class="bx-g" x="140" y="30" width="600" height="32" rx="6"/>
+  <text class="sm" x="440" y="51" text-anchor="middle">ServletContext 属性：应用启动 → 应用停止，所有用户、所有请求共享</text>
+  <text class="ttl" x="20" y="102">session</text>
+  <rect class="bx-b" x="180" y="82" width="260" height="32" rx="6"/>
+  <text class="sm" x="310" y="103" text-anchor="middle">用户 A 的 HttpSession（登录 → 超时）</text>
+  <rect class="bx-b" x="470" y="82" width="240" height="32" rx="6"/>
+  <text class="sm" x="590" y="103" text-anchor="middle">用户 B 的 HttpSession</text>
+  <text class="ttl" x="20" y="154">request</text>
+  <rect class="bx-a" x="190" y="134" width="44" height="32" rx="6"/>
+  <rect class="bx-a" x="290" y="134" width="44" height="32" rx="6"/>
+  <rect class="bx-a" x="380" y="134" width="44" height="32" rx="6"/>
+  <rect class="bx-a" x="500" y="134" width="44" height="32" rx="6"/>
+  <rect class="bx-a" x="620" y="134" width="44" height="32" rx="6"/>
+  <text class="sm" x="440" y="192" text-anchor="middle">每个请求一份，响应结束就丢弃；forward / include 期间共享同一份</text>
+</svg>
+<figcaption>图 21-2　作用域越大，活得越久，共享的人越多，越要注意线程安全</figcaption>
+</figure>
+
+<div class="box warn">
+  <div class="t">&#9888;&#65039; 应用属性会被并发访问</div>
+  <p>
+    <code>ApplicationContext</code> 的属性表本身是 <code>ConcurrentHashMap</code>，放进去的<strong>值</strong>却要自己保证线程安全。
+    计数器用 <code>AtomicLong</code> 而不是 <code>Long</code>：<code>get</code> 出来加一再 <code>set</code> 回去会丢更新。
+  </p>
+</div>
+
+<h2 id="three">forward、include、redirect</h2>
+
+<p>
+  一个请求经常需要多个 Servlet 合作：控制器处理业务，再交给视图渲染；页面由头部、正文、尾部拼起来。
+  Servlet 规范提供了两种<strong>服务器内部</strong>的分派方式，外加一种让<strong>浏览器</strong>重新发请求的方式：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 340" role="img" aria-label="forward、include、sendRedirect 三种方式的消息流对比">
+  <text class="ttl on-a" x="130" y="26" text-anchor="middle">forward</text>
+  <text class="ttl on-b" x="380" y="26" text-anchor="middle">include</text>
+  <text class="ttl on-p" x="630" y="26" text-anchor="middle">sendRedirect</text>
+
+  <!-- forward -->
+  <rect class="bx" x="55" y="50" width="150" height="36" rx="8"/><text x="130" y="73" text-anchor="middle">浏览器</text>
+  <rect class="bx-a" x="55" y="140" width="150" height="36" rx="8"/><text x="130" y="163" text-anchor="middle">Servlet A</text>
+  <rect class="bx-a" x="55" y="230" width="150" height="36" rx="8"/><text x="130" y="253" text-anchor="middle">Servlet B</text>
+  <path class="ln" d="M110 86 V138" marker-end="url(#ar)"/><text class="lbl" x="104" y="117" text-anchor="end">① 请求</text>
+  <path class="ln-a" d="M130 176 V228" marker-end="url(#ar-a)"/><text class="lbl" x="136" y="207">② forward</text>
+  <path class="ln-a" d="M205 248 H228 V68 H207" marker-end="url(#ar-a)"/><text class="lbl" x="226" y="160" text-anchor="end">③</text>
+
+  <!-- include -->
+  <rect class="bx" x="305" y="50" width="150" height="36" rx="8"/><text x="380" y="73" text-anchor="middle">浏览器</text>
+  <rect class="bx-b" x="305" y="140" width="150" height="36" rx="8"/><text x="380" y="163" text-anchor="middle">Servlet A</text>
+  <rect class="bx-b" x="305" y="230" width="150" height="36" rx="8"/><text x="380" y="253" text-anchor="middle">Servlet B</text>
+  <path class="ln" d="M345 86 V138" marker-end="url(#ar)"/><text class="lbl" x="339" y="117" text-anchor="end">① 请求</text>
+  <path class="ln-b" d="M365 176 V228" marker-end="url(#ar-b)"/><text class="lbl" x="359" y="207" text-anchor="end">② include</text>
+  <path class="ln-b" d="M395 230 V178" marker-end="url(#ar-b)"/><text class="lbl" x="401" y="207">③ 返回</text>
+  <path class="ln-b" d="M455 158 H478 V68 H457" marker-end="url(#ar-b)"/><text class="lbl" x="476" y="117" text-anchor="end">④</text>
+
+  <!-- redirect -->
+  <rect class="bx" x="555" y="50" width="150" height="36" rx="8"/><text x="630" y="73" text-anchor="middle">浏览器</text>
+  <rect class="bx-p" x="555" y="140" width="150" height="36" rx="8"/><text x="630" y="163" text-anchor="middle">Servlet A</text>
+  <rect class="bx-p" x="555" y="230" width="150" height="36" rx="8"/><text x="630" y="253" text-anchor="middle">Servlet B</text>
+  <path class="ln" d="M610 86 V138" marker-end="url(#ar)"/><text class="lbl" x="604" y="117" text-anchor="end">①</text>
+  <path class="ln-p" d="M650 140 V88" marker-end="url(#ar-p)"/><text class="lbl" x="656" y="117">② 302</text>
+  <path class="ln-p" d="M555 68 H535 V248 H553" marker-end="url(#ar-p)"/><text class="lbl" x="541" y="200">③</text>
+  <path class="ln-p" d="M705 248 H728 V68 H707" marker-end="url(#ar-p)"/><text class="lbl" x="724" y="200" text-anchor="end">④</text>
+
+  <text class="sm" x="130" y="296" text-anchor="middle">1 次 HTTP 请求，地址栏不变</text>
+  <text class="sm" x="130" y="314" text-anchor="middle">A 已写的内容作废，B 负责全部输出</text>
+  <text class="sm" x="380" y="296" text-anchor="middle">1 次 HTTP 请求，地址栏不变</text>
+  <text class="sm" x="380" y="314" text-anchor="middle">A、B 的输出拼在一起，B 不能改状态和头</text>
+  <text class="sm" x="630" y="296" text-anchor="middle">2 次 HTTP 请求，地址栏变成 B</text>
+  <text class="sm" x="630" y="314" text-anchor="middle">请求属性丢失，可以跳到别的网站</text>
+</svg>
+<figcaption>图 21-3　两种服务器内部分派与一次客户端重定向</figcaption>
+</figure>
+
+<div class="tw">
+<table>
+  <tr><th></th><th>forward</th><th>include</th><th>sendRedirect</th></tr>
+  <tr><td>HTTP 请求数</td><td>1</td><td>1</td><td>2</td></tr>
+  <tr><td>谁写响应</td><td>只有目标</td><td>调用方 + 目标</td><td>第二个请求的处理者</td></tr>
+  <tr><td>调用前已写的内容</td><td>被 <code>resetBuffer()</code> 清掉；已提交则抛 <code>IllegalStateException</code></td><td>保留</td><td>被清掉</td></tr>
+  <tr><td>目标看到的 <code>getRequestURI()</code></td><td>目标路径</td><td><strong>原路径</strong></td><td>新路径</td></tr>
+  <tr><td>原始路径去哪了</td><td><code>jakarta.servlet.forward.*</code> 属性</td><td>目标路径在 <code>jakarta.servlet.include.*</code> 属性里</td><td>没了</td></tr>
+  <tr><td>能否访问 <code>/WEB-INF/</code></td><td>能</td><td>能</td><td>不能（浏览器直接请求会 404）</td></tr>
+  <tr><td>典型用途</td><td>MVC：控制器 → 视图</td><td>公共页头、页脚</td><td>表单提交后跳转（PRG 模式）、登录后跳回</td></tr>
+</table>
+</div>
+
+<p>获取分派器有三种方式，区别在于路径怎么解释：</p>
+
+<div class="code" data-lang="java">
+<pre>
+// ① 相对上下文根，必须以 "/" 开头
+getServletContext().getRequestDispatcher("/WEB-INF/views/product?lang=zh");
+// ② 也可以是相对当前请求的路径（不以 "/" 开头），Tomcat 会先拼成绝对路径
+request.getRequestDispatcher("detail");
+// ③ 按 Servlet 名字：不经过 URL 映射，路径信息保持不变，也不设置 forward/include 属性
+getServletContext().getNamedDispatcher("fragment");
+</pre>
+</div>
+
+<h2 id="forward">forward 的内部：给请求套一层</h2>
+
+<p>
+  Tomcat 的实现类是 <code>org.apache.catalina.core.ApplicationDispatcher</code>。
+  创建它时，<code>ApplicationContext.getRequestDispatcher()</code> 已经用第 12 章那套映射规则（今天由 <code>Mapper</code> 完成）
+  找到了目标 Wrapper，并算好了目标的 <code>servletPath</code>、<code>pathInfo</code>、查询串。
+  调用 <code>forward()</code> 时它做这几件事：
+</p>
+
+<ol class="steps">
+  <li>检查响应是否已提交。提交了就抛 <code>IllegalStateException</code>——响应头已经发给浏览器，没法反悔。</li>
+  <li><code>response.resetBuffer()</code>：调用方写进缓冲区、还没发出去的内容全部丢掉。</li>
+  <li>用 <code>ApplicationHttpRequest</code> 把原请求包起来：路径方法返回目标路径，查询参数合并（新的优先），
+      并在这一层放上 <code>jakarta.servlet.forward.request_uri</code> 等属性记录原始路径（嵌套 forward 时保留最初的值）。</li>
+  <li>为目标构建过滤器链（只包含声明了 <code>FORWARD</code> 的过滤器），然后调用目标 Wrapper 的 Servlet。</li>
+  <li>返回后<strong>关闭响应</strong>：调用方在 <code>forward()</code> 之后写的任何东西都会被丢弃。</li>
+</ol>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 260" role="img" aria-label="ApplicationHttpRequest 包在 RequestFacade 外面，不同方法由不同层回答">
+  <rect class="bx-p" x="20" y="20" width="420" height="215" rx="14"/>
+  <text class="ttl on-p" x="40" y="46">ApplicationHttpRequest（分派层，每次分派新建）</text>
+  <text class="sm" x="40" y="66">目标路径、合并后的参数、forward.* 属性只活在这一层</text>
+  <rect class="bx-b" x="45" y="80" width="370" height="140" rx="12"/>
+  <text class="ttl on-b" x="65" y="105">RequestFacade（外观）</text>
+  <text class="sm" x="65" y="124">第 2 章：挡住 Request 的内部方法</text>
+  <rect class="bx" x="70" y="140" width="320" height="64" rx="10"/>
+  <text class="ttl" x="90" y="165">Request（连接器创建，请求属性存这里）</text>
+  <text class="sm" x="90" y="188">原始 URI、原始参数、属性表</text>
+
+  <rect class="bx-d" x="460" y="20" width="280" height="215" rx="12"/>
+  <text class="ttl" x="476" y="44">forward 后目标调用…</text>
+  <text class="mono sm" x="476" y="72">getRequestURI()</text>
+  <text class="sm on-p" x="476" y="90">→ 分派层：/app/WEB-INF/views/product</text>
+  <text class="mono sm" x="476" y="116">getAttribute(FORWARD_REQUEST_URI)</text>
+  <text class="sm on-p" x="476" y="134">→ 分派层：/app/products/42</text>
+  <text class="mono sm" x="476" y="160">getParameter("lang")</text>
+  <text class="sm on-p" x="476" y="178">→ 分派层合并后的参数：zh</text>
+  <text class="mono sm" x="476" y="204">setAttribute("product", …)</text>
+  <text class="sm" x="476" y="222">→ 穿透到 Request，调用方也看得到</text>
+</svg>
+<figcaption>图 21-4　分派不复制请求，只是在外面多套一层包装器（装饰器模式）</figcaption>
+</figure>
+
+<p>
+  为什么包装而不是复制？因为请求属性就是 Servlet 之间传数据的通道：控制器 <code>setAttribute("product", …)</code>，
+  视图 <code>getAttribute("product")</code>。包装层只拦截路径和参数相关的方法，其他调用原样传给里面那层，
+  属性自然是共享的。forward 返回后包装层被丢弃，调用方看到的又是原来的路径。
+</p>
+
+<h2 id="include">include：只许写响应体</h2>
+
+<p>
+  include 的请求包装和 forward 类似，但方向相反：<code>getRequestURI()</code> 等方法<strong>仍返回原路径</strong>（片段通常不关心自己在哪），
+  目标路径放在 <code>jakarta.servlet.include.*</code> 属性里。响应也要包一层 <code>ApplicationHttpResponse</code>，
+  它的 <code>included</code> 标志为真时，所有改状态码和响应头的调用都直接 <code>return</code>：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 190" role="img" aria-label="被 include 的 Servlet 写响应体会通过，改状态码和响应头会被包装器挡下">
+  <rect class="bx-b" x="20" y="55" width="160" height="80" rx="12"/>
+  <text class="ttl on-b" x="100" y="88" text-anchor="middle">片段 Servlet</text>
+  <text class="sm" x="100" y="110" text-anchor="middle">被 include 调用</text>
+  <rect class="bx-p" x="290" y="30" width="200" height="130" rx="12"/>
+  <text class="ttl on-p" x="390" y="56" text-anchor="middle">ApplicationHttpResponse</text>
+  <text class="mono sm" x="390" y="76" text-anchor="middle">included = true</text>
+  <text class="sm" x="390" y="112" text-anchor="middle">getWriter() → 原样放行</text>
+  <text class="sm" x="390" y="136" text-anchor="middle">setStatus / setHeader → return</text>
+  <rect class="bx" x="590" y="55" width="150" height="80" rx="12"/>
+  <text class="ttl" x="665" y="88" text-anchor="middle">Response</text>
+  <text class="sm" x="665" y="110" text-anchor="middle">调用方的响应</text>
+  <path class="ln-g" d="M182 75 H288" marker-end="url(#ar-g)"/>
+  <text class="lbl" x="235" y="68" text-anchor="middle">print("…")</text>
+  <path class="ln-g" d="M492 75 H588" marker-end="url(#ar-g)"/>
+  <text class="lbl" x="540" y="68" text-anchor="middle">写入</text>
+  <path class="ln-r" d="M182 120 H288" marker-end="url(#ar-r)"/>
+  <text class="lbl" x="235" y="140" text-anchor="middle">setStatus(500)</text>
+  <text class="ttl on-r" x="540" y="128" text-anchor="middle">✕ 忽略</text>
+</svg>
+<figcaption>图 21-5　被包含的一方只能贡献内容，不能决定响应的「元数据」</figcaption>
+</figure>
+
+<p>
+  规范这样设计的理由很简单：调用方决定这是一个什么样的响应（状态码、类型、缓存策略），片段只是其中的一部分。
+  如果片段能改状态码，那么页脚里的一个 bug 就能把整个页面变成 500。
+</p>
+
+<h2 id="dispatcher-type">分派类型与过滤器</h2>
+
+<p>
+  第 11 章的过滤器链默认只在<strong>来自客户端的请求</strong>上执行。分派时会不会再执行一遍过滤器，
+  取决于过滤器映射声明的 <code>DispatcherType</code>：
+</p>
+
+<div class="tw">
+<table>
+  <tr><th>DispatcherType</th><th>什么时候</th><th>典型过滤器</th></tr>
+  <tr><td><code>REQUEST</code>（默认）</td><td>客户端发来的请求</td><td>认证、日志、编码设置</td></tr>
+  <tr><td><code>FORWARD</code></td><td><code>forward()</code> 到目标时</td><td>视图层的通用处理（如模板变量注入）</td></tr>
+  <tr><td><code>INCLUDE</code></td><td><code>include()</code> 目标时</td><td>很少用</td></tr>
+  <tr><td><code>ERROR</code></td><td>容器转到 error-page 时（第 22 章）</td><td>错误页也需要的过滤器（如字符编码）</td></tr>
+  <tr><td><code>ASYNC</code></td><td><code>AsyncContext.dispatch()</code> 时（第 24 章）</td><td>需要在异步分派后再执行的过滤器</td></tr>
+</table>
+</div>
+
+<div class="box key">
+  <div class="t">&#128273; 为什么默认只拦截 REQUEST？</div>
+  <p>
+    想象一个认证过滤器：如果它也拦截 FORWARD，那么用户访问 <code>/products/42</code> 被认证一次，
+    控制器 forward 到视图时又被认证一次；一个页面 include 了十个片段就认证十一次。
+    大多数横切逻辑只应该在「请求进入应用」时执行一次。
+  </p>
+  <p>
+    另外，过滤器的 URL 模式匹配的是<strong>分派路径</strong>。按名字分派（<code>getNamedDispatcher</code>）没有路径，
+    所以只有按 <code>servlet-name</code> 映射的过滤器会执行——下面的运行结果能看到这一点。
+  </p>
+</div>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<p>
+  这一章原书没有对应的代码，我们分两步来写：先在内存里实现一个迷你 <code>RequestDispatcher</code>，
+  把包装器的原理看清楚（复用第 12 章的 <code>StandardContextMapper</code> 做映射）；
+  再用嵌入式 Tomcat 11 跑同样的场景，对照真实行为。
+</p>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch21/mini/</code><code>MiniApplicationContext.java</code><code>MiniRequestDispatcher.java</code><code>DispatchedRequest.java</code><code>IncludedResponse.java</code><code>DispatcherDemo.java</code><code>tomcat/EmbeddedDispatch.java</code></div>
+
+<h3>① forward：检查、清空、包装、调用、关闭</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch21/mini/MiniRequestDispatcher.java（节选）">
+<pre>
+@Override
+public void forward(ServletRequest req, ServletResponse resp) throws ServletException, IOException {
+    var request = (HttpServletRequest) req;
+    var response = (HttpServletResponse) resp;
+    if (response.isCommitted()) {
+        throw new IllegalStateException("响应已经提交，不能再 forward（Tomcat 抛同样的异常）");
+    }
+    response.resetBuffer();                           // 调用方之前写进缓冲区的内容全部作废
+
+    var wrapped = new DispatchedRequest(request, DispatcherType.FORWARD,
+            requestURI, servletPath, pathInfo, queryString);
+    // 嵌套 forward 时保留最初的值：属性描述的是「客户端原本请求的是什么」
+    if (request.getAttribute(FORWARD_REQUEST_URI) == null) {
+        wrapped.special(FORWARD_REQUEST_URI, request.getRequestURI());
+        wrapped.special(FORWARD_SERVLET_PATH, request.getServletPath());
+        wrapped.special(FORWARD_QUERY_STRING, request.getQueryString());
+        // …context_path、path_info 同理
+    }
+    servlet.service(wrapped, response);
+    // forward 返回时响应就结束了：调用方之后再写的内容都会被丢弃
+    ...
+}
+</pre>
+</div>
+
+<h3>② 包装器：只覆盖路径和参数</h3>
+
+<p>
+  <code>HttpServletRequestWrapper</code> 是规范自带的装饰器基类，所有方法默认委托给被包装的请求。
+  我们只覆盖需要「换答案」的几个方法；<code>setAttribute</code> 没覆盖，自然穿透到原请求。
+</p>
+
+<div class="code" data-lang="java" data-file="java17/.../ch21/mini/DispatchedRequest.java（节选）">
+<pre>
+final class DispatchedRequest extends HttpServletRequestWrapper {
+
+    private final Map&lt;String, Object&gt; special = new HashMap&lt;&gt;();   // forward.* / include.* 属性
+    private Map&lt;String, String[]&gt; params;
+
+    @Override public DispatcherType getDispatcherType() { return type; }
+    @Override public String getRequestURI() { return requestURI; }
+    @Override public String getServletPath() { return servletPath; }
+    @Override public String getParameter(String name) {
+        String[] v = params.get(name);
+        return v == null ? null : v[0];
+    }
+
+    void mergeQuery(String query) {                    // 分派路径上的参数优先
+        var merged = new LinkedHashMap&lt;String, String[]&gt;(QueryString.parse(query));
+        getRequest().getParameterMap().forEach(merged::putIfAbsent);
+        params = Collections.unmodifiableMap(merged);
+    }
+
+    @Override public Object getAttribute(String name) {
+        Object v = special.get(name);
+        return v != null ? v : super.getAttribute(name);
+    }
+}
+</pre>
+</div>
+
+<h3>③ include 的响应包装：空方法就是全部实现</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch21/mini/IncludedResponse.java（节选）">
+<pre>
+final class IncludedResponse extends HttpServletResponseWrapper {
+    @Override public void setStatus(int sc) { }
+    @Override public void setHeader(String name, String value) { }
+    @Override public void addHeader(String name, String value) { }
+    @Override public void setContentType(String type) { }
+    @Override public void sendError(int sc) { }
+    // …其余改元数据的方法同样是空实现；getWriter() 没覆盖，原样委托
+}
+</pre>
+</div>
+
+<h3>④ 嵌入式 Tomcat 11：同样的场景</h3>
+
+<p>
+  真实版本不写 web.xml，而是在 <code>ServletContainerInitializer</code> 里编程式注册 Servlet 和过滤器
+  （第 25 章会细讲这套机制）。注意过滤器映射的第一个参数就是 <code>DispatcherType</code> 集合：
+</p>
+
+<div class="code" data-lang="java" data-file="java17/.../ch21/tomcat/EmbeddedDispatch.java（节选）">
+<pre>
+Context ctx = tomcat.addContext("/app", docBase);
+ctx.addParameter("site.name", "Tomcat 教程商店");            // 相当于 &lt;context-param&gt;
+ctx.addServletContainerInitializer((classes, sc) -&gt; register(sc), null);
+
+// register(sc) 里：
+sc.addServlet("front", new HttpServlet() {
+    @Override protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+            throws ServletException, IOException {
+        ((AtomicLong) getServletContext().getAttribute("visits")).incrementAndGet();
+        req.setAttribute("product", "商品 #" + req.getPathInfo().substring(1));
+        req.getRequestDispatcher("/WEB-INF/views/product?lang=zh").forward(req, resp);
+    }
+}).addMapping("/products/*");
+
+sc.addFilter("onRequest", onRequest)
+  .addMappingForUrlPatterns(EnumSet.of(DispatcherType.REQUEST), false, "/*");
+sc.addFilter("onDispatch", onDispatch)
+  .addMappingForUrlPatterns(EnumSet.of(DispatcherType.FORWARD, DispatcherType.INCLUDE), false, "/*");
+</pre>
+</div>
+
+<div class="box warn">
+  <div class="t">&#9888;&#65039; 分派路径是 URI，要先编码</div>
+  <p>
+    第一版代码写的是 <code>getRequestDispatcher("/fragments/header?title=首页")</code>，结果 500：
+    <code>UnmappableCharacterException</code>。Tomcat 把分派路径里的查询串当作 URI 处理，非 ASCII 字符必须先
+    <code>URLEncoder.encode("首页", UTF_8)</code>。我们的迷你版不做解码所以没暴露这个问题——这也说明，
+    「自己写一个简化版」之后，一定要和真实实现对照着跑一遍。
+  </p>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch21.mini.DispatcherDemo
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+GET /shop/products/42?sort=price  →  HTTP 200 {} Content-Type=text/html
+  │ &lt;h1&gt;商品 #42&lt;/h1&gt;
+  │   dispatcherType = FORWARD
+  │   requestURI     = /shop/WEB-INF/views/product.view
+  │   servletPath    = /WEB-INF/views/product.view  pathInfo = null
+  │   lang 参数      = zh（来自分派路径的查询串）
+  │   属性           = {forward.request_uri=/shop/products/42, forward.servlet_path=/products, forward.query_string=sort=price}
+
+GET /shop/page  →  HTTP 200 {} Content-Type=text/html
+  │   &lt;fragment&gt; type=INCLUDE requestURI=/shop/page title=首页 属性={include.request_uri=/shop/fragments/header, include.servlet_path=/fragments, include.query_string=title=首页}
+  │ &lt;main&gt;正文：迷你商店&lt;/main&gt;
+  │   &lt;fragment&gt; type=INCLUDE requestURI=/shop/page title=null 属性={}
+
+GET /shop/late  →  HTTP 200 {}
+  │ 先输出一部分
+  │ forward 失败：响应已经提交，不能再 forward（Tomcat 抛同样的异常）
+
+GET /shop/WEB-INF/views/product.view  →  HTTP 404 {}
+
+应用级属性 visits = 1
+</pre>
+</div>
+
+<p>
+  逐条对照前面的表格：forward 前写的「这行会被 forward 清掉」和之后写的内容都没有出现；
+  片段把状态码设成 500、加了 <code>X-From-Fragment</code> 头，响应仍然是 200 且没有这个头；
+  按名字 include 的片段拿不到 <code>title</code> 参数，也没有 include 属性。再跑真实 Tomcat：
+</p>
+
+<div class="code" data-lang="bash">
+<pre>
+./run.sh ch21.tomcat.EmbeddedDispatch
+curl -i 'http://localhost:8080/app/products/42?sort=price'
+curl -i http://localhost:8080/app/page
+curl -i http://localhost:8080/app/old                       # 302 + Location
+curl -i http://localhost:8080/app/WEB-INF/views/product     # 404：客户端不能直接访问 WEB-INF
+curl http://localhost:8080/app/stats
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+商品 #42
+dispatcherType = FORWARD
+requestURI     = /app/WEB-INF/views/product
+servletPath    = /WEB-INF/views
+lang           = zh
+forward.request_uri  = /app/products/42
+forward.query_string = sort=price
+mapping        = PATH，原始 = MappingImpl[matchValue=42, pattern=/products/*, mappingType=PATH, servletName=front]
+
+HTTP/1.1 200
+Content-Type: text/plain;charset=UTF-8
+Transfer-Encoding: chunked
+
+[片段] type=INCLUDE requestURI=/app/page include.request_uri=/app/fragments/header title=首页
+== 正文：Tomcat 教程商店 ==
+[片段] type=INCLUDE requestURI=/app/page include.request_uri=null title=null
+</pre>
+</div>
+
+<p>服务器控制台里的过滤器日志：</p>
+
+<div class="code" data-lang="out">
+<pre>
+[REQUEST 过滤器]      /app/page
+[FORWARD/INCLUDE 过滤器] INCLUDE /app/page       ← 只有按路径的那次 include；按名字的那次没有
+[REQUEST 过滤器]      /app/products/42
+[FORWARD/INCLUDE 过滤器] FORWARD /app/WEB-INF/views/product
+</pre>
+</div>
+
+<p>
+  Tomcat 的 <code>servletPath</code> 是 <code>/WEB-INF/views</code>（前缀映射），我们的迷你版用的是扩展名映射 <code>*.view</code>，
+  所以 servletPath 是整个路径——两者都符合第 12 章讲的规则。Servlet 4.0 起还多了一个
+  <code>FORWARD_MAPPING</code> 属性，用 <code>HttpServletMapping</code> 对象描述原始请求是按哪条规则匹配的。
+</p>
+
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>包装而不是复制</div>
+  <p>分派时在原请求外面套一层 <code>ApplicationHttpRequest</code>，只改写路径和参数相关的方法，其余调用穿透。</p>
+  <dl>
+    <dt>取舍</dt><dd>属性天然共享、几乎没有拷贝成本；代价是层层包装后调试时要一层层 <code>getRequest()</code> 拆开看，<code>instanceof</code> 判断也会失效。</dd>
+    <dt>替代方案</dt><dd>复制一份请求对象（属性要同步回去，容易出错）。</dd>
+    <dt>还能用在</dt><dd>中间件需要「临时改写」上下文时（路由前缀剥离、租户切换），用装饰器包一层，退出时丢掉即可。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch31.html">第 31 章 · 设计模式实战</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>按生命周期划分作用域</div>
+  <p>request / session / application 三种作用域用同一套 API，只在存活时间和可见范围上不同。</p>
+  <dl>
+    <dt>取舍</dt><dd>API 统一好学；但放错作用域不会报错，只会在并发或多用户时出 bug。</dd>
+    <dt>还能用在</dt><dd>依赖注入容器的 scope（Spring 的 request / session / singleton）、任务框架的 job / step 上下文：先问「它应该活多久、谁能看到」。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>元数据由调用方决定</div>
+  <p>被 include 的片段只能写内容，状态码和响应头的修改被静默忽略。</p>
+  <dl>
+    <dt>取舍</dt><dd>局部错误不会破坏整体响应；代价是「静默忽略」让片段作者很难发现自己的设置没生效。</dd>
+    <dt>替代方案</dt><dd>抛异常（更显眼，但一个片段的小问题会导致整页失败）。</dd>
+    <dt>还能用在</dt><dd>组合式渲染（模板片段、微前端）、插件往宿主输出内容时：给插件一个受限的视图，只开放它该动的部分。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch30.html">第 30 章 · 扩展点设计</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">4</span>服务端分派与客户端重定向各有其位</div>
+  <p>forward 适合「同一个请求的不同处理阶段」，redirect 适合「这个请求已经结束，请去另一个地方」。</p>
+  <dl>
+    <dt>取舍</dt><dd>forward 少一次往返，但刷新页面会重复提交表单；redirect 多一次往返，但地址栏和浏览器历史是正确的。</dd>
+    <dt>还能用在</dt><dd>Post/Redirect/Get 模式；API 网关里「内部转发」与「返回 3xx 让客户端跳转」的选择。</dd>
+  </dl>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>每个 Web 应用一个 <code>ServletContext</code>，Tomcat 里是 <code>ApplicationContext</code>，交给 Servlet 的是它的外观。</li>
+  <li>三种作用域的区别是生命周期和可见范围；应用属性会被并发访问，值本身要线程安全。</li>
+  <li>forward 和 include 不产生新的 HTTP 请求，而是用 <code>ApplicationHttpRequest</code> 包装原请求再调用目标 Servlet。</li>
+  <li>forward 会清空缓冲区并在返回后关闭响应，已提交时抛 <code>IllegalStateException</code>；include 不能修改状态码和响应头。</li>
+  <li>原始路径（forward）或目标路径（include）保存在 <code>jakarta.servlet.forward.*</code> / <code>include.*</code> 属性里。</li>
+  <li>过滤器默认只拦截 REQUEST；分派时是否执行取决于映射声明的 <code>DispatcherType</code>。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>在迷你版里实现嵌套 forward：A forward 到 B，B 再 forward 到 C。确认 C 看到的 <code>forward.request_uri</code> 仍然是 A 的路径。</li>
+    <li>给 <code>MiniApplicationContext</code> 增加 <code>getRequestDispatcher</code> 的相对路径版本：<code>"detail"</code> 相对于当前请求的 servletPath 解析。</li>
+    <li>在 Tomcat 版里给 <code>onDispatch</code> 过滤器改成按 <code>servlet-name</code> 映射（<code>addMappingForServletNames</code>），观察按名字 include 时它是否会执行。</li>
+    <li>写一个表单：POST 之后分别用 forward 和 redirect 跳到结果页，然后在浏览器里按 F5，比较两者的区别。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

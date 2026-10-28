@@ -45,6 +45,8 @@ curl http://localhost:8080/SHUTDOWN       # 第 1 章的服务器靠这个 URL �
 | 18 | 部署器 | `ch18.startup.Bootstrap` `ch18.tomcat.EmbeddedHostConfig` |
 | 19 | Manager Servlet | `ch19.startup.Bootstrap` `ch19.tomcat.EmbeddedManager` |
 | 20 | JMX | `ch20.standardmbeantest.StandardAgent` `ch20.modelmbeantest1.ModelAgent` `ch20.modelmbeantest2.ModelAgent` `ch20.startup.MiniJmxServer` `ch20.tomcat.EmbeddedJmx` |
+| 21 | ServletContext、RequestDispatcher | `ch21.mini.DispatcherDemo` `ch21.tomcat.EmbeddedDispatch` |
+| 22 | 静态资源、错误页、字符编码 | `ch22.tomcat.EmbeddedStatic`（含 `ch22.mini.MiniDefaultServlet`） |
 
 ## 目录结构
 
