@@ -1,0 +1,486 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 28 章 · 运维：调优、监控与加固 — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="28">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 28 章 · 补充篇</span>
+<h1>运维：调优、监控与加固</h1>
+<p class="lede">
+  前面 27 章讲 Tomcat 怎么工作，这一章讲怎么让它在生产环境里好好工作。内容分四块：线程和 JVM 参数怎么定，
+  出了问题看哪些指标，重载为什么会泄漏内存，以及上线前的安全清单。每一块都对应前面的某几章——运维的知识，
+  本质上是把原理换成了「旋钮」和「仪表盘」。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>会用利特尔法则估算线程数，知道哪些连接器参数必须显式设置</li>
+    <li>知道「四个黄金信号」分别对应 Tomcat 的哪些 MBean 属性，能把它们导出给 Prometheus</li>
+    <li>理解类加载器泄漏的引用链，认识 Tomcat 的泄漏检测和防护机制</li>
+    <li>能对照清单完成一次 Tomcat 安全加固</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="tuning">调优：线程数从哪里来</h2>
+
+<p>
+  <code>maxThreads</code> 设多少？拍脑袋的答案是 200（默认值），算出来的答案来自<strong>利特尔法则</strong>：
+  系统中同时在处理的请求数 = 到达速率 × 每个请求的停留时间。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="利特尔法则：并发数等于吞吐量乘以响应时间，以及请求在 Tomcat 中各阶段的排队位置">
+  <rect class="bx-a" x="20" y="20" width="720" height="60" rx="12"/>
+  <text class="ttl on-a" x="380" y="46" text-anchor="middle">并发数 L = 吞吐量 λ × 响应时间 W</text>
+  <text class="sm" x="380" y="66" text-anchor="middle">例：目标 500 请求/秒，平均 80 ms → 同时在处理的请求 ≈ 500 × 0.08 = 40 个；按峰值和长尾留余量，maxThreads 取 80～100</text>
+  <rect class="bx-p" x="20" y="110" width="150" height="56" rx="10"/>
+  <text class="ttl on-p" x="95" y="134" text-anchor="middle">backlog</text>
+  <text class="mono sm" x="95" y="154" text-anchor="middle">acceptCount</text>
+  <path class="ln" d="M172 138 H196" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="200" y="110" width="150" height="56" rx="10"/>
+  <text class="ttl on-a" x="275" y="134" text-anchor="middle">连接</text>
+  <text class="mono sm" x="275" y="154" text-anchor="middle">maxConnections</text>
+  <path class="ln" d="M352 138 H376" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="380" y="110" width="150" height="56" rx="10"/>
+  <text class="ttl on-b" x="455" y="134" text-anchor="middle">线程池</text>
+  <text class="mono sm" x="455" y="154" text-anchor="middle">maxThreads</text>
+  <path class="ln" d="M532 138 H556" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="560" y="110" width="180" height="56" rx="10"/>
+  <text class="ttl on-g" x="650" y="134" text-anchor="middle">下游</text>
+  <text class="sm" x="650" y="154" text-anchor="middle">数据库连接池、HTTP 客户端</text>
+  <text class="sm" x="380" y="196" text-anchor="middle">线程数受下游约束：数据库连接池只有 20 个时，200 个线程里 180 个在等连接，只是把排队从门口挪到了里面</text>
+  <text class="sm" x="380" y="218" text-anchor="middle">CPU 密集的接口：线程数 ≈ CPU 核数；IO 密集：≈ 核数 × (1 + 等待时间 / 计算时间)</text>
+</svg>
+<figcaption>图 28-1　线程数由吞吐目标、响应时间和下游容量共同决定（第 23 章的三个上限）</figcaption>
+</figure>
+
+<p>除了线程数，以下参数都应该<strong>显式</strong>写在配置里，哪怕取值和默认值一样——它本身就是一份文档：</p>
+
+<div class="tw">
+<table>
+  <tr><th>参数</th><th>Tomcat 11 默认</th><th>建议</th><th>原理在哪一章</th></tr>
+  <tr><td><code>maxThreads</code> / <code>minSpareThreads</code></td><td>200 / 10</td><td>按上图估算；虚拟线程模式下不再适用</td><td>第 23、27 章</td></tr>
+  <tr><td><code>acceptCount</code> / <code>maxConnections</code></td><td>100 / 8192</td><td>前面有负载均衡器时可以调小，让过载更早暴露</td><td>第 23 章</td></tr>
+  <tr><td><code>connectionTimeout</code></td><td>60000 ms</td><td>10～20 秒，防慢速攻击</td><td>第 23 章</td></tr>
+  <tr><td><code>keepAliveTimeout</code></td><td>同 connectionTimeout</td><td>大于负载均衡器的空闲超时，否则会出现偶发的 502</td><td>第 4、23 章</td></tr>
+  <tr><td><code>maxHttpHeaderSize</code></td><td>8 KB</td><td>按需调整，不要随意放大</td><td>第 3 章</td></tr>
+  <tr><td><code>maxPostSize</code> / <code>maxParameterCount</code></td><td>2 MB / 1000</td><td>限制表单大小和参数个数，防资源耗尽</td><td>第 3、22 章</td></tr>
+</table>
+</div>
+
+<h3>JVM 参数</h3>
+
+<ul>
+  <li><strong>堆</strong>：容器环境用 <code>-XX:MaxRAMPercentage=75</code> 代替固定的 <code>-Xmx</code>，让堆随容器内存限制变化。</li>
+  <li><strong>GC</strong>：JDK 17/21 默认的 G1 适合大多数场景；对延迟敏感的服务可以试 ZGC（JDK 21 起有分代 ZGC，<code>-XX:+UseZGC -XX:+ZGenerational</code>，JDK 23 起分代成为默认）。</li>
+  <li><strong>出事时留证据</strong>：<code>-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=…</code>，以及 <code>-Xlog:gc*:file=gc.log</code>。</li>
+  <li><strong>JPMS 开放</strong>：Tomcat 的 <code>catalina.sh</code> 默认加了若干 <code>--add-opens</code>，泄漏检测依赖它们（后面会看到）。嵌入式部署要自己加。</li>
+</ul>
+
+<h2 id="monitoring">监控：四个黄金信号</h2>
+
+<p>
+  Google SRE 的「四个黄金信号」——延迟、流量、错误、饱和度——在 Tomcat 里都有现成的数据源，它们就是第 20 章的 MBean：
+</p>
+
+<div class="tw">
+<table>
+  <tr><th>信号</th><th>MBean</th><th>属性</th><th>怎么看</th></tr>
+  <tr><td>流量</td><td><code>type=GlobalRequestProcessor</code></td><td><code>requestCount</code>、<code>bytesSent</code></td><td>计数器，取变化率得到每秒请求数</td></tr>
+  <tr><td>错误</td><td>同上</td><td><code>errorCount</code></td><td>状态码 ≥ 400 的请求数；和流量相除得到错误率</td></tr>
+  <tr><td>延迟</td><td>同上</td><td><code>processingTime</code>、<code>maxTime</code></td><td>累计时间 / 请求数 = 平均值；分位数要靠访问日志或 Micrometer 的直方图</td></tr>
+  <tr><td>饱和度</td><td><code>type=ThreadPool</code></td><td><code>currentThreadsBusy</code> / <code>maxThreads</code>、<code>connectionCount</code></td><td>忙碌线程持续接近上限 = 该扩容或该查慢请求了</td></tr>
+  <tr><td>（应用）</td><td><code>type=Manager</code></td><td><code>activeSessions</code>、<code>rejectedSessions</code></td><td>会话数异常增长常常是内存问题的前兆</td></tr>
+</table>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="Tomcat 的 MBean 经 /metrics 端点被 Prometheus 抓取，再用于看板和告警">
+  <rect class="bx-a" x="20" y="50" width="170" height="90" rx="12"/>
+  <text class="ttl on-a" x="105" y="76" text-anchor="middle">Tomcat MBean</text>
+  <text class="mono sm" x="105" y="98" text-anchor="middle">ThreadPool</text>
+  <text class="mono sm" x="105" y="114" text-anchor="middle">GlobalRequestProcessor</text>
+  <text class="mono sm" x="105" y="130" text-anchor="middle">Manager</text>
+  <path class="ln" d="M192 95 H226" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="230" y="50" width="170" height="90" rx="12"/>
+  <text class="ttl on-b" x="315" y="76" text-anchor="middle">/admin/metrics</text>
+  <text class="sm" x="315" y="98" text-anchor="middle">本章的 MetricsServlet</text>
+  <text class="sm" x="315" y="116" text-anchor="middle">（生产中用 Micrometer /</text>
+  <text class="sm" x="315" y="132" text-anchor="middle">JMX Exporter）</text>
+  <path class="ln" d="M402 95 H436" marker-end="url(#ar)"/>
+  <text class="sm" x="419" y="86" text-anchor="middle">抓取</text>
+  <rect class="bx-p" x="440" y="50" width="130" height="90" rx="12"/>
+  <text class="ttl on-p" x="505" y="90" text-anchor="middle">Prometheus</text>
+  <text class="sm" x="505" y="110" text-anchor="middle">时序存储</text>
+  <path class="ln" d="M572 80 H606" marker-end="url(#ar)"/>
+  <path class="ln" d="M572 112 H606" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="610" y="50" width="130" height="40" rx="10"/><text class="sm" x="675" y="75" text-anchor="middle">Grafana 看板</text>
+  <rect class="bx-r" x="610" y="100" width="130" height="40" rx="10"/><text class="sm" x="675" y="125" text-anchor="middle">告警规则</text>
+  <text class="sm" x="380" y="176" text-anchor="middle">另外两类证据：访问日志（每个请求的耗时）和线程转储（jcmd &lt;pid&gt; Thread.print，看卡在哪一层）</text>
+</svg>
+<figcaption>图 28-2　监控数据早就在 MBean 里，导出只是换一种取法</figcaption>
+</figure>
+
+<div class="box tip">
+  <div class="t">&#9989; 「服务器卡住了」先打线程转储</div>
+  <p>
+    所有工作线程都忙、请求排队时，连打三次线程转储（间隔几秒），看这些 <code>http-nio-…-exec-*</code> 线程停在哪里。
+    对照第 23 章那张调用栈：停在 <code>SocketInputStream.read</code> / JDBC 驱动里说明在等下游，停在 <code>synchronized</code> 上说明有锁竞争，
+    停在业务代码的循环里说明是 CPU 问题。
+  </p>
+</div>
+
+<h2 id="leaks">重载与内存泄漏</h2>
+
+<p>
+  第 8 章的热重载原理很漂亮：丢掉旧的类加载器，新建一个，旧的类连同静态字段一起被 GC 回收。
+  但只要有<strong>任何一个</strong>活得比应用久的对象还引用着旧类加载器加载的任何一个对象，整个类加载器——
+  以及它加载的所有类、所有静态字段——都回收不了。重载几次之后，Metaspace 和堆就被撑爆了。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="线程池线程的 ThreadLocal 值引用应用类，应用类引用类加载器，导致整个类加载器无法回收">
+  <rect class="bx" x="20" y="30" width="200" height="60" rx="10"/>
+  <text class="ttl" x="120" y="54" text-anchor="middle">容器线程 exec-3</text>
+  <text class="sm" x="120" y="74" text-anchor="middle">属于连接器，比应用活得久</text>
+  <path class="ln-r" d="M222 60 H276" marker-end="url(#ar-r)"/>
+  <text class="sm" x="249" y="22" text-anchor="middle">threadLocals</text>
+  <rect class="bx-r" x="280" y="30" width="200" height="60" rx="10"/>
+  <text class="ttl on-r" x="380" y="54" text-anchor="middle">Entry.value</text>
+  <text class="sm" x="380" y="74" text-anchor="middle">Buffer 对象（强引用）</text>
+  <path class="ln-r" d="M482 60 H536" marker-end="url(#ar-r)"/>
+  <text class="sm" x="509" y="22" text-anchor="middle">getClass()</text>
+  <rect class="bx-r" x="540" y="30" width="200" height="60" rx="10"/>
+  <text class="ttl on-r" x="640" y="54" text-anchor="middle">Buffer.class</text>
+  <text class="sm" x="640" y="74" text-anchor="middle">由应用的类加载器加载</text>
+  <path class="ln-r" d="M640 92 V126" marker-end="url(#ar-r)"/>
+  <rect class="bx-r" x="380" y="130" width="360" height="70" rx="12"/>
+  <text class="ttl on-r" x="560" y="156" text-anchor="middle">旧的 WebappClassLoader</text>
+  <text class="sm" x="560" y="178" text-anchor="middle">→ 它加载的所有类、所有静态字段、所有缓存</text>
+  <text class="sm" x="560" y="194" text-anchor="middle">一个都回收不了</text>
+  <rect class="bx-d" x="20" y="130" width="330" height="70" rx="12"/>
+  <text class="sm" x="185" y="154" text-anchor="middle">ThreadLocal 的键是弱引用，值却是强引用；</text>
+  <text class="sm" x="185" y="172" text-anchor="middle">而键（静态字段）又被值所属的类间接引用着，</text>
+  <text class="sm" x="185" y="190" text-anchor="middle">形成一个从线程出发、GC 无法打破的链</text>
+  <text class="sm" x="380" y="240" text-anchor="middle">同样的链还可以从：应用自己启动的线程、注册到 DriverManager 的 JDBC 驱动、关闭钩子、JMX 注册、父加载器里的静态缓存出发</text>
+</svg>
+<figcaption>图 28-3　一条引用链钉住整个应用</figcaption>
+</figure>
+
+<div class="tw">
+<table>
+  <tr><th>泄漏来源</th><th>Tomcat 的检测 / 防护</th><th>应用该怎么做</th></tr>
+  <tr><td>ThreadLocal 留在容器线程上</td><td>停止时扫描所有线程并报 SEVERE；<code>ThreadLocalLeakPreventionListener</code> 逐步替换线程池里的线程</td><td>用完 <code>remove()</code>，或者在过滤器的 finally 里清理</td></tr>
+  <tr><td>应用启动的线程没停</td><td>报 WARNING（<code>clearReferencesStopThreads</code> 可以强行停止，有风险）</td><td>在 <code>ServletContextListener.contextDestroyed</code> 里停掉自己的线程池</td></tr>
+  <tr><td>JDBC 驱动注册在 <code>DriverManager</code> 里</td><td>停止时自动注销并警告</td><td>驱动放在 Tomcat 的 lib 而不是 WEB-INF/lib</td></tr>
+  <tr><td>JDK 内部的单例抓住了上下文类加载器</td><td><code>JreMemoryLeakPreventionListener</code> 在启动时用系统类加载器预先触发这些单例</td><td>—</td></tr>
+  <tr><td>RMI、Timer、关闭钩子、MBean</td><td>部分检测</td><td>在 <code>contextDestroyed</code> 里对称地注销</td></tr>
+</table>
+</div>
+
+<div class="box key">
+  <div class="t">&#128273; 最好的防护：生产环境不做热重载</div>
+  <p>
+    泄漏检测能发现问题，但不能保证清理干净。今天更常见的做法是不可变部署：每次发布启动一个新进程（新容器），
+    流量切过去之后直接结束旧进程。进程退出，所有内存自然归还操作系统。热重载留给开发环境。
+  </p>
+</div>
+
+<h2 id="hardening">安全加固清单</h2>
+
+<div class="tw">
+<table>
+  <tr><th>项目</th><th>做法</th><th>为什么</th></tr>
+  <tr><td>默认应用</td><td>删除 <code>webapps/</code> 下的 docs、examples、ROOT；manager / host-manager 不用就删</td><td>示例应用有过多次漏洞；Manager 是高价值攻击目标（第 19 章）</td></tr>
+  <tr><td>管理入口</td><td>用 <code>RemoteAddrValve</code> / <code>RemoteCIDRValve</code> 限制来源，配合强密码和 <code>LockOutRealm</code></td><td>防暴力破解和远程部署恶意 WAR</td></tr>
+  <tr><td>关闭端口</td><td><code>&lt;Server port="-1"&gt;</code>，用信号停止（第 14、16 章）</td><td>8005 端口知道口令就能关掉服务器</td></tr>
+  <tr><td>错误页</td><td><code>ErrorReportValve showReport="false" showServerInfo="false"</code></td><td>堆栈和版本号是攻击者的情报（第 22 章）</td></tr>
+  <tr><td>AJP</td><td>不用就不要开；要用就设置 <code>secretRequired</code> 并只监听内网地址</td><td>2020 年的 Ghostcat（CVE-2020-1938）就是通过默认开放的 AJP 读取任意文件</td></tr>
+  <tr><td>DefaultServlet</td><td>保持 <code>listings=false</code>、<code>readonly=true</code>（都是默认值）</td><td>目录列表泄露文件结构；可写则能上传 WebShell</td></tr>
+  <tr><td>请求限制</td><td><code>maxHttpHeaderSize</code>、<code>maxPostSize</code>、<code>maxParameterCount</code>、<code>connectionTimeout</code></td><td>防资源耗尽和慢速攻击（第 23 章）</td></tr>
+  <tr><td>Cookie</td><td>会话 Cookie 加 <code>Secure</code>；用 <code>CookieProcessor</code> 的 <code>sameSiteCookies</code> 设置 SameSite</td><td>HttpOnly 默认已开；Secure 和 SameSite 要自己配</td></tr>
+  <tr><td>运行身份</td><td>非 root 用户运行；对外 80/443 交给负载均衡器</td><td>被攻破时限制损失</td></tr>
+  <tr><td>及时升级</td><td>关注 Tomcat 安全公告，跟随小版本升级</td><td>大部分漏洞修复只在小版本里</td></tr>
+</table>
+</div>
+
+<h3>优雅停机</h3>
+
+<p>
+  发布时直接 <code>kill -9</code> 会让正在处理的请求失败。优雅的顺序是：先让负载均衡器摘除节点（就绪探针返回失败），
+  然后停止接收新连接，等在途请求处理完（有超时），最后关闭。Tomcat 的 <code>Service</code> 有 <code>gracefulStopAwaitMillis</code> 属性控制等待时间；
+  Spring Boot 对应 <code>server.shutdown=graceful</code>。这正是第 11 章 <code>unload()</code> 等待 <code>countAllocated</code> 归零、第 16 章关闭钩子调用 <code>stop()</code> 的组合。
+</p>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch28/tomcat/EmbeddedOps.java</code><code>tomcat/MetricsServlet.java</code><code>leak/ClassLoaderLeakDemo.java</code><code>leak/LeakyPlugin.java</code><code>leak/EmbeddedLeakDetection.java</code><code>leak/LeakyServlet.java</code></div>
+
+<h3>① 把清单写成代码</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch28/tomcat/EmbeddedOps.java（节选）">
+<pre>
+Connector c = tomcat.getConnector();
+c.setProperty("maxThreads", "50");
+c.setProperty("acceptCount", "100");
+c.setProperty("maxConnections", "2000");
+c.setProperty("connectionTimeout", "10000");      // 防慢速攻击：10 秒内必须发完请求行
+c.setProperty("keepAliveTimeout", "15000");
+c.setProperty("maxParameterCount", "1000");
+
+// 访问日志。注意 Tomcat 10 起 %D 的单位是微秒（和 httpd 一致），毫秒要写 %{ms}T
+var access = new AccessLogValve();
+access.setPattern("%h %t \"%r\" %s %b %{ms}Tms \"%{User-Agent}i\"");
+host.getPipeline().addValve(access);
+
+// 错误页：不泄露异常堆栈和版本号（StandardHost 发现已有这个阀，就不会再加默认的）
+var errorReport = new ErrorReportValve();
+errorReport.setShowReport(false);
+errorReport.setShowServerInfo(false);
+host.getPipeline().addValve(errorReport);
+
+// 管理端点单独一个 Context，只允许指定来源
+var ipFilter = new RemoteAddrValve();
+ipFilter.setAllow(adminAllow);                     // 默认 "127\\.0\\.0\\.1|0:0:0:0:0:0:0:1"
+admin.getPipeline().addValve(ipFilter);
+</pre>
+</div>
+
+<div class="box warn">
+  <div class="t">&#9888;&#65039; 一个单位的坑</div>
+  <p>
+    第一版用的是很多老教程里的 <code>%Dms</code>，结果一个睡了 300 ms 的请求在日志里显示 <code>308683ms</code>。
+    Tomcat 10 把 <code>%D</code> 改成了微秒，与 Apache httpd 保持一致；毫秒用 <code>%{ms}T</code>。升级大版本时，日志解析和告警规则都要跟着检查。
+  </p>
+</div>
+
+<h3>② 从 MBean 到 Prometheus</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch28/tomcat/MetricsServlet.java（节选）">
+<pre>
+MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+for (ObjectName on : mbs.queryNames(new ObjectName(domain + ":type=ThreadPool,*"), null)) {
+    String label = "{connector=" + on.getKeyProperty("name") + "}";   // name 本身带引号
+    gauge(out, "tomcat_threads_busy", label, mbs.getAttribute(on, "currentThreadsBusy"));
+    gauge(out, "tomcat_threads_max", label, mbs.getAttribute(on, "maxThreads"));
+}
+for (ObjectName on : mbs.queryNames(new ObjectName(domain + ":type=GlobalRequestProcessor,*"), null)) {
+    counter(out, "tomcat_requests_total", label, mbs.getAttribute(on, "requestCount"));
+    counter(out, "tomcat_errors_total", label, mbs.getAttribute(on, "errorCount"));
+    counter(out, "tomcat_processing_time_ms_total", label, mbs.getAttribute(on, "processingTime"));
+}
+</pre>
+</div>
+
+<h3>③ 复现类加载器泄漏</h3>
+
+<p>
+  <code>ClassLoaderLeakDemo</code> 用一个父加载器为 platform 类加载器的 <code>URLClassLoader</code> 加载插件（看不到应用类路径，像 WebappClassLoader 一样独立），
+  在一个「容器线程」上调用插件，让它往 ThreadLocal 里放一个 10 MB 的对象，然后丢掉类加载器、触发 GC，用 <code>WeakReference</code> 判断它是否被回收：
+</p>
+
+<div class="code" data-lang="java" data-file="java17/.../ch28/leak/（节选）">
+<pre>
+public class LeakyPlugin implements Consumer&lt;String&gt; {
+    private static final ThreadLocal&lt;Payload&gt; CACHE = new ThreadLocal&lt;&gt;();
+    @Override public void accept(String command) {
+        switch (command) {
+            case "start" -&gt; CACHE.set(new Payload());
+            case "stop" -&gt; CACHE.remove();
+        }
+    }
+    static final class Payload { final byte[] data = new byte[10 * 1024 * 1024]; }
+}
+
+// ClassLoaderLeakDemo
+var loader = new URLClassLoader(new URL[] {dir.toUri().toURL()}, ClassLoader.getPlatformClassLoader());
+var plugin = (Consumer&lt;String&gt;) loader.loadClass("modern.ch28.leak.LeakyPlugin").getConstructor().newInstance();
+threads.submit(() -&gt; plugin.accept("start")).get();                    // 请求在容器线程上执行
+if (cleanUp) threads.submit(() -&gt; plugin.accept("stop")).get();        // 应用停止时清理
+loader.close();
+return new WeakReference&lt;&gt;(loader);                                    // 之后只剩弱引用
+</pre>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch28.tomcat.EmbeddedOps                       # /admin 只允许本机
+./run.sh ch28.tomcat.EmbeddedOps 8081 '10\..*'         # /admin 只允许 10.x 网段（本机会被拒绝）
+curl -i http://localhost:8080/boom
+curl http://localhost:8080/admin/metrics
+curl -o /dev/null -w '%{http_code}\n' http://localhost:8081/admin/metrics
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+HTTP/1.1 500
+&lt;!doctype html&gt;…&lt;h1&gt;HTTP Status 500 – Internal Server Error&lt;/h1&gt;&lt;/body&gt;&lt;/html&gt;
+                          ← 没有异常信息「数据库密码是 hunter2」，也没有 Tomcat 版本号；它们只出现在服务器日志里
+
+tomcat_threads_busy{connector="http-nio-127.0.0.1-8080"} 1
+tomcat_threads_current{connector="http-nio-127.0.0.1-8080"} 30
+tomcat_threads_max{connector="http-nio-127.0.0.1-8080"} 50
+tomcat_connections{connector="http-nio-127.0.0.1-8080"} 2
+tomcat_requests_total{connector="http-nio-127.0.0.1-8080"} 37
+tomcat_errors_total{connector="http-nio-127.0.0.1-8080"} 1
+tomcat_processing_time_ms_total{connector="http-nio-127.0.0.1-8080"} 9535
+tomcat_sent_bytes_total{connector="http-nio-127.0.0.1-8080"} 765
+tomcat_request_max_time_ms{connector="http-nio-127.0.0.1-8080"} 317
+tomcat_sessions_active{context="/admin"} 0
+tomcat_sessions_active{context="/"} 36
+jvm_heap_used_bytes 20943560
+jvm_heap_max_bytes 507510784
+jvm_threads_live 40
+
+403                       ← RemoteAddrValve 拒绝了不在白名单里的来源
+</pre>
+</div>
+
+<p>访问日志（<code>%{ms}T</code> 修正之后）：</p>
+
+<div class="code" data-lang="out">
+<pre>
+127.0.0.1 [28/Oct/2026:09:51:09 +0800] "GET / HTTP/1.1" 200 5 28ms "curl/8.5.0"
+127.0.0.1 [28/Oct/2026:09:51:09 +0800] "GET /slow HTTP/1.1" 200 9 301ms "curl/8.5.0"
+127.0.0.1 [28/Oct/2026:09:51:09 +0800] "GET /boom HTTP/1.1" 500 455 6ms "curl/8.5.0"
+</pre>
+</div>
+
+<p>然后是泄漏实验：</p>
+
+<div class="code" data-lang="bash">
+<pre>
+JAVA_OPTS=-Xmx256m ./run.sh ch28.leak.ClassLoaderLeakDemo
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+—— 停止时忘了清理 ——
+  第 1 次重载：旧类加载器仍在内存中（泄漏），堆已用 13 MB
+  第 2 次重载：旧类加载器仍在内存中（泄漏），堆已用 24 MB
+  第 3 次重载：旧类加载器仍在内存中（泄漏），堆已用 35 MB
+
+—— 停止时调用 stop（ThreadLocal.remove）——
+  第 1 次重载：旧类加载器已被回收，堆已用 35 MB
+  第 2 次重载：旧类加载器已被回收，堆已用 35 MB
+  第 3 次重载：旧类加载器已被回收，堆已用 36 MB
+</pre>
+</div>
+
+<p>
+  每次泄漏都多占 10 MB（那个 <code>Payload</code>）；第二组虽然堆没有降下来（第一组泄漏的 30 MB 还在，因为那个「容器线程」一直活着），但不再增长。
+  最后让真实的 Tomcat 来检测：
+</p>
+
+<div class="code" data-lang="bash">
+<pre>
+./run.sh ch28.leak.EmbeddedLeakDetection                    # 不加 --add-opens
+JAVA_OPTS="--add-opens=java.base/java.lang=ALL-UNNAMED" ./run.sh ch28.leak.EmbeddedLeakDetection
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+（不加 --add-opens）
+WARNING: The web application [leaky] appears to have started a thread named [leaky-background]
+         but has failed to stop it. This is very likely to create a memory leak.
+WARNING: You need to add "--add-opens=java.base/java.lang=ALL-UNNAMED" to the JVM command line arguments
+         to enable ThreadLocal memory leak detection. …
+
+（加了 --add-opens）
+WARNING: The web application [leaky] appears to have started a thread named [leaky-background] but has failed to stop it. …
+SEVERE: The web application [leaky] created a ThreadLocal with key of type [java.lang.ThreadLocal.SuppliedThreadLocal]
+        (value […]) and a value of type [modern.ch28.leak.LeakyServlet.Buffer] (value […])
+        but failed to remove it when the web application was stopped.
+        Threads are going to be renewed over time to try and avoid a probable memory leak.
+（三个容器线程各报一次）
+</pre>
+</div>
+
+<p>
+  两个细节：一是 ThreadLocal 检测要用反射读 <code>Thread</code> 的私有字段，Java 9+ 的模块封装要求显式 <code>--add-opens</code>——
+  catalina.sh 默认加了，嵌入式部署往往忘了。二是第一版 <code>LeakyServlet</code> 的 ThreadLocal 值是 <code>StringBuilder</code>，
+  Tomcat 一声不吭：JDK 的类不会钉住应用的类加载器，所以那根本不算泄漏。只有值的类型来自应用自己，才会形成图 28-3 那条链。
+</p>
+
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>可观测性从第一天就内建</div>
+  <p>Tomcat 的每个核心组件都把运行状态注册为 MBean（第 20 章），所以今天接 Prometheus 只需要一个翻译层。</p>
+  <dl>
+    <dt>取舍</dt><dd>组件要多维护一套计数器和描述符；回报是任何监控系统都能接入，而不用改核心代码。</dd>
+    <dt>还能用在</dt><dd>自研中间件、任务调度器：在核心对象里维护计数器并统一注册（Micrometer 的 <code>MeterRegistry</code>），而不是在出事后到处加日志。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>安全的默认值 + 显式的配置</div>
+  <p><code>listings=false</code>、<code>readonly=true</code>、HttpOnly 都是默认开启的；但错误页详情、关闭端口、AJP 的历史默认值曾经不安全。</p>
+  <dl>
+    <dt>取舍</dt><dd>默认安全会让「开箱即用」的体验差一点（例如看不到详细错误）；默认方便则把风险留给不看文档的用户。Tomcat 在 Ghostcat 之后把 AJP 改成了默认安全。</dd>
+    <dt>还能用在</dt><dd>任何对外暴露的组件：默认只监听本机、默认需要认证、默认关闭调试接口，需要时显式打开。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch30.html">第 30 章 · 扩展点设计</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>资源的获取和释放要对称</div>
+  <p>每一种泄漏都是「启动时注册了、停止时没注销」：ThreadLocal、线程、驱动、钩子、MBean。</p>
+  <dl>
+    <dt>取舍</dt><dd>要求每个组件都有明确的 stop 逻辑（第 6 章生命周期）；没有它，长期运行的进程只能靠重启来回收资源。</dd>
+    <dt>还能用在</dt><dd>插件系统、热加载的规则引擎、测试框架：用 try-with-resources 或生命周期回调成对地管理资源，并在测试里断言卸载后对象可被回收。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">4</span>检测不了就重来</div>
+  <p>泄漏检测只能尽力而为，所以现代部署倾向于用进程级的「整体替换」代替进程内的热重载。</p>
+  <dl>
+    <dt>取舍</dt><dd>重启比重载慢、需要多一份实例做滚动发布；换来的是确定性——进程退出后不会有任何残留。</dd>
+    <dt>还能用在</dt><dd>配置变更、依赖升级、长时间运行的批处理 worker 定期回收：与其修补状态，不如丢弃重建。</dd>
+  </dl>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>线程数用利特尔法则估算，并受下游容量约束；连接器的关键参数应显式配置。</li>
+  <li>四个黄金信号都能从 Tomcat 的 MBean 读到：<code>GlobalRequestProcessor</code> 给出流量、错误、延迟，<code>ThreadPool</code> 给出饱和度。</li>
+  <li>访问日志记录每个请求的耗时（Tomcat 10 起 <code>%D</code> 是微秒），线程转储用来定位卡顿。</li>
+  <li>重载泄漏的本质是一条从长寿对象指向旧类加载器的引用链；Tomcat 能检测 ThreadLocal 和线程泄漏，但需要 <code>--add-opens</code>。</li>
+  <li>加固：删除默认应用、限制管理入口、关闭关闭端口和 AJP、隐藏错误详情、限制请求大小、及时升级。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>给 <code>MetricsServlet</code> 增加一个请求耗时直方图：写一个过滤器记录每个请求的耗时，按 10/50/100/500/1000 ms 分桶，输出 Prometheus 的 <code>_bucket</code> 格式。</li>
+    <li>修改 <code>LeakyServlet</code>：实现一个 <code>ServletContextListener</code>，在 <code>contextDestroyed</code> 里停止后台线程；再写一个过滤器在 finally 里 <code>BUFFER.remove()</code>，确认 Tomcat 不再报警。</li>
+    <li>用 <code>jcmd &lt;pid&gt; GC.class_histogram | grep WebappClassLoader</code> 观察 <code>ClassLoaderLeakDemo</code> 风格的泄漏在真实 Tomcat 中多次 reload 后的类加载器数量。</li>
+    <li>给 <code>EmbeddedOps</code> 实现优雅停机：收到关闭信号后先让 <code>/health</code> 返回 503，等 5 秒，再调用 <code>tomcat.stop()</code>。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

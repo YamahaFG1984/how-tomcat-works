@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 用法：./run.sh ch01.HttpServer [参数...]
 #       ./run.sh ch05.Bootstrap1
+#       JAVA_OPTS="-Xmx256m" ./run.sh ch28.leak.ClassLoaderLeakDemo   （JAVA_OPTS 传给 JVM）
 # 第一次运行会先 mvn compile，并把依赖的 classpath 缓存到 target/cp.txt
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -27,4 +28,5 @@ for src in webroot/*.java; do
   fi
 done
 
-exec java -cp "target/classes:$(cat target/cp.txt)" "$main" "$@"
+# shellcheck disable=SC2086  # JAVA_OPTS 需要按空格拆成多个参数
+exec java ${JAVA_OPTS:-} -cp "target/classes:$(cat target/cp.txt)" "$main" "$@"
