@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 25 章 · 可插拔性与 Spring Boot — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="25">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 25 章 · 补充篇</span>
+<h1>可插拔性：注解、SCI 与 Spring Boot 的启动</h1>
+<p class="lede">
+  原书里，Web 应用的一切都写在 web.xml 中，第 15 章的 Digester 把它变成 Wrapper。
+  Servlet 3.0（2009 年）引入了「可插拔性」：Servlet 可以用注解声明，第三方 jar 可以自带配置片段，
+  甚至可以在启动时用代码注册组件。今天的 Spring Boot 应用干脆没有 web.xml，main 方法里一行
+  <code>SpringApplication.run()</code> 就启动了 Tomcat。这一章讲清楚这些机制，并写一个能跑的「迷你 Spring Boot」。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>知道一个 Web 应用的配置可以来自四个地方：web.xml、web-fragment.xml、注解、编程式注册</li>
+    <li>理解 <code>ContextConfig</code> 如何扫描、排序、合并它们，以及 <code>metadata-complete</code> 的作用</li>
+    <li>掌握 <code>ServletContainerInitializer</code> + <code>@HandlesTypes</code> 这个「插件发现」机制</li>
+    <li>说出 Spring Boot 启动嵌入式 Tomcat 的过程，以及它为什么不用容器自带的注解扫描</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="sources">配置的四个来源</h2>
+
+<p>
+  第 15 章的 <code>ContextConfig</code> 只做一件事：解析 web.xml。Servlet 3.0 之后，它要从四个地方收集配置，合并成一份「有效配置」，再交给 <code>StandardContext</code>：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="web.xml、web-fragment.xml、注解、SCI 编程式注册四个来源合并成一份有效配置">
+  <rect class="bx-a" x="20" y="20" width="220" height="50" rx="10"/>
+  <text class="ttl on-a" x="130" y="42" text-anchor="middle">WEB-INF/web.xml</text>
+  <text class="sm" x="130" y="60" text-anchor="middle">应用自己的部署描述符，优先级最高</text>
+  <rect class="bx-b" x="20" y="82" width="220" height="50" rx="10"/>
+  <text class="ttl on-b" x="130" y="104" text-anchor="middle">META-INF/web-fragment.xml</text>
+  <text class="sm" x="130" y="122" text-anchor="middle">WEB-INF/lib 里每个 jar 都可以带一份</text>
+  <rect class="bx-p" x="20" y="144" width="220" height="50" rx="10"/>
+  <text class="ttl on-p" x="130" y="166" text-anchor="middle">@WebServlet / @WebFilter / …</text>
+  <text class="sm" x="130" y="184" text-anchor="middle">扫描 classes 和 jar 里的字节码</text>
+  <rect class="bx-g" x="20" y="206" width="220" height="50" rx="10"/>
+  <text class="ttl on-g" x="130" y="228" text-anchor="middle">ServletContainerInitializer</text>
+  <text class="sm" x="130" y="246" text-anchor="middle">启动时用代码 addServlet / addFilter</text>
+  <path class="ln" d="M242 45 C300 45 300 120 336 126" marker-end="url(#ar)"/>
+  <path class="ln" d="M242 107 C290 107 300 128 336 132" marker-end="url(#ar)"/>
+  <path class="ln" d="M242 169 C290 169 300 140 336 138" marker-end="url(#ar)"/>
+  <rect class="bx" x="340" y="94" width="190" height="80" rx="12"/>
+  <text class="ttl" x="435" y="120" text-anchor="middle">ContextConfig</text>
+  <text class="sm" x="435" y="140" text-anchor="middle">扫描 → 排序 → 合并</text>
+  <text class="sm" x="435" y="158" text-anchor="middle">→ 有效配置（WebXml 对象）</text>
+  <path class="ln" d="M532 134 H566" marker-end="url(#ar)"/>
+  <rect class="bx-d" x="570" y="70" width="170" height="190" rx="12"/>
+  <text class="ttl" x="655" y="96" text-anchor="middle">StandardContext</text>
+  <text class="sm" x="655" y="122" text-anchor="middle">① 创建 Wrapper、过滤器定义</text>
+  <text class="sm" x="655" y="144" text-anchor="middle">② 调用每个 SCI.onStartup</text>
+  <text class="sm" x="655" y="166" text-anchor="middle">③ 监听器</text>
+  <text class="sm" x="655" y="188" text-anchor="middle">④ 过滤器 init</text>
+  <text class="sm" x="655" y="210" text-anchor="middle">⑤ load-on-startup 的 Servlet</text>
+  <path class="ln-g" d="M242 231 H520 C550 231 552 150 566 146" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="400" y="224" text-anchor="middle">SCI 在 Context 启动时直接调用 ServletContext API</text>
+</svg>
+<figcaption>图 25-1　前三个来源在启动前合并，第四个来源在启动中执行</figcaption>
+</figure>
+
+<div class="tw">
+<table>
+  <tr><th>来源</th><th>谁写</th><th>适合</th><th>对应的 Tomcat 代码</th></tr>
+  <tr><td>web.xml</td><td>应用开发者</td><td>需要集中查看、由运维覆盖的配置</td><td><code>ContextConfig.webConfig()</code> 用 Digester 解析</td></tr>
+  <tr><td>web-fragment.xml</td><td>库的作者</td><td>库自带的 Servlet、过滤器，用户加个 jar 就生效</td><td>JarScanner 扫描 <code>WEB-INF/lib</code>，按 <code>&lt;ordering&gt;</code> 排序后合并</td></tr>
+  <tr><td>注解</td><td>应用开发者</td><td>配置和代码放在一起，少写 XML</td><td>用 BCEL 风格的字节码解析器读 class 文件，<strong>不加载类</strong></td></tr>
+  <tr><td>SCI 编程式注册</td><td>框架作者</td><td>要根据条件、配置决定注册什么</td><td><code>WebappServiceLoader</code> 按 <code>META-INF/services</code> 发现</td></tr>
+</table>
+</div>
+
+<h3>合并规则与 metadata-complete</h3>
+
+<p>
+  三者冲突时，web.xml 优先：同名的 Servlet，web.xml 里的设置覆盖注解里的。
+  web.xml 根元素上的 <code>metadata-complete="true"</code> 表示「我这份 web.xml 已经是完整的了」，
+  容器就<strong>跳过注解扫描和 web-fragment.xml</strong>。这能明显缩短大应用的启动时间——扫描几百个 jar 的字节码并不便宜。
+  但它<strong>不会</strong>关闭 SCI：本章的实验会验证这一点。要控制 SCI，得用 <code>&lt;absolute-ordering&gt;</code> 排除 jar，
+  或者 Tomcat 的 <code>containerSciFilter</code>。
+</p>
+
+<h2 id="sci">SCI 与 @HandlesTypes：插件的发现机制</h2>
+
+<p>
+  <code>ServletContainerInitializer</code> 是 Servlet 3.0 里最强大的扩展点，它借用了 JDK 的 <code>ServiceLoader</code> 约定：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="插件 jar 通过 META-INF/services 声明 SCI，容器根据 HandlesTypes 扫描应用类，把实现类集合传给 onStartup">
+  <rect class="bx-b" x="20" y="16" width="260" height="158" rx="12"/>
+  <text class="ttl on-b" x="150" y="38" text-anchor="middle">plugin.jar（第三方库）</text>
+  <text class="mono sm" x="34" y="62">META-INF/services/</text>
+  <text class="mono sm" x="44" y="78">jakarta.servlet.</text>
+  <text class="mono sm" x="44" y="94">ServletContainerInitializer</text>
+  <text class="mono sm" x="54" y="110">→ PluginInitializer</text>
+  <text class="mono sm" x="34" y="138">@HandlesTypes(PluginModule.class)</text>
+  <text class="mono sm" x="34" y="156">class PluginInitializer</text>
+  <rect class="bx-a" x="20" y="186" width="260" height="70" rx="12"/>
+  <text class="ttl on-a" x="150" y="210" text-anchor="middle">WEB-INF/classes（应用）</text>
+  <text class="mono sm" x="150" y="230" text-anchor="middle">class ReportModule</text>
+  <text class="mono sm" x="150" y="246" text-anchor="middle">implements PluginModule</text>
+  <rect class="bx" x="330" y="60" width="200" height="150" rx="12"/>
+  <text class="ttl" x="430" y="84" text-anchor="middle">ContextConfig</text>
+  <text class="sm" x="430" y="108" text-anchor="middle">① 读 services 文件</text>
+  <text class="sm" x="430" y="126" text-anchor="middle">→ 找到 PluginInitializer</text>
+  <text class="sm" x="430" y="150" text-anchor="middle">② 读它的 @HandlesTypes</text>
+  <text class="sm" x="430" y="168" text-anchor="middle">③ 扫描字节码，收集</text>
+  <text class="sm" x="430" y="186" text-anchor="middle">所有 PluginModule 的子类</text>
+  <path class="ln-b" d="M282 90 H326" marker-end="url(#ar-b)"/>
+  <path class="ln-a" d="M282 221 C310 221 310 192 326 188" marker-end="url(#ar-a)"/>
+  <path class="ln" d="M532 135 H566" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="570" y="80" width="170" height="110" rx="12"/>
+  <text class="ttl on-g" x="655" y="104" text-anchor="middle">onStartup(</text>
+  <text class="mono sm" x="655" y="126" text-anchor="middle">{ReportModule},</text>
+  <text class="mono sm" x="655" y="144" text-anchor="middle">servletContext)</text>
+  <text class="sm" x="655" y="172" text-anchor="middle">实例化并调用 register</text>
+  <text class="sm" x="380" y="282" text-anchor="middle">库定义接口，应用实现接口，谁也不用写配置：加个 jar、写个实现类就生效</text>
+</svg>
+<figcaption>图 25-2　SCI 让 jar 包「自己装配自己」，@HandlesTypes 让它找到应用里的扩展</figcaption>
+</figure>
+
+<p>
+  这正是 Spring MVC 在传统 WAR 部署下的启动方式：<code>spring-web.jar</code> 里的
+  <code>SpringServletContainerInitializer</code> 标注了 <code>@HandlesTypes(WebApplicationInitializer.class)</code>，
+  容器把应用里所有 <code>WebApplicationInitializer</code> 的实现交给它，其中一个实现（Spring Boot 的
+  <code>SpringBootServletInitializer</code>）再去调用 <code>SpringApplication</code>。Tomcat 自己的 WebSocket 支持（第 26 章）也是一个 SCI：<code>WsSci</code>。
+</p>
+
+<div class="box key">
+  <div class="t">&#128273; 为什么扫描字节码而不是加载类？</div>
+  <p>
+    加载类会执行静态初始化块，可能触发连锁加载、产生副作用，甚至因为缺少可选依赖而失败。
+    Tomcat 用自带的字节码解析器（<code>org.apache.tomcat.util.bcel</code>）直接读 class 文件的常量池和注解表，
+    只有确定需要时才加载。我们的 <code>ClassScanner</code> 为了简单用了 <code>Class.forName(name, false, loader)</code>（不初始化），
+    但仍然会触发类加载，大项目里不要这样做。
+  </p>
+</div>
+
+<h2 id="boot">Spring Boot 怎样启动 Tomcat</h2>
+
+<p>
+  传统部署是「Tomcat 里装应用」：先有容器，容器发现应用。Spring Boot 反过来，是「应用里装 Tomcat」：
+  先有 Spring 的 <code>ApplicationContext</code>，它在刷新过程中创建并启动一个嵌入式 Tomcat。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 380" role="img" aria-label="SpringApplication.run 到 Tomcat 启动的调用顺序">
+  <rect class="bx-g" x="20" y="16" width="230" height="36" rx="8"/><text class="ttl on-g" x="135" y="39" text-anchor="middle">SpringApplication.run()</text>
+  <path class="ln" d="M135 54 V72" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="20" y="76" width="230" height="36" rx="8"/><text class="sm" x="135" y="99" text-anchor="middle">创建 ApplicationContext，refresh()</text>
+  <path class="ln" d="M135 114 V132" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="20" y="136" width="230" height="36" rx="8"/><text class="sm" x="135" y="159" text-anchor="middle">onRefresh() → createWebServer()</text>
+  <path class="ln-a" d="M252 154 H296" marker-end="url(#ar-a)"/>
+
+  <rect class="bx-a" x="300" y="100" width="260" height="170" rx="12"/>
+  <text class="ttl on-a" x="430" y="124" text-anchor="middle">TomcatServletWebServerFactory</text>
+  <text class="mono sm" x="430" y="144" text-anchor="middle">getWebServer(initializers…)</text>
+  <text class="sm" x="314" y="170">• new Tomcat()，baseDir 设到临时目录</text>
+  <text class="sm" x="314" y="190">• 按 server.* 配置创建 Connector</text>
+  <text class="sm" x="314" y="210">• 添加 TomcatEmbeddedContext</text>
+  <text class="sm" x="314" y="230">• 注册唯一的 SCI：TomcatStarter</text>
+  <text class="sm" x="314" y="250">• tomcat.start()，但先摘掉连接器</text>
+  <path class="ln-p" d="M562 236 H596" marker-end="url(#ar-p)"/>
+
+  <rect class="bx-p" x="600" y="190" width="140" height="100" rx="12"/>
+  <text class="ttl on-p" x="670" y="214" text-anchor="middle">TomcatStarter</text>
+  <text class="sm" x="670" y="236" text-anchor="middle">onStartup：调用</text>
+  <text class="sm" x="670" y="254" text-anchor="middle">ServletContext-</text>
+  <text class="sm" x="670" y="272" text-anchor="middle">Initializer bean</text>
+  <path class="ln-p" d="M670 292 V312" marker-end="url(#ar-p)"/>
+  <rect class="bx-d" x="430" y="316" width="310" height="52" rx="10"/>
+  <text class="sm" x="585" y="338" text-anchor="middle">DispatcherServletRegistrationBean</text>
+  <text class="sm" x="585" y="356" text-anchor="middle">FilterRegistrationBean、ServletRegistrationBean…</text>
+
+  <path class="ln" d="M135 174 V280" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="20" y="284" width="230" height="36" rx="8"/><text class="sm" x="135" y="307" text-anchor="middle">其余 bean 初始化完成</text>
+  <path class="ln" d="M135 322 V332" marker-end="url(#ar)"/>
+  <rect class="bx-g" x="20" y="336" width="230" height="36" rx="8"/><text class="sm" x="135" y="359" text-anchor="middle">finishRefresh：装回连接器，开始接客</text>
+</svg>
+<figcaption>图 25-3　Spring Boot：应用创建容器，并在一切就绪后才打开端口</figcaption>
+</figure>
+
+<p>几个值得注意的设计决定：</p>
+
+<ul>
+  <li><strong>不用容器的注解扫描</strong>。嵌入式 Context 不做 <code>@WebServlet</code> 扫描（只有加了 <code>@ServletComponentScan</code> 才会，而且是 Spring 自己扫）。
+      Servlet、过滤器都是 Spring bean，通过 <code>ServletContextInitializer</code> 注册——这样它们能享受依赖注入、条件装配、<code>@Order</code> 排序。</li>
+  <li><strong>只有一个 SCI</strong>。<code>TomcatStarter</code> 是 Boot 交给 Tomcat 的唯一入口，Boot 不依赖 <code>META-INF/services</code> 的 SCI 发现，避免类路径上随便一个 jar 改变应用的行为。</li>
+  <li><strong>端口最后才打开</strong>。Tomcat 启动时连接器被暂时移除，等整个 <code>ApplicationContext</code> 刷新完成才加回来并启动。否则负载均衡器可能在应用还没准备好时就把流量打过来。</li>
+  <li><strong>非守护线程保活</strong>。Tomcat 的线程都是守护线程，<code>main</code> 返回后 JVM 会退出，所以 Boot 启动一个名为 <code>container-0</code> 的非守护线程调用 <code>await()</code>。</li>
+</ul>
+
+<div class="vs">
+  <div class="old"><div class="h">传统 WAR：容器发现应用</div>
+<div class="code" data-lang="text">
+<pre>
+Tomcat 启动
+ └─ HostConfig 部署 app.war（第 18 章）
+     └─ ContextConfig 扫描 SCI
+         └─ SpringServletContainerInitializer
+             └─ SpringBootServletInitializer
+                 └─ SpringApplication.run()
+</pre>
+</div>
+  </div>
+  <div class="new"><div class="h">Spring Boot jar：应用创建容器</div>
+<div class="code" data-lang="text">
+<pre>
+java -jar app.jar → main()
+ └─ SpringApplication.run()
+     └─ refresh() → createWebServer()
+         └─ new Tomcat() + TomcatStarter
+             └─ ServletContextInitializer bean
+                 └─ 注册 DispatcherServlet
+</pre>
+</div>
+  </div>
+</div>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch25/miniboot/</code><code>demo/</code><code>plugin/</code><code>webapp/</code><code>tomcat/EmbeddedPluggability.java</code></div>
+
+<h3>① MiniBoot：一个方法的 Spring Boot</h3>
+
+<p>
+  <code>MiniBoot.run(主类)</code> 复刻了上图左侧和中间的流程：扫描主类所在的包，创建 Tomcat，
+  用 <code>addContext</code>（不带 <code>ContextConfig</code>，所以 Tomcat 不扫描注解）加一个 Context，
+  再注册一个自己的 SCI，在里面用编程式 API 注册扫描到的组件：
+</p>
+
+<div class="code" data-lang="java" data-file="java17/.../ch25/miniboot/MiniBoot.java（节选）">
+<pre>
+public static Tomcat run(Class&lt;?&gt; primary, String... args) throws Exception {
+    List&lt;Class&lt;?&gt;&gt; classes = ClassScanner.scan(primary.getClassLoader(), primary.getPackageName());
+
+    var tomcat = new Tomcat();
+    tomcat.setBaseDir(Files.createTempDirectory("miniboot").toString());
+    tomcat.setPort(port);
+    Context ctx = tomcat.addContext("", docBase);                // 不带 ContextConfig：Tomcat 不扫描
+    ctx.addServletContainerInitializer(new MiniBootStarter(classes), null);   // ≈ TomcatStarter
+    tomcat.start();
+
+    // Tomcat 的线程都是守护线程，main 返回后 JVM 会退出
+    Thread await = new Thread(() -&gt; tomcat.getServer().await(), "container-0");
+    await.setDaemon(false);
+    await.start();
+    return tomcat;
+}
+</pre>
+</div>
+
+<div class="code" data-lang="java" data-file="java17/.../ch25/miniboot/MiniBootStarter.java（节选）">
+<pre>
+for (Class&lt;?&gt; c : classes) {
+    WebServlet s = c.getAnnotation(WebServlet.class);
+    if (s == null) continue;
+    String name = s.name().isEmpty() ? c.getName() : s.name();
+    var reg = sc.addServlet(name, c.asSubclass(Servlet.class));   // 编程式注册
+    reg.addMapping(s.urlPatterns().length &gt; 0 ? s.urlPatterns() : s.value());
+    reg.setLoadOnStartup(s.loadOnStartup());
+    reg.setAsyncSupported(s.asyncSupported());
+    for (WebInitParam p : s.initParams()) reg.setInitParameter(p.name(), p.value());
+}
+// …@WebListener、@WebFilter 同理；AppInitializer 的实现类实例化后调用 onStartup(sc)
+</pre>
+</div>
+
+<p>应用代码看起来就像一个 Spring Boot 项目：</p>
+
+<div class="code" data-lang="java" data-file="java17/.../ch25/demo/（节选）">
+<pre>
+public final class DemoApplication {
+    public static void main(String[] args) throws Exception {
+        MiniBoot.run(DemoApplication.class, args);
+    }
+}
+
+@WebServlet(urlPatterns = "/hello", loadOnStartup = 1,
+        initParams = @WebInitParam(name = "greeting", value = "你好"))
+public class HelloServlet extends HttpServlet { … }
+
+@WebFilter("/*")
+public class TimingFilter implements Filter { … }
+
+public class ApiInitializer implements AppInitializer {        // ≈ ServletContextInitializer
+    @Override public void onStartup(ServletContext sc) {
+        sc.addServlet("time", new HttpServlet() { … }).addMapping("/api/time");
+    }
+}
+</pre>
+</div>
+
+<h3>② Tomcat 原生的可插拔性</h3>
+
+<p>
+  第二个示例反过来：让 Tomcat 自己扫描。它在启动前用代码拼出一个 Web 应用目录——
+  <code>WEB-INF/classes</code> 里放带 <code>@WebServlet</code> 的类和一个 <code>PluginModule</code> 实现，
+  <code>WEB-INF/lib</code> 里用 <code>JarOutputStream</code> 现场打一个 <code>plugin.jar</code>，内含 SCI 声明、
+  <code>web-fragment.xml</code> 和插件类。然后像第 15 章一样给 Context 装上 <code>ContextConfig</code>：
+</p>
+
+<div class="code" data-lang="java" data-file="java17/.../ch25/plugin/PluginInitializer.java">
+<pre>
+@HandlesTypes(PluginModule.class)
+public class PluginInitializer implements ServletContainerInitializer {
+
+    @Override
+    public void onStartup(Set&lt;Class&lt;?&gt;&gt; classes, ServletContext sc) {
+        System.out.println("[PluginInitializer] 容器传入的 @HandlesTypes 类：" + classes);
+        if (classes == null) return;                         // 一个实现类都没有时是 null
+        for (Class&lt;?&gt; c : classes) {
+            if (c.isInterface() || Modifier.isAbstract(c.getModifiers())) continue;
+            ((PluginModule) c.getDeclaredConstructor().newInstance()).register(sc);
+        }
+    }
+}
+</pre>
+</div>
+
+<div class="code" data-lang="java" data-file="java17/.../ch25/tomcat/EmbeddedPluggability.java（节选）">
+<pre>
+try (var jar = new JarOutputStream(Files.newOutputStream(lib.resolve("plugin.jar")))) {
+    put(jar, "META-INF/services/jakarta.servlet.ServletContainerInitializer",
+            "modern.ch25.plugin.PluginInitializer\n");
+    put(jar, "META-INF/web-fragment.xml", """
+            &lt;web-fragment xmlns="https://jakarta.ee/xml/ns/jakartaee" version="6.1"&gt;
+              &lt;name&gt;plugin&lt;/name&gt;
+              &lt;servlet&gt;…FragmentServlet…&lt;/servlet&gt;
+              &lt;servlet-mapping&gt;…/fragment…&lt;/servlet-mapping&gt;
+            &lt;/web-fragment&gt;
+            """);
+    // …再把 modern/ch25/plugin/*.class 放进去
+}
+
+Context ctx = tomcat.addContext("/app", app.toString());
+var config = new ContextConfig();                      // 解析 web.xml、扫描注解、运行 SCI
+config.setDefaultWebXml(Constants.NoDefaultWebXml);
+ctx.addLifecycleListener(config);
+</pre>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch25.demo.DemoApplication
+curl http://localhost:8080/hello
+curl http://localhost:8080/api/time
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+[MiniBoot] 扫描包 modern.ch25.demo：6 个类
+[MiniBoot] @WebListener    StartupListener
+[MiniBoot] @WebFilter      TimingFilter /*
+[MiniBoot] @WebServlet     HelloServlet /hello
+[MiniBoot] AppInitializer  ApiInitializer
+[StartupListener] 应用启动：Apache Tomcat/11.0.21
+[HelloServlet] init()，greeting = 你好               ← loadOnStartup = 1，启动时就初始化
+[MiniBoot] 已在 8080 端口启动，用时 1159 ms
+[TimingFilter] /hello 用时 3516 µs
+[TimingFilter] /api/time 用时 811 µs
+
+你好，来自 modern.ch25.demo.HelloServlet
+{"now":"2026-10-28T09:32:29"}
+</pre>
+</div>
+
+<p>然后是 Tomcat 原生扫描。分别用 <code>metadata-complete</code> 为 false 和 true 启动：</p>
+
+<div class="code" data-lang="bash">
+<pre>
+./run.sh ch25.tomcat.EmbeddedPluggability 8080            # metadata-complete="false"
+curl http://localhost:8080/app/annotated
+curl http://localhost:8080/app/fragment
+curl http://localhost:8080/app/report
+
+./run.sh ch25.tomcat.EmbeddedPluggability 8080 true       # metadata-complete="true"
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+[PluginInitializer] 容器传入的 @HandlesTypes 类：[class modern.ch25.webapp.ReportModule]
+[ReportModule] 注册 /report
+metadata-complete = false，Context 里的 Servlet：
+  fragment
+  modern.ch25.webapp.AnnotatedServlet
+  report
+
+来自 @WebServlet 的 Servlet
+来自 web-fragment.xml 的 Servlet，类加载器：ParallelWebappClassLoader
+来自 ServletContainerInitializer + @HandlesTypes 的 Servlet
+
+—— metadata-complete = true ——
+[PluginInitializer] 容器传入的 @HandlesTypes 类：[class modern.ch25.webapp.ReportModule]
+metadata-complete = true，Context 里的 Servlet：
+  report
+annotated → 404    fragment → 404    report → 200
+</pre>
+</div>
+
+<p>
+  <code>metadata-complete="true"</code> 关掉了注解和 web-fragment，但 SCI 照样运行，<code>@HandlesTypes</code> 的扫描也照样进行。
+  这就是为什么「加了 metadata-complete 启动还是慢」的问题，往往要到 SCI 那里去找原因。
+  另外注意 <code>FragmentServlet</code> 是由 <code>ParallelWebappClassLoader</code>（第 8 章 WebappClassLoader 的现代版）加载的：
+  插件 jar 里的类属于应用，不属于容器。
+</p>
+
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>用 ServiceLoader 约定发现插件</div>
+  <p>jar 在 <code>META-INF/services/接口名</code> 里写上实现类名，宿主不需要知道插件的存在。</p>
+  <dl>
+    <dt>取舍</dt><dd>零配置、加 jar 即生效；代价是「隐式」：类路径上多一个 jar 就可能改变应用行为，排查时要知道去看 services 文件。</dd>
+    <dt>替代方案</dt><dd>显式注册（Spring Boot 选择的方式）、配置文件列出插件类名。</dd>
+    <dt>还能用在</dt><dd>JDBC 驱动（<code>java.sql.Driver</code>）、SLF4J 绑定、Spring Boot 的 <code>AutoConfiguration.imports</code>：任何「库自带扩展」的场景。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch30.html">第 30 章 · 扩展点设计</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>声明式与编程式两条路</div>
+  <p>同一件事（注册 Servlet）既可以用 web.xml / 注解声明，也可以用 <code>ServletContext.addServlet</code> 写代码。</p>
+  <dl>
+    <dt>取舍</dt><dd>声明式一目了然、工具友好；编程式能根据条件和配置动态决定。代价是两条路都要维护，还要定义冲突时谁优先（web.xml 优先）。</dd>
+    <dt>还能用在</dt><dd>Spring 的 XML / 注解 / Java Config、Gradle 的 DSL 与插件 API：先提供编程式 API，再在其上构建声明式语法。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>控制反转的反转</div>
+  <p>传统部署是容器加载应用；Spring Boot 让应用创建容器，并且只给容器一个入口（<code>TomcatStarter</code>）。</p>
+  <dl>
+    <dt>取舍</dt><dd>应用掌握启动顺序（例如等所有 bean 就绪再开端口）、部署变成一个 jar；代价是一个 JVM 只跑一个应用，失去了容器级的多应用管理（第 18、19 章的那些能力）。</dd>
+    <dt>还能用在</dt><dd>需要嵌入数据库（H2）、消息队列（嵌入式 Kafka/Artemis）做测试或单机部署的场景：把「服务器」当作一个可以 new 出来的库。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">4</span>准备就绪之后再接流量</div>
+  <p>Spring Boot 启动 Tomcat 时先摘掉连接器，等整个应用上下文刷新完才装回去。</p>
+  <dl>
+    <dt>取舍</dt><dd>不会有请求打到半初始化的应用上；代价是启动流程多了一个特殊步骤，自定义启动逻辑时要理解它。</dd>
+    <dt>还能用在</dt><dd>Kubernetes 的 readiness 探针、消息消费者在依赖就绪后才开始拉取：把「进程活着」和「可以服务」分成两个状态。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>Servlet 3.0 之后，应用配置来自 web.xml、web-fragment.xml、注解、SCI 编程式注册四个来源，由 <code>ContextConfig</code> 合并，web.xml 优先。</li>
+  <li><code>metadata-complete="true"</code> 跳过注解扫描和 web-fragment，但不影响 SCI。</li>
+  <li>SCI 通过 <code>META-INF/services</code> 发现，<code>@HandlesTypes</code> 让容器把应用中指定类型的实现交给它，是库「自我装配」的标准方式。</li>
+  <li>Spring Boot 让应用创建嵌入式 Tomcat，只注册一个 SCI（<code>TomcatStarter</code>），用 Spring bean 注册 Servlet 和过滤器，并在上下文就绪后才打开端口。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>给 MiniBoot 增加 <code>@Order</code> 支持：<code>AppInitializer</code> 和 <code>@WebFilter</code> 按注解里的数字排序注册，验证过滤器执行顺序随之改变。</li>
+    <li>模仿 Spring Boot「最后才开端口」：在 <code>MiniBoot.run</code> 里先 <code>tomcat.getService().removeConnector(...)</code>，模拟一段 3 秒的初始化，再加回连接器并启动它。启动期间用 curl 观察连接被拒绝。</li>
+    <li>在 <code>EmbeddedPluggability</code> 的 web.xml 里加一个同名的 <code>modern.ch25.webapp.AnnotatedServlet</code> 映射到 <code>/xml</code>，观察 web.xml 和注解的映射是合并还是覆盖。</li>
+    <li>给 web.xml 加上 <code>&lt;absolute-ordering/&gt;</code>（空的），看看插件 jar 的 SCI 和 web-fragment 是否还会生效。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

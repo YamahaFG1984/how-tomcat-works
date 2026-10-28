@@ -30,7 +30,8 @@
     { n: 21, t: 'ServletContext 与 RequestDispatcher', d: 'forward、include 与三种作用域', part: '第六部分 · 补充：现代 Servlet 容器' },
     { n: 22, t: '静态资源、错误页与字符编码', d: 'DefaultServlet、ETag/304/Range、error-page 与 UTF-8' },
     { n: 23, t: 'Coyote 与 NIO 连接器', d: 'Acceptor、Poller、Worker 与 CoyoteAdapter' },
-    { n: 24, t: '异步 Servlet 与非阻塞 IO', d: 'AsyncContext、SSE 与 ReadListener' }
+    { n: 24, t: '异步 Servlet 与非阻塞 IO', d: 'AsyncContext、SSE 与 ReadListener' },
+    { n: 25, t: '可插拔性与 Spring Boot', d: '注解、SCI、web-fragment 与嵌入式启动' }
   ];
 
   const pad = (n) => String(n).padStart(2, '0');
