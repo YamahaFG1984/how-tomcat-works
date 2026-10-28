@@ -318,6 +318,38 @@ shutdown hook: Tomcat 11 已停止
 </pre>
 </div>
 
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>关闭钩子保证清理</div>
+  <p><code>Runtime.addShutdownHook</code> 注册的线程在正常退出、Ctrl+C、SIGTERM 时都会执行。</p>
+  <dl>
+    <dt>取舍</dt><dd><code>kill -9</code> 和断电时不会执行；钩子之间没有顺序保证，执行时间也不能太长。</dd>
+    <dt>还能用在</dt><dd>关闭连接池、刷写缓冲日志、注销服务发现；但关键数据要靠事务和持久化，不能依赖钩子。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>钩子只做一件事：调用 stop()</div>
+  <p>Catalina 的钩子只调用 <code>server.stop()</code>，具体清理逻辑仍在各组件的生命周期里。</p>
+  <dl>
+    <dt>取舍</dt><dd>清理逻辑只有一份，正常关闭和信号关闭走同一条路径。</dd>
+    <dt>还能用在</dt><dd>不要在钩子里写业务清理代码，把它放在组件的 <code>close()</code>/<code>stop()</code> 中。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>stop() 要幂等</div>
+  <p>钩子和正常关闭流程可能先后调用 <code>stop()</code>。</p>
+  <dl>
+    <dt>取舍</dt><dd>多一个状态判断，换来重复调用不出错。</dd>
+    <dt>还能用在</dt><dd>所有 <code>close()</code>/<code>shutdown()</code> 方法都应该可以安全地调用多次。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+
 <h2 id="summary">小结</h2>
 
 <ul>

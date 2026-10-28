@@ -730,6 +730,48 @@ HTTP/1.1 400 Invalid URI: /../pom.xml
 </pre>
 </div>
 
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>连接器只负责把字节变成对象</div>
+  <p>连接器创建并填充 Request/Response，然后调用 <code>container.invoke()</code>，从此不再关心业务。</p>
+  <dl>
+    <dt>取舍</dt><dd>两边要约定一个稳定的接口；好处是后面换连接器（BIO→NIO→NIO2）完全不影响容器。</dd>
+    <dt>还能用在</dt><dd>RPC 框架的 transport 层 vs 业务层、Netty 的 codec handler vs 业务 handler：协议编解码和业务处理永远分开。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>懒解析：用到才解析</div>
+  <p>请求参数和 Cookie 在第一次调用 <code>getParameter()</code> 时才解析，<code>parsed</code> 标志保证只解析一次。</p>
+  <dl>
+    <dt>取舍</dt><dd>不用的请求不付成本；但解析时机会带来副作用——先读了 <code>getInputStream()</code>，表单参数就再也拿不到了。</dd>
+    <dt>替代方案</dt><dd>在连接器里全部提前解析（简单，但浪费）。</dd>
+    <dt>还能用在</dt><dd>昂贵的派生数据按需计算并缓存；如果对象会被多线程访问，缓存要考虑可见性。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>热点路径手写解析器</div>
+  <p><code>SocketInputStream</code> 按字节扫描请求行和头部，复用 <code>char[]</code> 缓冲区，不用 <code>BufferedReader.readLine()</code>。</p>
+  <dl>
+    <dt>取舍</dt><dd>少创建对象、能精确控制编码（HTTP 头是 ISO-8859-1）；代价是代码复杂、边界条件多。</dd>
+    <dt>替代方案</dt><dd>标准库或成熟的解析库。</dd>
+    <dt>还能用在</dt><dd>只在压测证明的热点上手写，其余地方用标准库；手写的部分配上大量边界测试。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">4</span>错误消息集中在资源包里</div>
+  <p>每个包一个 <code>StringManager</code> + <code>LocalStrings.properties</code>，代码里只写键。</p>
+  <dl>
+    <dt>取舍</dt><dd>消息可以翻译、可以统一修改；读代码时要多跳一次文件。</dd>
+    <dt>还能用在</dt><dd>大型项目的错误码表 + 国际化文案；日志和异常消息也能从中受益。</dd>
+  </dl>
+</div>
+
 <h2 id="summary">小结</h2>
 
 <ul>

@@ -531,6 +531,58 @@ SimpleContextLifecycleListener's event after_stop
   </div>
 </div>
 
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>统一生命周期，级联启动</div>
+  <p>所有组件实现 <code>Lifecycle</code>；父组件 <code>start()</code> 时先启动自己的子组件，所以只要启动顶层。</p>
+  <dl>
+    <dt>取舍</dt><dd>每个组件都要写 start/stop，但启动和关闭顺序不再需要人工记忆。</dd>
+    <dt>替代方案</dt><dd>启动脚本里手动按顺序 new 和 init（组件越多越容易漏）。</dd>
+    <dt>还能用在</dt><dd>Spring <code>SmartLifecycle</code>、Guava <code>Service</code>；任何持有线程、连接、文件句柄的模块都应有明确的 start/stop。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>观察者：用监听器挂载行为</div>
+  <p><code>LifecycleListener</code> 在 BEFORE_START、START、AFTER_START 等事件上被通知。</p>
+  <dl>
+    <dt>取舍</dt><dd>不修改组件就能扩展它（第 15 章的 <code>ContextConfig</code> 就是一个监听器）；代价是控制流变得隐式。</dd>
+    <dt>还能用在</dt><dd>领域事件、插件钩子；监听器里不要做太重的事，也不要依赖监听器之间的顺序。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch31.html">第 31 章 · 设计模式实战</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>组合优于继承：LifecycleSupport</div>
+  <p>监听器的注册、遍历、通知集中在 <code>LifecycleSupport</code>，组件持有它并委托调用。</p>
+  <dl>
+    <dt>取舍</dt><dd>多一个字段，换来不占用唯一的父类位置。Java 17 版用 <code>CopyOnWriteArrayList</code>，遍历时增删监听器也安全。</dd>
+    <dt>替代方案</dt><dd>抽象基类（Tomcat 后来的 <code>LifecycleBase</code>）。</dd>
+    <dt>还能用在</dt><dd>通用能力（事件、指标、重试）做成可组合的辅助对象，而不是塞进继承树。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch31.html">第 31 章 · 设计模式实战</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">4</span>关闭顺序与启动顺序相反</div>
+  <p>先启动被依赖者（Loader、Manager），再启动依赖者；关闭时倒过来。</p>
+  <dl>
+    <dt>取舍</dt><dd>保证任何组件在运行期间，它依赖的组件都可用。</dd>
+    <dt>还能用在</dt><dd>资源释放按 LIFO：<code>try-with-resources</code>、Spring 的 bean 销毁顺序都是这样。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">5</span>布尔标志 → 状态机</div>
+  <p>原书只有一个 <code>started</code> 布尔值；Tomcat 7 引入 <code>LifecycleState</code> 枚举，明确每个状态允许哪些转换。</p>
+  <dl>
+    <dt>取舍</dt><dd>状态机多写一些代码，但能拒绝非法转换（例如在 STARTING 时调用 stop），并给出清晰的错误。</dd>
+    <dt>还能用在</dt><dd>一个对象有两个以上布尔标志描述「阶段」时，就该换成枚举状态机。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+
 <h2 id="summary">小结</h2>
 
 <ul>

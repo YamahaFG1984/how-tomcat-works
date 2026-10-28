@@ -428,6 +428,39 @@ Tomcat 11 已优雅关闭
 </pre>
 </div>
 
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>多个入口，一个核心</div>
+  <p>一个 Service = 多个 Connector + 一个 Engine：HTTP、HTTPS、AJP 共享同一套容器。</p>
+  <dl>
+    <dt>取舍</dt><dd>协议和业务彻底分离，加一个端口只是加一个连接器。</dd>
+    <dt>还能用在</dt><dd>同一套业务同时提供 HTTP API、gRPC、消息队列消费者——入口层可以有多个，领域层只有一个。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>组件不创建自己的依赖</div>
+  <p>Bootstrap（后来是 Digester）负责 new 出所有组件并用 setter 接起来，组件自身只管运行。</p>
+  <dl>
+    <dt>取舍</dt><dd>组件可以单独测试、可以替换；这就是没有框架的依赖注入。</dd>
+    <dt>还能用在</dt><dd>「组合根」（composition root）：所有装配集中在 main 附近，业务代码里不出现 new 具体实现。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>关闭端口要收紧</div>
+  <p>Server 在 8005 端口等待 <code>SHUTDOWN</code> 字符串。</p>
+  <dl>
+    <dt>取舍</dt><dd>只绑定 localhost；生产环境常设为 <code>-1</code> 禁用，改用信号关闭。</dd>
+    <dt>替代方案</dt><dd>SIGTERM + 关闭钩子（第 16 章）、容器编排的 preStop。</dd>
+    <dt>还能用在</dt><dd>任何远程管理入口都要考虑：谁能访问、如何鉴权、能否关闭。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+
 <h2 id="summary">小结</h2>
 
 <ul>

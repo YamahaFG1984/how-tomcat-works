@@ -564,6 +564,48 @@ ContextConfig 创建的 Wrapper：
 </pre>
 </div>
 
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>声明式装配：XML 描述对象图</div>
+  <p>规则把元素映射为「创建对象」「设置属性」「调用方法」，<code>server.xml</code> 就成了一段装配程序的输入。</p>
+  <dl>
+    <dt>取舍</dt><dd>不重新编译就能改结构；代价是错误要到运行时才发现，IDE 难以导航。</dd>
+    <dt>替代方案</dt><dd>代码装配（嵌入式 Tomcat、Spring <code>@Configuration</code>）。</dd>
+    <dt>还能用在</dt><dd>任何需要由运维人员调整结构（而不仅是参数）的系统。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>模式匹配 + 对象栈</div>
+  <p>每遇到一个元素就按路径模式找规则，创建的对象压栈，结束时出栈，父子关系由栈自然得到。</p>
+  <dl>
+    <dt>取舍</dt><dd>规则彼此独立，可以自由组合；但规则顺序和栈状态需要仔细考虑。</dd>
+    <dt>还能用在</dt><dd>任何树状配置（XML、JSON、YAML）到对象图的转换。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch31.html">第 31 章 · 设计模式实战</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>RuleSet：规则打包复用</div>
+  <p><code>ContextRuleSet</code>、<code>WebRuleSet</code> 把一组规则打包，可以挂在不同前缀下。</p>
+  <dl>
+    <dt>取舍</dt><dd>规则可以模块化；代价是多一层间接。</dd>
+    <dt>还能用在</dt><dd>配置解析器按领域拆分成可复用的模块。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch30.html">第 30 章 · 扩展点设计</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">4</span>className 属性：每个组件都能换实现</div>
+  <p><code>server.xml</code> 里几乎所有元素都接受 <code>className</code>，Digester 用它来实例化。</p>
+  <dl>
+    <dt>取舍</dt><dd>最强的扩展点——不改 Tomcat 就能替换任何组件；代价是没有类型检查，也增加了维护承诺。</dd>
+    <dt>还能用在</dt><dd>只在确实有替换需求的地方开放，并为替换实现提供契约和测试。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch30.html">第 30 章 · 扩展点设计</a></div>
+</div>
+
 <h2 id="summary">小结</h2>
 
 <ul>

@@ -410,6 +410,50 @@ $ cat logs/juli-demo.2026-10-28.log
 </pre>
 </div>
 
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>模板方法：过滤在基类，输出在子类</div>
+  <p><code>LoggerBase</code> 处理 verbosity 级别判断和格式化，子类只实现「写到哪里」。</p>
+  <dl>
+    <dt>取舍</dt><dd>新增一种输出目的地只需要写一个方法；但继承层次限制了组合（想同时写文件和控制台就麻烦）。</dd>
+    <dt>替代方案</dt><dd>JULI/Logback 的 Handler/Appender 组合模型。</dd>
+    <dt>还能用在</dt><dd>多个实现共享相同流程、只有一步不同时用模板方法；需要自由组合时改用组合。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch31.html">第 31 章 · 设计模式实战</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>子组件沿用父组件的设施</div>
+  <p>容器没有设置 Logger 时，向父容器要。</p>
+  <dl>
+    <dt>取舍</dt><dd>配置一次就能覆盖整棵树，也可以在任意一层单独覆盖。</dd>
+    <dt>还能用在</dt><dd>层级配置：全局 → 租户 → 用户；日志级别按包名继承也是同一个思路。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>被推翻的设计：自己造日志接口</div>
+  <p>Tomcat 4 的 <code>org.apache.catalina.Logger</code> 后来被 commons-logging，再被 JULI 取代。</p>
+  <dl>
+    <dt>取舍</dt><dd>基础设施自己造，就要自己维护、自己适配所有用户的日志系统。</dd>
+    <dt>替代方案</dt><dd>SLF4J 这样的日志门面 + 运行时选择实现。</dd>
+    <dt>还能用在</dt><dd>日志、JSON、HTTP 客户端这类通用设施，优先选业界标准的门面，而不是自研接口。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">4</span>惰性检查代替定时器</div>
+  <p><code>FileLogger</code> 每次写日志时比较日期，日期变了就换文件，不需要单独的线程。</p>
+  <dl>
+    <dt>取舍</dt><dd>实现简单、没有线程开销；代价是没有日志写入时，文件不会按时滚动。</dd>
+    <dt>替代方案</dt><dd>定时任务。</dd>
+    <dt>还能用在</dt><dd>令牌桶补充令牌、缓存过期判断，都可以在「被访问时」顺便完成。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+
 <h2 id="summary">小结</h2>
 
 <ul>

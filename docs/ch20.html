@@ -502,6 +502,48 @@ java.lang  (19 个 MBean)
 </pre>
 </div>
 
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>管理接口和实现分离</div>
+  <p>MBean 接口或描述符定义「能管什么」：哪些属性可读写、哪些操作可调用。</p>
+  <dl>
+    <dt>取舍</dt><dd>暴露的范围是显式选择的，而不是把整个对象交出去。</dd>
+    <dt>还能用在</dt><dd>对外 API 只暴露需要的字段（DTO），内部模型可以自由修改。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>模型 MBean：不改原类就能管理它</div>
+  <p>Commons Modeler 根据 <code>mbeans-descriptors.xml</code> 为现有类生成 MBean。</p>
+  <dl>
+    <dt>取舍</dt><dd>被管理的类不需要实现任何 JMX 接口；代价是描述符和类之间没有编译期检查。</dd>
+    <dt>替代方案</dt><dd>标准 MBean（要求类实现 <code>XxxMBean</code> 接口）。</dd>
+    <dt>还能用在</dt><dd>这是适配器模式：给已有对象套上新接口，例如把内部组件适配成 Micrometer 指标。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch31.html">第 31 章 · 设计模式实战</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>统一的命名规范</div>
+  <p><code>Catalina:type=Manager,context=/app,host=localhost</code>：域 + 键值对，可以按模式查询。</p>
+  <dl>
+    <dt>取舍</dt><dd>命名一旦确定就很难改，监控系统都依赖它。</dd>
+    <dt>还能用在</dt><dd>指标、日志字段、配置键的命名要有规范（Micrometer 的 name + tags 就是同样的结构）。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">4</span>今天的可观测性</div>
+  <p>JMX 仍然存在，但指标更多通过 HTTP 暴露（Prometheus、Spring Boot Actuator），诊断用 JFR。</p>
+  <dl>
+    <dt>取舍</dt><dd>JMX 远程访问配置复杂、防火墙不友好；HTTP 端点容易接入现有监控体系。</dd>
+    <dt>还能用在</dt><dd>新项目优先用 Micrometer + Prometheus，必要时再桥接到 JMX。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+
 <h2 id="summary">小结</h2>
 
 <ul>

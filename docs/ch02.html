@@ -635,6 +635,50 @@ request 的真实类型: jdk.proxy1.$Proxy0
 </pre>
 </div>
 
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>容器只认识 Servlet 接口</div>
+  <p>容器通过 <code>javax.servlet.Servlet</code> 调用应用代码，应用由第三方编写，双方只共享接口。</p>
+  <dl>
+    <dt>取舍</dt><dd>双方可以独立演进；代价是接口一旦发布就很难改，Servlet API 二十年来只能「加」不能「改」。</dd>
+    <dt>替代方案</dt><dd>约定方法名 + 反射调用（脆弱，没有编译期检查）。</dd>
+    <dt>还能用在</dt><dd>做插件系统时，先把 SPI 接口放进一个单独的 api 包或模块，插件和宿主都只依赖它。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch30.html">第 30 章 · 扩展点设计</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>按类名在运行时加载</div>
+  <p><code>URLClassLoader.loadClass(name)</code> + 反射创建实例，容器编译时不知道会有哪些 Servlet。</p>
+  <dl>
+    <dt>取舍</dt><dd>换来了「不改容器就能部署新应用」，失去了编译期检查，错误推迟到运行时才暴露。</dd>
+    <dt>替代方案</dt><dd><code>ServiceLoader</code>、依赖注入容器、显式注册表。</dd>
+    <dt>还能用在</dt><dd>插件、驱动、策略类的动态装配；记得在启动阶段就加载并校验，尽早失败。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch31.html">第 31 章 · 设计模式实战</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>用外观对象挡住内部方法</div>
+  <p><code>Request</code> 有 <code>parse()</code> 等公开方法，直接交给 Servlet，Servlet 就能向下转型去调用；<code>RequestFacade</code> 只暴露接口方法。</p>
+  <dl>
+    <dt>取舍</dt><dd>多一层委托代码；Java 17 版用 JDK 动态代理一次性生成，省掉了手写的几十个方法。</dd>
+    <dt>替代方案</dt><dd>包级可见性；JPMS 模块只 <code>exports</code> API 包，是更强的版本。</dd>
+    <dt>还能用在</dt><dd>把内部对象交给不可信代码（插件、脚本、回调）时，交出接口视图而不是对象本身。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch31.html">第 31 章 · 设计模式实战</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">4</span>按 URI 前缀分派给不同处理器</div>
+  <p><code>/servlet/</code> 开头交给 <code>ServletProcessor</code>，其余交给 <code>StaticResourceProcessor</code>。</p>
+  <dl>
+    <dt>取舍</dt><dd>分派规则写死在 if 里，加一种处理器就要改代码；第 5 章的容器和映射器把它变成了可配置的。</dd>
+    <dt>还能用在</dt><dd>「分派器 + 一组处理器」是 MVC 框架 <code>DispatcherServlet</code> 的雏形，也是命令行工具子命令的常见结构。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch31.html">第 31 章 · 设计模式实战</a></div>
+</div>
+
 <h2 id="summary">小结</h2>
 
 <ul>

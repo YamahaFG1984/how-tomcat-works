@@ -498,6 +498,56 @@ $ ./run.sh ch11.startup.InstancePoolDemo
 </pre>
 </div>
 
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>单实例 + 多线程，要求 Servlet 无状态</div>
+  <p>默认一个 Servlet 实例服务所有请求，并发安全由 Servlet 自己负责。</p>
+  <dl>
+    <dt>取舍</dt><dd>没有实例创建和池化的开销；代价是开发者必须理解「实例字段是共享的」。</dd>
+    <dt>还能用在</dt><dd>Spring 的单例 Controller/Service 也是如此：把状态放在方法局部变量、请求对象或外部存储中。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>被推翻的设计：SingleThreadModel</div>
+  <p>STM Servlet 用实例池保证「一个实例同时只服务一个请求」。Servlet 2.4 废弃，6.0 移除。</p>
+  <dl>
+    <dt>取舍</dt><dd>它给了虚假的安全感：静态变量、Session、外部资源仍然共享；实例池还限制了吞吐。</dd>
+    <dt>还能用在</dt><dd>并发安全不能靠框架「魔法」兜底，要靠无状态设计和明确的同步。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>过滤器链用下标推进</div>
+  <p><code>ApplicationFilterChain</code> 保存过滤器数组和当前位置，每次 <code>doFilter</code> 前进一格，走完调用 Servlet。</p>
+  <dl>
+    <dt>取舍</dt><dd>和 ValveContext 一样是外部迭代器；Filter 是规范接口，所以这个结构一直保留下来。</dd>
+    <dt>还能用在</dt><dd>实现可短路、可前后包裹的中间件链时，这是最直接的写法。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch31.html">第 31 章 · 设计模式实战</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">4</span>懒加载 vs load-on-startup</div>
+  <p>默认第一次请求时才加载 Servlet；配置 <code>load-on-startup</code> 后在启动时加载。</p>
+  <dl>
+    <dt>取舍</dt><dd>懒加载启动快，但第一次请求慢，初始化错误也要等到有人访问才暴露。</dd>
+    <dt>还能用在</dt><dd>关键组件启动时预热并做健康检查，非关键组件懒加载。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">5</span>卸载前等待正在处理的请求</div>
+  <p><code>countAllocated</code> 记录正在使用的实例数，<code>unload()</code> 等它降到 0（有超时）再调用 <code>destroy()</code>。</p>
+  <dl>
+    <dt>取舍</dt><dd>优雅停机要多等一会儿，但不会在请求处理中途销毁对象。</dd>
+    <dt>还能用在</dt><dd>优雅停机的通用写法：停止接收新请求 → 等待在途请求 → 超时强制关闭。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+
 <h2 id="summary">小结</h2>
 
 <ul>

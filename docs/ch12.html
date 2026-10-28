@@ -422,6 +422,49 @@ mappingMatch = CONTEXT_ROOT, pattern = , matchValue =
 </pre>
 </div>
 
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>配置和运行分离</div>
+  <p>Context 不自己解析 web.xml，而是由监听器 <code>ContextConfig</code> 在启动事件里完成，成功后置 <code>configured = true</code>。</p>
+  <dl>
+    <dt>取舍</dt><dd>Context 可以在测试里用代码直接装配；解析逻辑可以替换。</dd>
+    <dt>还能用在</dt><dd>业务组件只接收配置对象，配置从哪里来（文件、注解、配置中心）由单独的装配层负责。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>映射规则有确定的优先级</div>
+  <p>精确匹配 → 最长路径前缀 → 扩展名 → 默认 Servlet。</p>
+  <dl>
+    <dt>取舍</dt><dd>规则固定，结果可预测；代价是灵活性不如正则路由。</dd>
+    <dt>替代方案</dt><dd>正则或通配符路由（灵活，但多条规则冲突时难以判断结果）。</dd>
+    <dt>还能用在</dt><dd>设计路由器、规则引擎时，优先级必须明确并写进文档。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>一个后台线程服务整棵树</div>
+  <p>Tomcat 5 起，Engine 上的一个线程定期调用 <code>backgroundProcess()</code>，并递归调用子容器的。</p>
+  <dl>
+    <dt>取舍</dt><dd>替代了 Tomcat 4 中 Loader、Manager 各开一个线程的做法；线程数不再随应用数增长。</dd>
+    <dt>替代方案</dt><dd>每个组件自己起定时线程。</dd>
+    <dt>还能用在</dt><dd>大量周期性小任务时，用一个调度器统一驱动，而不是各自 <code>new Thread</code>。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">4</span>重载时暂停请求</div>
+  <p><code>paused</code> 标志为 true 时，请求在映射阶段等待，直到重载完成。</p>
+  <dl>
+    <dt>取舍</dt><dd>请求延迟增加，但不会被半初始化的应用处理。</dd>
+    <dt>还能用在</dt><dd>切换配置、切换数据源时先「排空」再切换。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+
 <h2 id="summary">小结</h2>
 
 <ul>

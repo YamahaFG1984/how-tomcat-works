@@ -405,6 +405,47 @@ $ curl -o /dev/null -w '%{http_code}\n' http://localhost:8080/nope       # 没�
   <p>一是像上面那样用 <code>curl -H 'Host: ...'</code> 手动指定请求头；二是在 <code>/etc/hosts</code>（Windows 是 <code>C:\Windows\System32\drivers\etc\hosts</code>）里加一行 <code>127.0.0.1 www.example.com</code>，然后浏览器访问 <code>http://www.example.com:8080/Hello</code>。</p>
 </div>
 
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>每一层只做一次路由</div>
+  <p>Engine 按 Host 头选 Host，Host 按路径选 Context，Context 按 Servlet 路径选 Wrapper。</p>
+  <dl>
+    <dt>取舍</dt><dd>每层的规则都很简单；代价是请求要经过多层调用（Tomcat 后来把映射合并到连接器的 <code>Mapper</code> 里，一次查完）。</dd>
+    <dt>还能用在</dt><dd>多租户系统：先按域名选租户，再按路径选模块，最后选具体处理器。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>总有一个默认值</div>
+  <p>Host 头不匹配任何虚拟主机时，交给 <code>defaultHost</code>。</p>
+  <dl>
+    <dt>取舍</dt><dd>不会因为一个陌生的 Host 头就返回错误；但要注意默认主机不应暴露敏感应用。</dd>
+    <dt>还能用在</dt><dd>路由、配置、策略选择都应该有显式的兜底项。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>错误页渲染也是一个阀</div>
+  <p><code>ErrorReportValve</code> 在请求处理完之后检查状态码，统一生成错误页面。</p>
+  <dl>
+    <dt>取舍</dt><dd>业务代码只需 <code>sendError(404)</code>，页面样式集中在一处。</dd>
+    <dt>还能用在</dt><dd>统一异常处理（Spring 的 <code>@ControllerAdvice</code>）。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch30.html">第 30 章 · 扩展点设计</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">4</span>状态反映到协议上</div>
+  <p>Context 停止时返回 <code>503 Service Unavailable</code>，而不是 500 或 404。</p>
+  <dl>
+    <dt>取舍</dt><dd>客户端和负载均衡器能区分「暂时不可用」和「出错了」，从而重试或切换节点。</dd>
+    <dt>还能用在</dt><dd>健康检查、维护模式、降级：用正确的状态码表达服务状态。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+
 <h2 id="summary">小结</h2>
 
 <ul>

@@ -681,6 +681,59 @@ req2 200
 </pre>
 </div>
 
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>只依赖 Container 接口</div>
+  <p>连接器通过 <code>setContainer()</code> 拿到容器，只调用 <code>invoke()</code>，不知道对面是 Wrapper 还是 Engine。</p>
+  <dl>
+    <dt>取舍</dt><dd>这是依赖倒置：高层（连接器）和低层（具体容器）都依赖抽象，测试时可以塞一个假容器。</dd>
+    <dt>还能用在</dt><dd>任何「框架调用用户代码」的地方：框架定义接口，用户实现，启动代码负责把两者接起来。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>池化昂贵资源</div>
+  <p>启动时预先创建 <code>minProcessors</code> 个 <code>HttpProcessor</code>（各带一个线程），用栈复用。</p>
+  <dl>
+    <dt>取舍</dt><dd>在 JDK 1.4 时代线程和对象都贵；今天普通对象分配很便宜，值得池化的是线程、连接、大缓冲区这类资源。</dd>
+    <dt>替代方案</dt><dd><code>ThreadPoolExecutor</code>（Java 17 版）、虚拟线程（第 27 章，根本不池化）。</dd>
+    <dt>还能用在</dt><dd>数据库连接池、HTTP 客户端连接池、Netty 的 <code>ByteBuf</code> 池；普通业务对象不要池化。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch31.html">第 31 章 · 设计模式实战</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>有界 + 满了就拒绝</div>
+  <p>处理器数量到 <code>maxProcessors</code> 后，新连接直接关闭。</p>
+  <dl>
+    <dt>取舍</dt><dd>拒绝一部分请求，换来其余请求不受影响；无界的话，高峰时所有请求一起变慢，最后 OOM。</dd>
+    <dt>替代方案</dt><dd>排队等待（有界队列）、降级响应（503）。</dd>
+    <dt>还能用在</dt><dd>所有线程池、队列、缓存都要设上限，并且事先想好「满了怎么办」。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">4</span>线程交接别手写 wait/notify</div>
+  <p><code>assign()</code> / <code>await()</code> 用 <code>available</code> 标志 + <code>wait/notifyAll</code> 交接一个 socket。</p>
+  <dl>
+    <dt>取舍</dt><dd>原语级代码容易出错（虚假唤醒、丢通知）；它的语义就是一个容量为 0 的同步队列。</dd>
+    <dt>替代方案</dt><dd><code>SynchronousQueue</code>、<code>Executor</code>、<code>CompletableFuture</code>。</dd>
+    <dt>还能用在</dt><dd>线程之间传递数据优先用 <code>java.util.concurrent</code> 的现成结构。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">5</span>协议特性在边界层消化掉</div>
+  <p>keep-alive、<code>100-continue</code>、chunked 编码都在连接器里实现，容器和 Servlet 感知不到。</p>
+  <dl>
+    <dt>取舍</dt><dd>连接器变复杂，但复杂度只出现在一处。</dd>
+    <dt>还能用在</dt><dd>把重试、压缩、分块、心跳这类传输细节封装在客户端/网关层，不要泄漏给业务代码。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+
 <h2 id="summary">小结</h2>
 
 <ul>

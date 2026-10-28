@@ -617,6 +617,50 @@ Hello, version 2
 </pre>
 </div>
 
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>每个应用一个类加载器</div>
+  <p>每个 Context 有自己的 <code>WebappClassLoader</code>，只能看到自己的 <code>WEB-INF/classes</code> 和 <code>lib</code>。</p>
+  <dl>
+    <dt>取舍</dt><dd>同名类的不同版本可以共存，丢掉加载器就能卸载整个应用；代价是内存占用，以及类加载器泄漏（ThreadLocal、JDBC 驱动注册、静态缓存）。</dd>
+    <dt>替代方案</dt><dd>单一 classpath（简单，但无法隔离和热重载）；JPMS 模块层。</dd>
+    <dt>还能用在</dt><dd>IDE 插件、Jenkins 插件、规则引擎热加载：每个插件一个类加载器。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>有选择地打破双亲委派</div>
+  <p>先查 WEB-INF，再查父加载器；但 <code>java.*</code> 和 Servlet API 永远交给父加载器。</p>
+  <dl>
+    <dt>取舍</dt><dd>应用自带的库优先（避免和容器的库冲突），白名单保证核心类不能被应用替换。</dd>
+    <dt>替代方案</dt><dd>标准的父优先委派。</dd>
+    <dt>还能用在</dt><dd>插件系统里，「共享 API 父优先、插件实现子优先」几乎是标准答案。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>Loader 管策略，ClassLoader 管机制</div>
+  <p><code>WebappLoader</code> 负责组装仓库、启动/停止、检测修改；<code>WebappClassLoader</code> 只负责查找和定义类。</p>
+  <dl>
+    <dt>取舍</dt><dd>两个类各自简单；ClassLoader 可以被替换而不影响重载策略。</dd>
+    <dt>还能用在</dt><dd>把「何时、如何配置」和「具体执行」拆开：调度器 vs 任务、连接池管理 vs 连接。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">4</span>重载 = 整体替换</div>
+  <p>检测到修改后：停止 Context → 丢弃旧加载器 → 新建加载器 → 启动 Context。</p>
+  <dl>
+    <dt>取舍</dt><dd>不尝试在运行中修改已加载的类（JVM 也不允许），换来逻辑简单、状态干净；代价是重载期间请求要等待，Session 要序列化保存。</dd>
+    <dt>替代方案</dt><dd>JRebel 等字节码热替换（复杂）。</dd>
+    <dt>还能用在</dt><dd>不可变部署、蓝绿发布、配置热更新时「构建新对象再原子切换引用」。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+
 <h2 id="summary">小结</h2>
 
 <ul>

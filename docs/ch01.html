@@ -564,6 +564,50 @@ $ curl http://localhost:8080/SHUTDOWN       # 服务器打印「收到 /SHUTDOWN
 
 <p>浏览器加载 index.html 时，控制台会先后打印两条请求：一条 <code>GET /index.html</code>，一条 <code>GET /images/logo.gif</code>——HTML 里的 <code>&lt;img&gt;</code> 让浏览器又发了一次请求。</p>
 
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>把原始流包装成 Request / Response 对象</div>
+  <p><code>HttpServer</code> 只管接收连接，解析交给 <code>Request</code>，输出交给 <code>Response</code>。</p>
+  <dl>
+    <dt>取舍</dt><dd>多了两个类，换来解析逻辑和网络循环解耦：给 <code>Request</code> 一个 <code>ByteArrayInputStream</code> 就能单独测试。</dd>
+    <dt>替代方案</dt><dd>在 accept 循环里直接读写 socket——写得最快，改起来最难。</dd>
+    <dt>还能用在</dt><dd>任何协议处理程序（自定义 TCP 协议、Redis 协议客户端）都先定义「报文对象」，再写 I/O 循环。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>先写正确的串行版本</div>
+  <p>一次只处理一个连接，同步阻塞，处理完再 <code>accept</code> 下一个。</p>
+  <dl>
+    <dt>取舍</dt><dd>没有任何并发问题，代价是一个慢客户端会卡住所有人。</dd>
+    <dt>替代方案</dt><dd>每连接一个线程、线程池（第 4 章）、NIO 多路复用（第 23 章）。</dd>
+    <dt>还能用在</dt><dd>先把业务做对，再把「怎么并发」做成可以替换的执行策略——第 4 章的演进就是这么来的。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>用约定代替配置：URI 直接对应 WEB_ROOT 下的文件</div>
+  <p>不需要路由表，请求 <code>/index.html</code> 就读 <code>webroot/index.html</code>。</p>
+  <dl>
+    <dt>取舍</dt><dd>零配置；但必须防住 <code>/../</code> 路径穿越。原书没防，Java 17 版用 <code>normalize()</code> + <code>startsWith(root)</code> 检查。</dd>
+    <dt>替代方案</dt><dd>显式路由表、白名单。</dd>
+    <dt>还能用在</dt><dd>静态站点、文件下载网关、对象存储代理：凡是把外部输入拼成路径的地方，都要做「根目录逃逸」校验。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">4</span>关闭命令和业务请求走同一个端口</div>
+  <p>请求 <code>/SHUTDOWN</code> 就退出循环。</p>
+  <dl>
+    <dt>取舍</dt><dd>实现简单，但任何能访问端口的人都能关掉服务器。Tomcat 后来改成只监听本机的独立关闭端口 + 口令（第 14 章）。</dd>
+    <dt>还能用在</dt><dd>管理面和数据面分开：不同端口、只绑 127.0.0.1、单独鉴权。Spring Boot 的 <code>management.server.port</code> 就是这个思路。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+
 <h2 id="summary">小结</h2>
 
 <ul>

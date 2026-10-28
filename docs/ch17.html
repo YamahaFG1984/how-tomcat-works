@@ -457,6 +457,38 @@ Tomcat 11 Catalina 已退出
 </pre>
 </div>
 
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>Bootstrap 薄，Catalina 厚</div>
+  <p>Bootstrap 只负责建立类加载器，然后用反射调用 Catalina；Catalina 才处理命令行和启动服务器。</p>
+  <dl>
+    <dt>取舍</dt><dd>让 Tomcat 内部类不出现在系统 classpath 上，Web 应用就看不到它们。代价是启动流程多一次反射。</dd>
+    <dt>还能用在</dt><dd>插件宿主、应用服务器、Spring Boot 的 <code>JarLauncher</code>：启动器先搭类加载环境，再加载真正的主类。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>类加载器层次控制可见性</div>
+  <p>common（双方共享）→ catalina（只有容器能看到）/ shared（只有应用能看到）→ 每个 webapp。</p>
+  <dl>
+    <dt>取舍</dt><dd>层次越多越灵活，也越难排查 <code>ClassCastException</code> 和 <code>NoClassDefFoundError</code>。Tomcat 6 起默认把三层合并为一个 lib 目录。</dd>
+    <dt>还能用在</dt><dd>设计插件系统时，明确哪些类是共享 API、哪些是宿主私有、哪些是插件私有。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>程序与实例分离：HOME vs BASE</div>
+  <p><code>CATALINA_HOME</code> 放二进制，<code>CATALINA_BASE</code> 放 conf、logs、webapps。</p>
+  <dl>
+    <dt>取舍</dt><dd>一份安装可以跑多个实例，升级时只替换 HOME。</dd>
+    <dt>还能用在</dt><dd>程序、配置、数据三者分开存放，是容器镜像和十二要素应用的基本要求。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+
 <h2 id="summary">小结</h2>
 
 <ul>

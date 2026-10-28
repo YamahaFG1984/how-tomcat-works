@@ -539,6 +539,48 @@ StandardManager: 会话 02943F5C26F649609BB6F3124F68EF0D 已过期
 </pre>
 </div>
 
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>Manager 接口：存储策略可替换</div>
+  <p><code>StandardManager</code> 全放内存、停机时序列化；<code>PersistentManager</code> 把不活跃的会话换出到 <code>Store</code>。</p>
+  <dl>
+    <dt>取舍</dt><dd>容器代码只依赖 <code>Manager</code> 接口，换存储不改调用方。</dd>
+    <dt>还能用在</dt><dd>缓存、会话、限流计数器：先定义存储接口，内存实现用于开发和测试，Redis 实现用于生产。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch30.html">第 30 章 · 扩展点设计</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>过期清理 = 访问时检查 + 周期扫描</div>
+  <p><code>isValid()</code> 在访问时检查过期；后台线程定期扫描，清掉没人访问的过期会话。</p>
+  <dl>
+    <dt>取舍</dt><dd>扫描周期越长，过期会话占用内存越久；越短，CPU 开销越大。</dd>
+    <dt>还能用在</dt><dd>Redis、Caffeine 的过期策略都是「惰性 + 主动」结合。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>会话也用外观</div>
+  <p>交给应用的是 <code>StandardSessionFacade</code>，应用拿不到 <code>StandardSession</code> 的内部方法。</p>
+  <dl>
+    <dt>取舍</dt><dd>和第 2 章同样的取舍：多一层委托，换来内部方法不被误用。</dd>
+    <dt>还能用在</dt><dd>凡是对象会被「外部代码」长期持有的地方，都考虑交出视图。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch31.html">第 31 章 · 设计模式实战</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">4</span>序列化即攻击面</div>
+  <p>会话持久化依赖 Java 序列化，反序列化来自磁盘或网络的数据可能触发任意代码执行。</p>
+  <dl>
+    <dt>取舍</dt><dd>Java 17 版加了 <code>ObjectInputFilter</code> 白名单；更好的做法是根本不用 Java 序列化。</dd>
+    <dt>替代方案</dt><dd>JSON 等数据格式、无状态令牌（签名的 JWT）、外部会话存储。</dd>
+    <dt>还能用在</dt><dd>任何反序列化外部数据的地方都要加过滤器或换格式。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+
 <h2 id="summary">小结</h2>
 
 <ul>

@@ -391,6 +391,38 @@ Undeploying context [/app3]
 </pre>
 </div>
 
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>约定优于配置：放进去就部署</div>
+  <p>appBase 下的目录、WAR、<code>conf/&lt;Engine&gt;/&lt;Host&gt;/*.xml</code> 都会被自动发现并部署。</p>
+  <dl>
+    <dt>取舍</dt><dd>新手零配置；但「放错文件也会被部署」，生产环境常关闭 autoDeploy。</dd>
+    <dt>还能用在</dt><dd>插件目录扫描、数据库迁移脚本目录（Flyway）。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>部署器是 Host 的监听器</div>
+  <p><code>HostConfig</code> 实现 <code>LifecycleListener</code>，在 Host 启动和周期事件中工作。</p>
+  <dl>
+    <dt>取舍</dt><dd>部署逻辑可以替换或关闭，<code>StandardHost</code> 本身不需要知道部署细节。</dd>
+    <dt>还能用在</dt><dd>用事件挂载「可选能力」，核心类保持精简。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch30.html">第 30 章 · 扩展点设计</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>被推翻的设计：Deployer 接口</div>
+  <p>Tomcat 4/5 让 <code>StandardHost</code> 实现 <code>Deployer</code>，再全部委托给 <code>StandardHostDeployer</code>；后来移除。</p>
+  <dl>
+    <dt>取舍</dt><dd>为了一个实现定义接口，再让容器把方法转发一遍，只增加了间接层。</dd>
+    <dt>还能用在</dt><dd>只有在出现第二个实现或明确的替换需求时，才抽出接口。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+
 <h2 id="summary">小结</h2>
 
 <ul>

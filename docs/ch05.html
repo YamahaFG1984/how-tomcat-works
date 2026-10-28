@@ -672,6 +672,49 @@ accept:*/*
   <p>用 <code>curl -i</code> 请求 Tomcat 11 版本，状态行是 <code>HTTP/1.1 200</code>，后面没有 <code>OK</code>。从 Tomcat 8.5 起默认不再发送原因短语——RFC 7230 允许省略它，客户端本来就只看状态码。</p>
 </div>
 
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>组合模式：四种容器一棵树</div>
+  <p>Engine、Host、Context、Wrapper 都实现 <code>Container</code>，用 <code>addChild/findChild</code> 组成树，任何一层都能当顶层用。</p>
+  <dl>
+    <dt>取舍</dt><dd>接口统一、可以只部署其中几层（本章就只用了 Context + Wrapper）；代价是接口偏「胖」，Wrapper 的 <code>addChild</code> 只能抛异常。</dd>
+    <dt>替代方案</dt><dd>每层一个不相关的类，靠具体类型连接。</dd>
+    <dt>还能用在</dt><dd>组织架构、菜单、规则树、文件系统：凡是「部分—整体」层级结构都可以用。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>管道 + 阀：可插拔的横切逻辑</div>
+  <p>每个容器有一条管道，附加阀按顺序执行，最后是基础阀；日志、鉴权、统计都以阀的形式插入。</p>
+  <dl>
+    <dt>取舍</dt><dd>不改容器代码就能增加功能；代价是调用链变长、顺序敏感、调试时栈很深。</dd>
+    <dt>替代方案</dt><dd>AOP、装饰器、子类覆盖。</dd>
+    <dt>还能用在</dt><dd>Servlet Filter、Netty <code>ChannelPipeline</code>、OkHttp Interceptor、Spring <code>HandlerInterceptor</code> 都是同一个思路。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch30.html">第 30 章 · 扩展点设计</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>基础阀固定在链尾</div>
+  <p>附加阀可以任意增删，基础阀由容器自己设置，总在最后执行。</p>
+  <dl>
+    <dt>取舍</dt><dd>保证核心逻辑一定存在（除非前面的阀主动短路）；是模板方法思想在链上的变体。</dd>
+    <dt>还能用在</dt><dd>设计中间件链时，把「必须执行的终点」和「可选的中间件」分开管理。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch31.html">第 31 章 · 设计模式实战</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">4</span>被推翻的设计：ValveContext</div>
+  <p>Tomcat 4 用 <code>ValveContext</code> 记录当前执行到第几个阀；Tomcat 5 起阀直接持有 <code>next</code> 引用。</p>
+  <dl>
+    <dt>取舍</dt><dd>ValveContext 是有状态的外部迭代器，必须每个请求一份；链表版无状态、更简单，也更快。</dd>
+    <dt>还能用在</dt><dd>引入辅助对象之前先问：它保存的状态是否真的必要？能不能用不可变结构代替？</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+
 <h2 id="summary">小结</h2>
 
 <ul>

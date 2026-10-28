@@ -539,6 +539,49 @@ $ curl -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/Modern
 </pre>
 </div>
 
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>认证方式和用户存储正交</div>
+  <p><code>Authenticator</code>（BASIC/FORM/DIGEST）负责「怎么问用户要凭据」，<code>Realm</code>（内存/JDBC/LDAP）负责「凭据对不对」。</p>
+  <dl>
+    <dt>取舍</dt><dd>两个维度任意组合，3 种认证 × 3 种存储不需要 9 个类。</dd>
+    <dt>还能用在</dt><dd>Spring Security 的 <code>AuthenticationFilter</code> + <code>AuthenticationProvider</code> / <code>UserDetailsService</code> 是同样的拆分。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch30.html">第 30 章 · 扩展点设计</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>声明式安全</div>
+  <p>受保护的 URL、需要的角色写在 web.xml 的 <code>&lt;security-constraint&gt;</code> 里，不写在 Servlet 代码里。</p>
+  <dl>
+    <dt>取舍</dt><dd>集中、可审计、不会漏写；但粒度只到 URL，细粒度权限还得写代码。</dd>
+    <dt>替代方案</dt><dd>代码里 <code>if (!user.hasRole())</code>（容易遗漏）。</dd>
+    <dt>还能用在</dt><dd>把「谁能访问什么」集中成一张表，代码只负责检查。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>安全检查放在必经之路上</div>
+  <p>认证器是一个阀，加在 Context 管道里，所有请求都会经过。</p>
+  <dl>
+    <dt>取舍</dt><dd>单一入口，不会有绕过的路径；但要注意顺序——它必须在业务阀之前。</dd>
+    <dt>还能用在</dt><dd>网关鉴权、统一的拦截器；不要把权限检查分散在每个接口里。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch30.html">第 30 章 · 扩展点设计</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">4</span>密码不存明文，比较要常量时间</div>
+  <p>原书的 <code>SimpleRealm</code> 明文比较；Java 17 版改为 PBKDF2 加盐哈希，并用 <code>MessageDigest.isEqual</code> 比较。</p>
+  <dl>
+    <dt>取舍</dt><dd>计算慢一些（这正是目的）；常量时间比较防止计时攻击。</dd>
+    <dt>替代方案</dt><dd>bcrypt、scrypt、Argon2。</dd>
+    <dt>还能用在</dt><dd>任何存储凭据的系统。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+
 <h2 id="summary">小结</h2>
 
 <ul>

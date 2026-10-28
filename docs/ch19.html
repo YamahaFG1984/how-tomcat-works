@@ -365,6 +365,39 @@ Tomcat Version: [Apache Tomcat/11.0.21]
 
 <p>二十年过去，<code>list</code> 命令的输出格式几乎没变：「路径:状态:会话数:docBase」。</p>
 
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>标记接口：受控地打破隔离</div>
+  <p>实现 <code>ContainerServlet</code> 的 Servlet 会被注入它的 Wrapper，从而能访问容器内部；只有 privileged 的 Context 才允许。</p>
+  <dl>
+    <dt>取舍</dt><dd>管理功能可以写成普通 Web 应用；但这是一个特权通道，必须严格限制。</dd>
+    <dt>替代方案</dt><dd>JMX（第 20 章）、独立的管理进程。</dd>
+    <dt>还能用在</dt><dd>插件需要访问宿主内部时，用显式的能力接口 + 权限开关，而不是直接暴露宿主对象。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch30.html">第 30 章 · 扩展点设计</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>管理接口要单独鉴权</div>
+  <p>Manager 应用依赖 Realm 和 <code>manager-script</code> 等角色，生产环境通常只允许本机访问。</p>
+  <dl>
+    <dt>取舍</dt><dd>方便自动化部署，同时也是常见的被攻击入口。</dd>
+    <dt>还能用在</dt><dd>运维接口（部署、重启、调日志级别）单独设置角色、来源 IP 限制和审计日志。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>面向脚本的文本协议</div>
+  <p><code>/list</code>、<code>/reload?path=/app</code> 这类命令返回 <code>OK - ...</code> / <code>FAIL - ...</code> 纯文本。</p>
+  <dl>
+    <dt>取舍</dt><dd>用 curl 就能调用，适合 CI 脚本；但不适合复杂的结构化数据。</dd>
+    <dt>替代方案</dt><dd>JSON API。</dd>
+    <dt>还能用在</dt><dd>给自动化使用的接口，返回稳定、易解析的格式，并保证首行就能判断成功与否。</dd>
+  </dl>
+</div>
+
 <h2 id="summary">小结</h2>
 
 <ul>
