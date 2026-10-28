@@ -1,0 +1,536 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 31 章 · 设计模式实战 — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="31">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 31 章 · 设计篇</span>
+<h1>设计模式实战：在 Tomcat 里找到它们，在业务里用上它们</h1>
+<p class="lede">
+  设计模式最难的不是记住类图，而是知道「什么问题该用它」。Tomcat 是一个绝佳的教材：每个模式都是被真实问题逼出来的，
+  而且你已经在前面的章节里读过它们的源码。这一章按「问题 → Tomcat 怎么用 → 业务里怎么用 → 要注意什么」把十二个模式过一遍，
+  每个模式都配了一段可以运行的电商场景代码。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>能在 Tomcat 源码里认出十二个常用模式，并说出它们解决的问题</li>
+    <li>能把每个模式迁移到一个业务场景里</li>
+    <li>理解模式之间如何组合，而不是孤立地使用</li>
+    <li>认识每个模式最常见的误用</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="map">模式地图</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="十二个模式在 Tomcat 架构中的位置">
+  <rect class="bx-b" x="20" y="20" width="200" height="130" rx="12"/>
+  <text class="ttl on-b" x="120" y="44" text-anchor="middle">连接器</text>
+  <rect class="bx" x="36" y="56" width="168" height="24" rx="5"/><text class="sm" x="120" y="73" text-anchor="middle">⑧ 适配器 CoyoteAdapter</text>
+  <rect class="bx" x="36" y="86" width="168" height="24" rx="5"/><text class="sm" x="120" y="103" text-anchor="middle">⑩ 对象池 处理器 / 线程 / Request</text>
+  <rect class="bx" x="36" y="116" width="168" height="24" rx="5"/><text class="sm" x="120" y="133" text-anchor="middle">⑫ 状态机 AsyncStateMachine</text>
+
+  <rect class="bx-a" x="240" y="20" width="300" height="200" rx="12"/>
+  <text class="ttl on-a" x="390" y="44" text-anchor="middle">容器</text>
+  <rect class="bx" x="256" y="56" width="268" height="24" rx="5"/><text class="sm" x="390" y="73" text-anchor="middle">⑤ 组合 Engine ⊃ Host ⊃ Context ⊃ Wrapper</text>
+  <rect class="bx" x="256" y="86" width="268" height="24" rx="5"/><text class="sm" x="390" y="103" text-anchor="middle">② 责任链 Pipeline / Valve、FilterChain</text>
+  <rect class="bx" x="256" y="116" width="268" height="24" rx="5"/><text class="sm" x="390" y="133" text-anchor="middle">⑪ 写时复制 阀数组、监听器数组</text>
+  <rect class="bx" x="256" y="146" width="268" height="24" rx="5"/><text class="sm" x="390" y="163" text-anchor="middle">⑨ 装饰器 ApplicationHttpRequest</text>
+  <rect class="bx" x="256" y="176" width="268" height="24" rx="5"/><text class="sm" x="390" y="193" text-anchor="middle">① 外观 RequestFacade / ContextFacade</text>
+
+  <rect class="bx-g" x="560" y="20" width="180" height="130" rx="12"/>
+  <text class="ttl on-g" x="650" y="44" text-anchor="middle">可替换组件</text>
+  <rect class="bx" x="576" y="56" width="148" height="24" rx="5"/><text class="sm" x="650" y="73" text-anchor="middle">⑥ 策略 Realm / Manager</text>
+  <rect class="bx" x="576" y="86" width="148" height="24" rx="5"/><text class="sm" x="650" y="103" text-anchor="middle">⑥ 策略 Loader / Executor</text>
+  <rect class="bx" x="576" y="116" width="148" height="24" rx="5"/><text class="sm" x="650" y="133" text-anchor="middle">⑧ 适配器 模型 MBean</text>
+
+  <rect class="bx-p" x="20" y="240" width="350" height="76" rx="12"/>
+  <text class="ttl on-p" x="195" y="264" text-anchor="middle">所有组件共享</text>
+  <text class="sm" x="195" y="286" text-anchor="middle">④ 模板方法 LifecycleBase、HttpServlet、ValveBase</text>
+  <text class="sm" x="195" y="304" text-anchor="middle">③ 观察者 LifecycleListener　⑫ 状态机 LifecycleState</text>
+  <rect class="bx-d" x="390" y="240" width="350" height="76" rx="12"/>
+  <text class="ttl" x="565" y="264" text-anchor="middle">装配层</text>
+  <text class="sm" x="565" y="286" text-anchor="middle">⑦ 工厂 + 反射 Digester、className、SCI</text>
+  <text class="sm" x="565" y="304" text-anchor="middle">③ 观察者 ContextConfig / HostConfig 作为监听器</text>
+</svg>
+<figcaption>图 31-1　十二个模式在 Tomcat 里的位置（编号对应下文）</figcaption>
+</figure>
+
+<div class="tw">
+<table>
+  <tr><th>#</th><th>模式</th><th>Tomcat 里的例子</th><th>章节</th><th>本章的业务例子</th></tr>
+  <tr><td>1</td><td>外观</td><td><code>RequestFacade</code>、<code>StandardSessionFacade</code></td><td>2、9、21</td><td>只读的订单视图给插件</td></tr>
+  <tr><td>2</td><td>责任链</td><td><code>Pipeline</code> / <code>Valve</code>、<code>FilterChain</code></td><td>5、11</td><td>价格计算：折扣规则链</td></tr>
+  <tr><td>3</td><td>观察者</td><td><code>LifecycleListener</code>、会话监听器</td><td>6</td><td>订单支付后通知积分和短信</td></tr>
+  <tr><td>4</td><td>模板方法</td><td><code>LifecycleBase</code>、<code>HttpServlet.service</code></td><td>6、7</td><td>批量导入任务</td></tr>
+  <tr><td>5</td><td>组合</td><td>Engine ⊃ Host ⊃ Context ⊃ Wrapper</td><td>5、13</td><td>套装商品计价</td></tr>
+  <tr><td>6</td><td>策略</td><td><code>Realm</code>、<code>Manager</code>、<code>Loader</code></td><td>8～10</td><td>运费计算</td></tr>
+  <tr><td>7</td><td>工厂 + 反射装配</td><td>Digester、<code>className</code>、SCI</td><td>15、25</td><td>按配置创建支付网关</td></tr>
+  <tr><td>8</td><td>适配器</td><td><code>CoyoteAdapter</code>、模型 MBean</td><td>20、23</td><td>包装老短信 SDK</td></tr>
+  <tr><td>9</td><td>装饰器</td><td><code>HttpServletRequestWrapper</code></td><td>21</td><td>给价格服务加缓存</td></tr>
+  <tr><td>10</td><td>对象池</td><td>处理器池、线程池、Request 回收</td><td>4、11、23</td><td>昂贵的 PDF 渲染器</td></tr>
+  <tr><td>11</td><td>写时复制</td><td>监听器数组、阀数组</td><td>6</td><td>促销规则热更新</td></tr>
+  <tr><td>12</td><td>状态机</td><td><code>LifecycleState</code>、<code>AsyncStateMachine</code></td><td>6、24</td><td>订单状态流转</td></tr>
+</table>
+</div>
+
+<h2 id="structural">结构：外观、组合、适配器、装饰器</h2>
+
+<p>这四个模式都是「包一层」，区别在于包的目的：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="外观、适配器、装饰器的区别：接口变少、接口变样、接口不变加功能">
+  <rect class="bx-a" x="20" y="20" width="230" height="150" rx="12"/>
+  <text class="ttl on-a" x="135" y="44" text-anchor="middle">外观：接口变少</text>
+  <rect class="bx" x="40" y="60" width="190" height="60" rx="6"/>
+  <text class="sm" x="135" y="80" text-anchor="middle">Request：parse()、recycle()…</text>
+  <text class="sm" x="135" y="100" text-anchor="middle">getParameter()…</text>
+  <rect class="bx-a" x="70" y="128" width="130" height="28" rx="5"/><text class="sm" x="135" y="147" text-anchor="middle">只暴露规范方法</text>
+  <rect class="bx-b" x="265" y="20" width="230" height="150" rx="12"/>
+  <text class="ttl on-b" x="380" y="44" text-anchor="middle">适配器：接口变样</text>
+  <rect class="bx" x="285" y="60" width="190" height="60" rx="6"/>
+  <text class="sm" x="380" y="80" text-anchor="middle">coyote.Request</text>
+  <text class="sm" x="380" y="100" text-anchor="middle">（协议层的形状）</text>
+  <rect class="bx-b" x="315" y="128" width="130" height="28" rx="5"/><text class="sm" x="380" y="147" text-anchor="middle">→ HttpServletRequest</text>
+  <rect class="bx-g" x="510" y="20" width="230" height="150" rx="12"/>
+  <text class="ttl on-g" x="625" y="44" text-anchor="middle">装饰器：接口不变，加行为</text>
+  <rect class="bx" x="530" y="60" width="190" height="60" rx="6"/>
+  <text class="sm" x="625" y="80" text-anchor="middle">HttpServletRequest</text>
+  <text class="sm" x="625" y="100" text-anchor="middle">（原请求）</text>
+  <rect class="bx-g" x="560" y="128" width="130" height="28" rx="5"/><text class="sm" x="625" y="147" text-anchor="middle">同接口 + 改写路径</text>
+  <text class="sm" x="380" y="196" text-anchor="middle">组合则不是「包一层」，而是「很多层」：让单个对象和一组对象用同一个接口</text>
+</svg>
+<figcaption>图 31-2　三种「包装」的区别在于对接口做了什么</figcaption>
+</figure>
+
+<h3 id="facade">① 外观 Facade</h3>
+
+<div class="dp">
+  <dl>
+    <dt>问题</dt><dd>内部对象有很多公开方法（因为同一个包里的其他类要用），但交给外部代码时，不希望对方调用它们。</dd>
+    <dt>Tomcat</dt><dd>Servlet 拿到的是 <code>RequestFacade</code> 而不是 <code>Request</code>；如果拿到 <code>Request</code>，Servlet 可以向下转型调用 <code>recycle()</code> 把别人的请求清空。</dd>
+    <dt>业务</dt><dd>把订单交给插件、脚本、模板引擎时，交出只读视图；对外 API 返回 DTO 而不是实体。</dd>
+    <dt>注意</dt><dd>外观只挡住「方法」，挡不住「可变对象」：如果视图返回了内部的可变集合，外部照样能改。返回不可变副本或 <code>List.copyOf</code>。</dd>
+  </dl>
+</div>
+
+<div class="code" data-lang="java" data-file="java17/.../design/ch31/PatternTour.java（外观）">
+<pre>
+var order = new Order("A-1", new BigDecimal("100"));
+OrderView forPlugin = Facade.of(OrderView.class, order);       // 第 2 章的 JDK 动态代理外观
+System.out.println("插件看到：" + forPlugin.id() + " " + forPlugin.total());
+System.out.println("能向下转型吗？" + (forPlugin instanceof Order));   // false：applyRefund 碰不到
+</pre>
+</div>
+
+<h3 id="composite">⑤ 组合 Composite</h3>
+
+<div class="dp">
+  <dl>
+    <dt>问题</dt><dd>有层级结构，希望对「一个」和「一组」用同样的方式处理。</dd>
+    <dt>Tomcat</dt><dd>四种容器都是 <code>Container</code>，<code>start()</code>、<code>backgroundProcess()</code>、<code>invoke()</code> 都能沿着树递归。第 5 章甚至可以只部署 Context + Wrapper 两层。</dd>
+    <dt>业务</dt><dd>组织架构、菜单权限、商品套装、审批流程的嵌套步骤、规则组（AND / OR 嵌套）。</dd>
+    <dt>注意</dt><dd>叶子节点不该支持的操作（Wrapper 的 <code>addChild</code>）只能抛异常。Java 17 的 <code>sealed</code> 接口可以把节点类型限定死，让编译器帮你检查。</dd>
+  </dl>
+</div>
+
+<div class="code" data-lang="java" data-file="java17/.../design/ch31/PatternTour.java（组合）">
+<pre>
+sealed interface Item permits Product, Bundle { BigDecimal price(); String name(); }
+
+record Product(String name, BigDecimal price) implements Item { }
+
+record Bundle(String name, List&lt;Item&gt; items, BigDecimal discount) implements Item {
+    @Override public BigDecimal price() {
+        return items.stream().map(Item::price).reduce(BigDecimal.ZERO, BigDecimal::add).subtract(discount);
+    }
+}
+// 套装 = 手机 + 礼盒(手机壳 + 贴膜 − 10) − 100 → 2970
+</pre>
+</div>
+
+<h3 id="adapter">⑧ 适配器 Adapter</h3>
+
+<div class="dp">
+  <dl>
+    <dt>问题</dt><dd>手上的东西和需要的接口形状不一样，又不能（或不该）改其中任何一方。</dd>
+    <dt>Tomcat</dt><dd><code>CoyoteAdapter</code> 把协议层的 <code>coyote.Request</code> 转成 Servlet 世界的 <code>HttpServletRequest</code>；Commons Modeler 用描述符把普通对象适配成 MBean（第 20 章）。</dd>
+    <dt>业务</dt><dd>包装第三方 SDK（短信、支付、对象存储），让业务代码只依赖自己定义的接口——换供应商时只写一个新适配器。</dd>
+    <dt>注意</dt><dd>适配器里只做「翻译」：参数格式、错误码转异常、重试默认值。业务逻辑一旦溜进适配器，换供应商时就要重写它。</dd>
+  </dl>
+</div>
+
+<div class="code" data-lang="java" data-file="java17/.../design/ch31/PatternTour.java（适配器）">
+<pre>
+var sdk = new LegacySmsSdk();                           // 改不了的第三方 SDK：sendSms(mobile, content, retry) 返回错误码
+Notifier notifier = (user, text) -&gt; {                   // 我们需要的接口：notify(user, text)
+    if (sdk.sendSms(mobiles.get(user), text, 3) != 0) throw new IllegalStateException("短信发送失败");
+};
+notifier.notify("alice", "您的订单已发货");
+</pre>
+</div>
+
+<h3 id="decorator">⑨ 装饰器 Decorator</h3>
+
+<div class="dp">
+  <dl>
+    <dt>问题</dt><dd>想给一个对象加行为（缓存、计时、改写某些返回值），又不想改它、也不想用继承。</dd>
+    <dt>Tomcat</dt><dd>分派时用 <code>ApplicationHttpRequest</code> 包住原请求，只改写路径和参数（第 21 章）；Servlet 规范提供 <code>HttpServletRequestWrapper</code> 作为装饰器基类，压缩、XSS 过滤等过滤器都用它。</dd>
+    <dt>业务</dt><dd>给 Repository 加缓存、给远程调用加超时和重试、给任何接口加指标统计。Spring 的 AOP 代理本质上就是自动生成的装饰器。</dd>
+    <dt>注意</dt><dd>层层包装后 <code>instanceof</code> 和 <code>equals</code> 会出乎意料；调试时要知道去拆包装（<code>getRequest()</code>）。</dd>
+  </dl>
+</div>
+
+<div class="code" data-lang="java" data-file="java17/.../design/ch31/PatternTour.java（装饰器）">
+<pre>
+PriceService cached = new PriceService() {             // 同一个接口，包在外面加缓存
+    private final Map&lt;String, BigDecimal&gt; cache = new ConcurrentHashMap&lt;&gt;();
+    @Override public BigDecimal priceOf(String sku) { return cache.computeIfAbsent(sku, remote::priceOf); }
+};
+for (int i = 0; i &lt; 3; i++) cached.priceOf("SKU-1");   // 远程调用 1 次
+</pre>
+</div>
+
+<h2 id="behavioral">行为：责任链、观察者、模板方法、策略、状态机</h2>
+
+<h3 id="chain">② 责任链 Chain of Responsibility</h3>
+
+<div class="dp">
+  <dl>
+    <dt>问题</dt><dd>一个请求要经过一串可增可减的处理步骤，每一步都可能修改请求、提前结束、或者在后续步骤前后做事。</dd>
+    <dt>Tomcat</dt><dd>每个容器的 <code>Pipeline</code>：附加阀按顺序执行，基础阀在最后；Servlet 的 <code>FilterChain</code> 同理。</dd>
+    <dt>业务</dt><dd>价格计算（会员价 → 满减 → 优惠券 → 结算）、请求校验、审批流、风控规则。</dd>
+    <dt>注意</dt><dd>顺序就是语义：先打折再满减和先满减再打折结果不同。把顺序写进配置并加测试，不要依赖注册的先后。</dd>
+  </dl>
+</div>
+
+<div class="code" data-lang="java" data-file="java17/.../design/ch31/PatternTour.java（责任链，用设计工具包的 Pipeline）">
+<pre>
+var pricing = new Pipeline&lt;Cart&gt;(c -&gt; c.notes.add("应付 " + c.price));          // 基础阀：结算
+pricing.addValve((c, next) -&gt; {                                                   // 会员 95 折
+            c.price = c.price.multiply(new BigDecimal("0.95")).setScale(2, RoundingMode.HALF_UP);
+            next.invoke(c);
+        })
+        .addValve((c, next) -&gt; {                                                  // 满 100 减 10
+            if (c.price.compareTo(new BigDecimal("100")) &gt;= 0) c.price = c.price.subtract(BigDecimal.TEN);
+            next.invoke(c);
+        });
+// 原价 120 → [会员 95 折, 满 100 减 10, 应付 104.00]
+</pre>
+</div>
+
+<h3 id="observer">③ 观察者 Observer</h3>
+
+<div class="dp">
+  <dl>
+    <dt>问题</dt><dd>一件事发生后，有好几方需要知道，但发生事件的一方不应该依赖它们。</dd>
+    <dt>Tomcat</dt><dd>组件状态变化时通知 <code>LifecycleListener</code>：ContextConfig 借此在 Context 启动时解析 web.xml（第 15 章），HostConfig 借此部署应用（第 18 章）——核心类不知道它们的存在。</dd>
+    <dt>业务</dt><dd>领域事件：订单支付后通知积分、短信、库存、数据仓库。Spring 的 <code>ApplicationEvent</code>、消息队列都是它的放大版。</dd>
+    <dt>注意</dt><dd>事件链一长，「谁改了这个状态」就很难追踪；监听器之间不要有顺序依赖；在主线程同步执行的监听器会拖慢主流程。</dd>
+  </dl>
+</div>
+
+<div class="code" data-lang="java" data-file="java17/.../design/ch31/PatternTour.java（观察者）">
+<pre>
+List&lt;Consumer&lt;OrderEvent&gt;&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();
+listeners.add(e -&gt; System.out.println("  [积分] " + e.orderId() + " 加 10 分"));
+listeners.add(e -&gt; System.out.println("  [短信] 通知用户：订单 " + e.orderId() + " " + e.type()));
+listeners.forEach(l -&gt; l.accept(new OrderEvent("A-1", "已支付")));   // 订单服务不认识积分和短信
+</pre>
+</div>
+
+<h3 id="template">④ 模板方法 Template Method</h3>
+
+<div class="dp">
+  <dl>
+    <dt>问题</dt><dd>多个类的流程相同、只有某几步不同；流程本身有容易写错的规则（状态检查、异常处理、事件通知）。</dd>
+    <dt>Tomcat</dt><dd><code>LifecycleBase.start()</code> 是 final 的，负责状态机和事件，子类只实现 <code>startInternal()</code>；<code>HttpServlet.service()</code> 按方法名分派到 <code>doGet/doPost</code>；第 7 章的 <code>LoggerBase</code>。</dd>
+    <dt>业务</dt><dd>批量导入（读取 → 校验 → 保存 → 汇总）、报表生成、对接多家支付渠道的通用流程。</dd>
+    <dt>注意</dt><dd>继承只能用一次。如果「不同的那几步」需要自由组合，改用策略（把步骤做成可注入的对象）。</dd>
+  </dl>
+</div>
+
+<div class="code" data-lang="java" data-file="java17/.../design/ch31/PatternTour.java（模板方法）">
+<pre>
+abstract static class ImportJob {
+    final String run(List&lt;String&gt; rows) {               // 流程固定，final 防止子类改顺序
+        int ok = 0;
+        for (String row : rows) {
+            if (!validate(row)) continue;
+            save(row);
+            ok++;
+        }
+        return getClass().getSimpleName() + "：导入 " + ok + "/" + rows.size();
+    }
+    protected abstract boolean validate(String row);
+    protected void save(String row) { }                   // 钩子方法：有默认实现，按需覆盖
+}
+</pre>
+</div>
+
+<h3 id="strategy">⑥ 策略 Strategy</h3>
+
+<div class="dp">
+  <dl>
+    <dt>问题</dt><dd>同一件事有多种做法，要能在运行时或部署时选择，而且不影响使用它的代码。</dd>
+    <dt>Tomcat</dt><dd>Context 用哪个 Realm 校验密码、用哪个 Manager 存会话、用哪个 Loader 加载类，都是可替换的策略（第 30 章的「策略插槽」）。</dd>
+    <dt>业务</dt><dd>运费、税费、价格策略；重试和退避策略；不同租户的风控规则。</dd>
+    <dt>注意</dt><dd>只有两三种、几乎不变的分支，用 <code>switch</code> 就够了。策略的价值在于「新增一种做法时不改老代码」，没有这个需求就是过度设计。</dd>
+  </dl>
+</div>
+
+<div class="code" data-lang="java" data-file="java17/.../design/ch31/PatternTour.java（策略）">
+<pre>
+Map&lt;String, ShippingFee&gt; strategies = Map.of(
+        "standard", amount -&gt; amount.compareTo(new BigDecimal("99")) &gt;= 0 ? BigDecimal.ZERO : new BigDecimal("8"),
+        "express", amount -&gt; new BigDecimal("20"));
+</pre>
+</div>
+
+<h3 id="state">⑫ 状态机 State Machine</h3>
+
+<div class="dp">
+  <dl>
+    <dt>问题</dt><dd>对象有明确的阶段，每个阶段允许的操作不同，非法的转换必须被拒绝。</dd>
+    <dt>Tomcat</dt><dd><code>LifecycleState</code> 规定了组件的合法转换；<code>AsyncStateMachine</code> 处理异步请求里「complete 在 service 返回前被调用」这类竞态（第 24 章）。</dd>
+    <dt>业务</dt><dd>订单、工单、审批、支付单的状态流转。</dd>
+    <dt>注意</dt><dd>状态转换表要集中在一处（枚举或表格），而不是散落在各个 <code>if (status == …)</code> 里。并发修改时要配合乐观锁或 CAS。</dd>
+  </dl>
+</div>
+
+<div class="code" data-lang="java" data-file="java17/.../design/ch31/PatternTour.java（状态机）">
+<pre>
+enum OrderStatus {
+    CREATED, PAID, SHIPPED, COMPLETED, CANCELLED;
+
+    private static final Map&lt;OrderStatus, Set&lt;OrderStatus&gt;&gt; NEXT = new EnumMap&lt;&gt;(Map.of(
+            CREATED, EnumSet.of(PAID, CANCELLED),
+            PAID, EnumSet.of(SHIPPED, CANCELLED),
+            SHIPPED, EnumSet.of(COMPLETED), …));
+
+    OrderStatus to(OrderStatus next) {
+        if (!NEXT.get(this).contains(next)) throw new IllegalStateException(this + " 不能变成 " + next);
+        return next;
+    }
+}
+</pre>
+</div>
+
+<h2 id="creation">创建与资源：工厂、对象池、写时复制</h2>
+
+<h3 id="factory">⑦ 工厂 + 反射装配</h3>
+
+<div class="dp">
+  <dl>
+    <dt>问题</dt><dd>要创建哪个类，编译时不知道，由配置或者类路径上有什么决定。</dd>
+    <dt>Tomcat</dt><dd>Digester 的 <code>ObjectCreateRule</code> 按 XML 里的 <code>className</code> 创建对象（第 15 章）；SCI 按 <code>META-INF/services</code> 创建（第 25 章）。</dd>
+    <dt>业务</dt><dd>按配置选择支付网关、存储后端、消息中间件的实现；插件系统。</dd>
+    <dt>注意</dt><dd>反射把错误推迟到运行时：启动时就把所有配置的类加载并校验一遍，不要等第一个请求来了才发现类名拼错了。</dd>
+  </dl>
+</div>
+
+<div class="code" data-lang="java" data-file="java17/.../design/ch31/PatternTour.java（工厂）">
+<pre>
+String configured = "…PatternTour$AlipayGateway";                      // 来自配置文件
+var gateway = (PaymentGateway) Class.forName(configured).getConstructor().newInstance();
+</pre>
+</div>
+
+<h3 id="pool">⑩ 对象池 Object Pool</h3>
+
+<div class="dp">
+  <dl>
+    <dt>问题</dt><dd>某种对象创建代价很高（线程、连接、加载了大量数据的解析器），而且可以复用。</dd>
+    <dt>Tomcat</dt><dd>第 4 章的 HttpProcessor 池、第 11 章 SingleThreadModel 的实例池、今天的工作线程池；Coyote 的 Request/Response 对象也在连接上回收复用。</dd>
+    <dt>业务</dt><dd>数据库连接池、HTTP 客户端连接池、昂贵的渲染器或模型。</dd>
+    <dt>注意</dt><dd>普通对象不要池化——JVM 分配小对象比从池里取还快，池化还会带来「忘了归还」「归还前没清理状态」两类 bug。池一定要有界，并想好池空时是等待还是失败。</dd>
+  </dl>
+</div>
+
+<div class="code" data-lang="java" data-file="java17/.../design/ch31/PatternTour.java（对象池）">
+<pre>
+&lt;R&gt; R with(Function&lt;T, R&gt; work) throws InterruptedException {
+    T t = idle.take();                                   // 没有空闲的就等（有界）
+    try {
+        return work.apply(t);
+    } finally {
+        idle.add(t);                                     // 一定要还回去
+    }
+}
+</pre>
+</div>
+
+<h3 id="cow">⑪ 写时复制 Copy-on-Write</h3>
+
+<div class="dp">
+  <dl>
+    <dt>问题</dt><dd>一份数据读得非常频繁、改得很少，读的时候不想加锁，改的时候不能影响正在读的人。</dd>
+    <dt>Tomcat</dt><dd>第 6 章的 <code>LifecycleSupport</code> 每次增删监听器都复制数组；管道的阀数组同理。遍历时拿到的是不可变的快照。</dd>
+    <dt>业务</dt><dd>路由表、促销规则、功能开关、黑白名单的热更新：构建一份新的不可变配置，用 <code>AtomicReference</code> 原子替换。</dd>
+    <dt>注意</dt><dd>写多读少时代价很高（每次写都复制全部数据）；它只保证每个读者看到一致的快照，不保证所有读者看到最新值。</dd>
+  </dl>
+</div>
+
+<div class="code" data-lang="java" data-file="java17/.../design/ch31/PatternTour.java（写时复制）">
+<pre>
+var current = new AtomicReference&lt;&gt;(new PromotionRules(List.of("满100减10"), 1));
+PromotionRules seenByRequest = current.get();            // 一个正在处理的请求拿到的快照
+current.updateAndGet(old -&gt; {                            // 运营后台改规则：复制一份再替换引用
+    var copy = new ArrayList&lt;&gt;(old.rules());
+    copy.add("会员95折");
+    return new PromotionRules(List.copyOf(copy), old.version() + 1);
+});
+// 进行中的请求仍然看到 v1，新请求看到 v2
+</pre>
+</div>
+
+<h2 id="together">模式从不单独出现</h2>
+
+<p>
+  在 Tomcat 里，模式总是成组出现的。以一个容器为例，它身上同时有六个模式，每个解决一个不同的问题：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="一个 StandardContext 身上的六个模式">
+  <rect class="bx-a" x="270" y="95" width="220" height="80" rx="14"/>
+  <text class="ttl on-a" x="380" y="128" text-anchor="middle">StandardContext</text>
+  <text class="sm" x="380" y="150" text-anchor="middle">一个类，六个模式</text>
+  <rect class="bx" x="20" y="20" width="220" height="50" rx="10"/><text class="ttl" x="130" y="42" text-anchor="middle">⑤ 组合</text><text class="sm" x="130" y="60" text-anchor="middle">是 Host 的子节点，Wrapper 的父节点</text>
+  <rect class="bx" x="20" y="110" width="220" height="50" rx="10"/><text class="ttl" x="130" y="132" text-anchor="middle">② 责任链</text><text class="sm" x="130" y="150" text-anchor="middle">自己的 Pipeline + 基础阀</text>
+  <rect class="bx" x="20" y="200" width="220" height="50" rx="10"/><text class="ttl" x="130" y="222" text-anchor="middle">④ 模板方法 + ⑫ 状态机</text><text class="sm" x="130" y="240" text-anchor="middle">继承 LifecycleBase</text>
+  <rect class="bx" x="520" y="20" width="220" height="50" rx="10"/><text class="ttl" x="630" y="42" text-anchor="middle">⑥ 策略</text><text class="sm" x="630" y="60" text-anchor="middle">Loader、Manager、Realm 插槽</text>
+  <rect class="bx" x="520" y="110" width="220" height="50" rx="10"/><text class="ttl" x="630" y="132" text-anchor="middle">③ 观察者</text><text class="sm" x="630" y="150" text-anchor="middle">ContextConfig 监听它的启动</text>
+  <rect class="bx" x="520" y="200" width="220" height="50" rx="10"/><text class="ttl" x="630" y="222" text-anchor="middle">① 外观</text><text class="sm" x="630" y="240" text-anchor="middle">对应用暴露 ApplicationContextFacade</text>
+  <path class="ln" d="M242 45 C270 45 280 90 300 98"/>
+  <path class="ln" d="M242 135 H268"/>
+  <path class="ln" d="M242 225 C270 225 280 180 300 172"/>
+  <path class="ln" d="M518 45 C490 45 480 90 460 98"/>
+  <path class="ln" d="M518 135 H492"/>
+  <path class="ln" d="M518 225 C490 225 480 180 460 172"/>
+</svg>
+<figcaption>图 31-3　每个模式只解决一个问题，所以一个类常常需要好几个</figcaption>
+</figure>
+
+<p>
+  这给了一个实用的读源码技巧：看到一个陌生的大类，先问「它是哪棵树上的节点、有没有管道、继承了什么模板、有哪些插槽、谁在监听它、对外暴露的是不是外观」，
+  六个问题问完，类的骨架就清楚了，剩下的才是业务细节。
+</p>
+
+<h2 id="misuse">常见误用</h2>
+
+<div class="tw">
+<table>
+  <tr><th>模式</th><th>误用的症状</th><th>应该怎么做</th></tr>
+  <tr><td>策略</td><td>每个只有一个实现的类都配一个接口和工厂</td><td>出现第二种做法时再抽（第 30 章的三次法则）</td></tr>
+  <tr><td>观察者</td><td>业务流程靠一串事件串起来，没人说得清完整流程</td><td>主流程显式调用，旁路通知才用事件</td></tr>
+  <tr><td>责任链</td><td>链里的处理器互相依赖（「这个阀假设前面那个阀已经设置了某个属性」）</td><td>把依赖写成显式的上下文字段，并对顺序加测试</td></tr>
+  <tr><td>模板方法</td><td>为了复用一个工具方法而继承，形成很深的继承树</td><td>工具方法放进可组合的辅助类（第 6 章的 LifecycleSupport）</td></tr>
+  <tr><td>对象池</td><td>池化普通对象；池无界；归还前不清理状态</td><td>只池化昂贵资源，有界，借出时重置</td></tr>
+  <tr><td>单例（本章没讲）</td><td>用静态单例保存可变的全局状态</td><td>Tomcat 几乎不用单例：组件由装配层创建并注入（第 29 章原则四）</td></tr>
+</table>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/design/ch31/PatternTour.java</code></div>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh design.ch31.PatternTour
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+== 1 外观 Facade ==
+插件看到：A-1 100
+能向下转型吗？false
+
+== 2 责任链 Chain of Responsibility ==
+原价 120 → [会员 95 折, 满 100 减 10, 应付 104.00]
+原价 80 → [会员 95 折, 应付 76.00]
+
+== 3 观察者 Observer ==
+订单服务只发布事件，不认识积分和短信：
+  [积分] A-1 加 10 分
+  [短信] 通知用户：订单 A-1 已支付
+
+== 4 模板方法 Template Method ==
+SkuImportJob：导入 2/3
+
+== 5 组合 Composite ==
+套装 价格 2970（单品和组合用同一个 price() 计算）
+
+== 6 策略 Strategy ==
+standard：订单 50 元运费 8，订单 120 元运费 0
+express：订单 50 元运费 20，订单 120 元运费 20
+
+== 7 工厂 + 反射装配 Factory by name ==
+配置 AlipayGateway → 支付宝扣款 88
+
+== 8 适配器 Adapter ==
+  [老 SDK] sendSms(13800000000, 您的订单已发货, retry=3)
+
+== 9 装饰器 Decorator ==
+查询 3 次，远程调用 1 次
+
+== 10 对象池 Object Pool ==
+渲染 5 次，PdfRenderer 只创建了 2 个
+
+== 11 写时复制 Copy-on-Write ==
+进行中的请求仍然看到 v1 [满100减10]
+新请求看到         v2 [满100减10, 会员95折]
+
+== 12 状态机 State Machine ==
+CREATED → PAID → SHIPPED：SHIPPED
+已发货再取消：SHIPPED 不能变成 CANCELLED
+LifecycleBase 也是状态机：STARTED，允许的下一步 [STOPPING]
+</pre>
+</div>
+
+<div class="box note">
+  <div class="t">&#128161; 一个小插曲</div>
+  <p>
+    第一次运行时外观示例抛了 <code>IllegalAccessException</code>：<code>OrderView</code> 接口是包私有的，而第 2 章的 <code>Facade</code> 在另一个包里用反射调用它的方法。
+    JDK 动态代理要求被代理的接口对调用方可见——这也是为什么 Tomcat 的外观类都实现 <code>public</code> 的规范接口。
+  </p>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>外观、适配器、装饰器都是「包一层」：分别让接口变少、变样、不变但加行为；组合让一个和一组用同一个接口。</li>
+  <li>责任链处理「一串可增减的步骤」，观察者处理「一对多的通知」，模板方法固定流程，策略替换做法，状态机约束阶段。</li>
+  <li>工厂 + 反射让配置决定实现，对象池复用昂贵资源，写时复制让读无锁、写不影响读。</li>
+  <li>模式总是成组出现；读一个大类时，先用六个问题找出它身上的模式。</li>
+  <li>每个模式都有误用：没有第二个实现就不要抽策略，主流程不要靠事件串联，普通对象不要池化。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>把责任链示例里的折扣顺序调换，算出新结果，并写一个测试固定「先打折后满减」的业务规则。</li>
+    <li>给装饰器示例加一个「计时装饰器」，和缓存装饰器叠加使用。两种叠加顺序下，计时结果有什么不同？</li>
+    <li>用组合模式实现一个规则引擎：<code>Rule</code> 有 <code>And</code>、<code>Or</code>、<code>Not</code> 和叶子规则（金额大于 X、用户等级为 Y），用 sealed 接口限定节点类型。</li>
+    <li>在你的项目里找出三个模式的实际使用，按本章的「问题 / 实现 / 注意」格式记录下来，检查是否落入了误用表里的情况。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>
