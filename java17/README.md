@@ -3,7 +3,8 @@
 《How Tomcat Works》原书配套代码（`../HowTomcatWorks`）基于 J2SE 1.4、Servlet 2.3 和 Tomcat 4.1.12。
 这里是每一章的 **Java 17+ 重写版**，配套的图解教程在 `../docs`（可直接部署到 GitHub Pages）。
 
-- 语言级别：`--release 17`（用 JDK 17 或更高版本编译运行；在 JDK 21 上测试通过）
+- 语言级别：`--release 17`（用 JDK 17 或更高版本编译运行；在 JDK 17 和 21 上测试通过）
+  第 27 章的虚拟线程示例放在 `src/main/java21`，由 `java21` profile 在 JDK 21+ 上自动编译
 - 依赖：`org.apache.tomcat.embed:tomcat-embed-core:11.0.21`
   （自带 jakarta.servlet 6.1 API、Catalina、Digester、JULI、modeler），
   第 26 章另加 `tomcat-embed-websocket`（同版本）
@@ -52,6 +53,7 @@ curl http://localhost:8080/SHUTDOWN       # 第 1 章的服务器靠这个 URL �
 | 24 | 异步 Servlet、非阻塞 IO | `ch24.mini.AsyncBootstrap` `ch24.tomcat.EmbeddedAsync` `ch24.LoadClient <URL> [并发数]` |
 | 25 | 可插拔性、SCI、Spring Boot 式启动 | `ch25.demo.DemoApplication`（MiniBoot） `ch25.tomcat.EmbeddedPluggability [端口] [metadataComplete]` |
 | 26 | TLS、HTTP/2、WebSocket | `ch26.ws.MiniWebSocketServer` `ch26.ws.WsClient <ws-URL> [消息…] [--hold=秒]` `ch26.tomcat.EmbeddedWebSocket` `ch26.tomcat.EmbeddedHttp2Tls` `ch26.tomcat.Http2Client <URL> [并发数]` |
+| 27 | 虚拟线程（JDK 21+） | `ch27.VirtualThreadsDemo`（源码在 `src/main/java21`） `ch27.tomcat.EmbeddedVirtualThreads [端口] [true\|false]` |
 
 ## 目录结构
 

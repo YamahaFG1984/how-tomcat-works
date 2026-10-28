@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 27 章 · 虚拟线程 — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="27">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 27 章 · 补充篇</span>
+<h1>虚拟线程：同步代码，异步的效率</h1>
+<p class="lede">
+  回顾前几章的演进：第 4 章一个连接一个线程，简单但线程不够用；第 23 章用 NIO 让等客户端不占线程；
+  第 24 章用异步 Servlet 让等业务不占线程，代价是代码变成了回调。Java 21 的<strong>虚拟线程</strong>给出了第三条路：
+  代码仍然按同步阻塞的方式写，而阻塞时由 JDK 自动把线程「挪开」。Tomcat 11 只需要一个连接器属性就能用上它。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>理解虚拟线程和平台线程的区别：M:N 调度、挂载与卸载</li>
+    <li>知道什么是「钉住」（pinning），以及 JDK 24 做了什么改进</li>
+    <li>会在 Tomcat 11 里开启虚拟线程，并理解它替换了连接器的哪一部分</li>
+    <li>比较线程池、异步 Servlet、虚拟线程三种模型的适用场景</li>
+    <li>知道去掉线程池之后，并发限制要放到哪里</li>
+  </ul>
+</div>
+
+<div class="box note">
+  <div class="t">&#128161; 本章需要 JDK 21+</div>
+  <p>
+    配套工程整体用 <code>--release 17</code> 编译。本章用到虚拟线程 API 的代码放在单独的 <code>src/main/java21</code> 目录，
+    由 pom.xml 里的 <code>java21</code> profile 在 JDK 21 及以上自动编译；用 JDK 17 构建时这部分会被跳过，其余章节不受影响。
+  </p>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="what">平台线程与虚拟线程</h2>
+
+<p>
+  在 Java 21 之前，每个 <code>java.lang.Thread</code> 都对应一个操作系统线程（现在叫<strong>平台线程</strong>）。
+  它的栈由操作系统分配，默认 512 KB～1 MB，创建和切换都要进内核。几千个还行，几十万个就不现实了。
+  <strong>虚拟线程</strong>也是 <code>java.lang.Thread</code>，但由 JDK 自己调度：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 240" role="img" aria-label="平台线程与操作系统线程一一对应，虚拟线程多对多地挂载在少量载体线程上">
+  <text class="ttl" x="20" y="24">平台线程：1 : 1</text>
+  <rect class="bx-a" x="20" y="40" width="70" height="30" rx="6"/><text class="mono sm" x="55" y="60" text-anchor="middle">Thread</text>
+  <rect class="bx-a" x="100" y="40" width="70" height="30" rx="6"/><text class="mono sm" x="135" y="60" text-anchor="middle">Thread</text>
+  <rect class="bx-a" x="180" y="40" width="70" height="30" rx="6"/><text class="mono sm" x="215" y="60" text-anchor="middle">Thread</text>
+  <path class="ln-a" d="M55 72 V110"/><path class="ln-a" d="M135 72 V110"/><path class="ln-a" d="M215 72 V110"/>
+  <rect class="bx" x="20" y="112" width="70" height="30" rx="6"/><text class="mono sm" x="55" y="132" text-anchor="middle">OS 线程</text>
+  <rect class="bx" x="100" y="112" width="70" height="30" rx="6"/><text class="mono sm" x="135" y="132" text-anchor="middle">OS 线程</text>
+  <rect class="bx" x="180" y="112" width="70" height="30" rx="6"/><text class="mono sm" x="215" y="132" text-anchor="middle">OS 线程</text>
+  <text class="sm" x="135" y="166" text-anchor="middle">栈在操作系统里，约 1 MB</text>
+  <text class="sm" x="135" y="184" text-anchor="middle">阻塞 = OS 线程睡着</text>
+
+  <text class="ttl" x="320" y="24">虚拟线程：M : N</text>
+  <rect class="bx-b" x="320" y="40" width="54" height="26" rx="6"/><text class="mono sm" x="347" y="58" text-anchor="middle">VT1</text>
+  <rect class="bx-b" x="380" y="40" width="54" height="26" rx="6"/><text class="mono sm" x="407" y="58" text-anchor="middle">VT2</text>
+  <rect class="bx-d" x="440" y="40" width="54" height="26" rx="6"/><text class="mono sm" x="467" y="58" text-anchor="middle">VT3</text>
+  <rect class="bx-d" x="500" y="40" width="54" height="26" rx="6"/><text class="mono sm" x="527" y="58" text-anchor="middle">VT4</text>
+  <rect class="bx-d" x="560" y="40" width="54" height="26" rx="6"/><text class="mono sm" x="587" y="58" text-anchor="middle">…</text>
+  <rect class="bx-d" x="620" y="40" width="110" height="26" rx="6"/><text class="mono sm" x="675" y="58" text-anchor="middle">VT 100000</text>
+  <path class="ln-b" d="M347 68 V110"/><path class="ln-b" d="M407 68 V110"/>
+  <rect class="bx-p" x="320" y="112" width="200" height="34" rx="8"/>
+  <text class="sm" x="420" y="133" text-anchor="middle">ForkJoinPool：载体线程 × CPU 核数</text>
+  <path class="ln-p" d="M370 148 V176"/><path class="ln-p" d="M470 148 V176"/>
+  <rect class="bx" x="330" y="178" width="80" height="28" rx="6"/><text class="mono sm" x="370" y="197" text-anchor="middle">OS 线程</text>
+  <rect class="bx" x="430" y="178" width="80" height="28" rx="6"/><text class="mono sm" x="470" y="197" text-anchor="middle">OS 线程</text>
+  <text class="sm" x="545" y="102">实线：正在载体上运行</text>
+  <text class="sm" x="545" y="120">虚线：阻塞中，栈帧存在堆上</text>
+  <text class="sm" x="545" y="138">每个只需几百字节～几 KB</text>
+  <text class="sm" x="380" y="230" text-anchor="middle">虚拟线程多到用不完，所以「每个任务一个新线程」，不需要池</text>
+</svg>
+<figcaption>图 27-1　虚拟线程是 JDK 调度的轻量线程，阻塞时不占操作系统线程</figcaption>
+</figure>
+
+<h2 id="mount">挂载与卸载</h2>
+
+<p>
+  关键在于虚拟线程<strong>阻塞</strong>时发生了什么。JDK 把所有阻塞操作（<code>Thread.sleep</code>、socket 读写、<code>BlockingQueue.take</code>、<code>Lock</code>……）都改造过：
+  在虚拟线程里调用时，它们不会让载体线程睡着，而是把虚拟线程的栈帧复制到堆上（卸载），载体线程转去执行别的虚拟线程；
+  等阻塞的条件满足（数据到了、时间到了），虚拟线程被重新放进调度队列，由任意一个空闲的载体线程接着执行（挂载）。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 240" role="img" aria-label="VT1 阻塞时从载体线程卸载，载体去执行 VT2，VT1 醒来后挂载到另一个载体上">
+  <text class="mono sm" x="20" y="54">worker-1</text>
+  <rect class="bx-b" x="100" y="40" width="150" height="24" rx="4"/><text class="sm" x="175" y="56" text-anchor="middle">VT1 运行</text>
+  <rect class="bx-g" x="260" y="40" width="220" height="24" rx="4"/><text class="sm" x="370" y="56" text-anchor="middle">VT2 运行（借用同一个载体）</text>
+  <text class="mono sm" x="20" y="104">worker-2</text>
+  <rect class="bx" x="100" y="90" width="380" height="24" rx="4"/><text class="sm" x="380" y="106" text-anchor="middle">执行其他虚拟线程</text>
+  <rect class="bx-b" x="490" y="90" width="150" height="24" rx="4"/><text class="sm" x="565" y="106" text-anchor="middle">VT1 继续</text>
+  <path class="ln-r" d="M250 66 V150"/>
+  <text class="sm on-r" x="256" y="146">sleep / read：卸载</text>
+  <text class="sm on-r" x="256" y="162">栈帧复制到堆上</text>
+  <path class="ln-g" d="M490 150 V116" marker-end="url(#ar-g)"/>
+  <text class="sm on-g" x="496" y="146">条件满足：挂载</text>
+  <text class="sm on-g" x="496" y="162">（可能换了载体）</text>
+  <text class="sm" x="380" y="210" text-anchor="middle">程序员看到的是一段连续的同步代码；JDK 在背后做了第 23、24 章里我们手写的「保存状态、归还线程、稍后恢复」</text>
+</svg>
+<figcaption>图 27-2　阻塞点就是切换点</figcaption>
+</figure>
+
+<p>
+  本章的实验正好捕捉到了这个过程：同一个虚拟线程，睡之前在 <code>ForkJoinPool-1-worker-2</code> 上，睡醒后跑到了 <code>worker-1</code> 上。
+  这和第 23 章的 <code>SocketWrapper</code> 是同一个思想——把「执行到哪儿了」从线程身上拿走——只是这次由 JDK 替所有代码做了。
+</p>
+
+<h2 id="pinning">钉住：虚拟线程卸载不了的时候</h2>
+
+<p>
+  有两种情况虚拟线程阻塞时无法卸载，只能连同载体线程一起阻塞，叫做<strong>钉住</strong>（pinning）：
+</p>
+
+<ul>
+  <li>在 <code>synchronized</code> 块或方法里阻塞（JDK 21～23）。原因是对象监视器的实现记录的是持有它的<em>载体线程</em>。JDK 24 的 JEP 491 重写了这部分，<code>synchronized</code> 里阻塞也能正常卸载了。</li>
+  <li>在本地方法（JNI）或外部函数调用期间阻塞——这一条至今仍然成立。</li>
+</ul>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="载体只有两个时，synchronized 中阻塞的 8 个任务分 4 批完成，用 ReentrantLock 则一批完成">
+  <text class="ttl" x="20" y="24">synchronized 里 sleep 500ms（JDK 21，载体 2 个）</text>
+  <text class="mono sm" x="20" y="54">worker-1</text>
+  <rect class="bx-r" x="100" y="40" width="140" height="22" rx="4"/><rect class="bx-r" x="244" y="40" width="140" height="22" rx="4"/>
+  <rect class="bx-r" x="388" y="40" width="140" height="22" rx="4"/><rect class="bx-r" x="532" y="40" width="140" height="22" rx="4"/>
+  <text class="mono sm" x="20" y="82">worker-2</text>
+  <rect class="bx-r" x="100" y="68" width="140" height="22" rx="4"/><rect class="bx-r" x="244" y="68" width="140" height="22" rx="4"/>
+  <rect class="bx-r" x="388" y="68" width="140" height="22" rx="4"/><rect class="bx-r" x="532" y="68" width="140" height="22" rx="4"/>
+  <text class="sm on-r" x="680" y="70">2.00 秒</text>
+  <text class="ttl" x="20" y="128">ReentrantLock 里 sleep 500ms</text>
+  <text class="mono sm" x="20" y="158">两个载体</text>
+  <rect class="bx-g" x="100" y="144" width="140" height="22" rx="4"/>
+  <text class="sm" x="248" y="159">8 个任务同时在睡，载体线程空着</text>
+  <text class="sm on-g" x="680" y="159">0.50 秒</text>
+  <text class="sm" x="380" y="196" text-anchor="middle">8 把锁互不相干，没有任何竞争；慢的原因纯粹是载体线程被钉住了</text>
+</svg>
+<figcaption>图 27-3　钉住让虚拟线程退化成了平台线程（JDK 24 起 synchronized 不再钉住）</figcaption>
+</figure>
+
+<p>
+  在 JDK 21～23 上，排查钉住可以加 JFR 事件 <code>jdk.VirtualThreadPinned</code>（默认阈值 20 ms）。
+  建议是：在会阻塞的临界区里优先用 <code>ReentrantLock</code>；升级到 JDK 24+ 后这个问题基本消失。
+</p>
+
+<h2 id="tomcat">Tomcat 11 里的虚拟线程</h2>
+
+<p>
+  回到第 23 章的三类线程：Acceptor 和 Poller 不变，变的是 Worker。开启 <code>useVirtualThreads="true"</code> 后，
+  连接器不再使用 <code>ThreadPoolExecutor</code>，而是换成一个为每个任务新建虚拟线程的执行器：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="开启虚拟线程后，Poller 把每个 SocketProcessor 交给一个新的虚拟线程">
+  <rect class="bx-p" x="20" y="70" width="120" height="50" rx="10"/><text class="ttl on-p" x="80" y="100" text-anchor="middle">Acceptor</text>
+  <path class="ln" d="M142 95 H176" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="180" y="70" width="120" height="50" rx="10"/><text class="ttl on-a" x="240" y="100" text-anchor="middle">Poller</text>
+  <path class="ln" d="M302 95 H336" marker-end="url(#ar)"/>
+  <rect class="bx-d" x="340" y="20" width="400" height="70" rx="10"/>
+  <text class="ttl" x="356" y="44">默认：ThreadPoolExecutor</text>
+  <text class="sm" x="356" y="64">maxThreads = 200 个平台线程，满了排队</text>
+  <text class="mono sm" x="356" y="80">http-nio-8080-exec-1 … exec-200</text>
+  <rect class="bx-b" x="340" y="100" width="400" height="80" rx="10"/>
+  <text class="ttl on-b" x="356" y="124">useVirtualThreads="true"：每个任务一个新虚拟线程</text>
+  <text class="sm" x="356" y="144">没有池，没有 maxThreads；阻塞时自动卸载</text>
+  <text class="mono sm" x="356" y="164">VirtualThread[#28,http-nio-8080-virt-1]</text>
+</svg>
+<figcaption>图 27-4　只替换了 Worker 的来源，Coyote 和容器的其余部分不变</figcaption>
+</figure>
+
+<div class="code" data-lang="xml" data-file="server.xml">
+<pre>
+&lt;Connector port="8080" protocol="HTTP/1.1" useVirtualThreads="true" /&gt;
+</pre>
+</div>
+
+<p>
+  Servlet 代码一行都不用改。Spring Boot 3.2+ 对应的开关是 <code>spring.threads.virtual.enabled=true</code>，它做的就是给 Tomcat 设置这个属性。
+</p>
+
+<h3>三种模型的比较</h3>
+
+<div class="tw">
+<table>
+  <tr><th></th><th>线程池（第 23 章）</th><th>异步 Servlet（第 24 章）</th><th>虚拟线程（本章）</th></tr>
+  <tr><td>代码风格</td><td>同步阻塞</td><td>回调 / Future</td><td>同步阻塞</td></tr>
+  <tr><td>等待时占用</td><td>一个平台线程</td><td>什么都不占</td><td>几 KB 堆内存</td></tr>
+  <tr><td>并发上限</td><td><code>maxThreads</code></td><td>取决于业务的异步能力</td><td>基本只受内存和下游资源限制</td></tr>
+  <tr><td>需要什么</td><td>什么都不需要</td><td>下游必须提供异步 API</td><td>JDK 21+；临界区避免钉住</td></tr>
+  <tr><td>调试</td><td>栈清晰</td><td>栈被回调打断</td><td>栈清晰（<code>jcmd Thread.dump_to_file</code> 能导出虚拟线程）</td></tr>
+  <tr><td>适合</td><td>CPU 密集、并发量可预估</td><td>推送、长轮询、已有响应式栈</td><td>IO 密集、大量阻塞调用的普通业务</td></tr>
+</table>
+</div>
+
+<div class="box warn">
+  <div class="t">&#9888;&#65039; 线程池曾经在悄悄替你限流</div>
+  <p>
+    <code>maxThreads=200</code> 除了限制线程数，还隐含了「最多 200 个请求同时访问数据库」。换成虚拟线程后，
+    1 万个并发请求会同时冲向只有 20 个连接的连接池，变成 1 万个线程排队等连接，或者把下游服务压垮。
+    去掉线程池之后，要在真正稀缺的资源前面显式限流：连接池本身、<code>Semaphore</code>、限流器。
+    另外，用 <code>ThreadLocal</code> 缓存大对象（例如每线程一个 <code>SimpleDateFormat</code>、缓冲区）的老技巧也不再划算——线程不再复用，缓存每次都是新的。
+  </p>
+</div>
+
+<h2 id="java17">代码</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java21/modern/ch27/VirtualThreadsDemo.java</code><code>java17/src/main/java/modern/ch27/tomcat/EmbeddedVirtualThreads.java</code><code>java17/pom.xml（java21 profile）</code></div>
+
+<h3>① 让一个 Maven 工程同时支持 17 和 21</h3>
+
+<div class="code" data-lang="xml" data-file="java17/pom.xml（节选）">
+<pre>
+&lt;profile&gt;
+  &lt;id&gt;java21&lt;/id&gt;
+  &lt;activation&gt;&lt;jdk&gt;[21,)&lt;/jdk&gt;&lt;/activation&gt;     &lt;!-- 用 JDK 21+ 构建时自动激活 --&gt;
+  &lt;build&gt;&lt;plugins&gt;&lt;plugin&gt;
+    &lt;artifactId&gt;maven-compiler-plugin&lt;/artifactId&gt;
+    &lt;executions&gt;&lt;execution&gt;
+      &lt;id&gt;compile-java21&lt;/id&gt;
+      &lt;goals&gt;&lt;goal&gt;compile&lt;/goal&gt;&lt;/goals&gt;
+      &lt;configuration&gt;
+        &lt;release&gt;21&lt;/release&gt;
+        &lt;compileSourceRoots&gt;
+          &lt;compileSourceRoot&gt;${project.basedir}/src/main/java21&lt;/compileSourceRoot&gt;
+        &lt;/compileSourceRoots&gt;
+      &lt;/configuration&gt;
+    &lt;/execution&gt;&lt;/executions&gt;
+  &lt;/plugin&gt;&lt;/plugins&gt;&lt;/build&gt;
+&lt;/profile&gt;
+</pre>
+</div>
+
+<p>
+  Tomcat 示例没有直接调用虚拟线程 API（只设置了一个字符串属性），所以仍放在 <code>src/main/java</code> 里用 <code>--release 17</code> 编译，
+  只是运行时需要 JDK 21。在 JDK 17 上开启这个属性，连接器启动会抛 <code>UnsupportedOperationException</code>，示例里提前检查并给出提示。
+</p>
+
+<h3>② 三个实验</h3>
+
+<div class="code" data-lang="java" data-file="java17/src/main/java21/modern/ch27/VirtualThreadsDemo.java（节选）">
+<pre>
+// 必须在第一个虚拟线程创建之前设置：载体线程只用 2 个，让钉住的效果更明显
+System.setProperty("jdk.virtualThreadScheduler.parallelism", "2");
+
+time("平台线程池（200 个线程）", Executors.newFixedThreadPool(200), 2000, VirtualThreadsDemo::sleepTask);
+time("虚拟线程（每任务一个）  ", Executors.newVirtualThreadPerTaskExecutor(), 2000, VirtualThreadsDemo::sleepTask);
+
+Thread vt = Thread.ofVirtual().name("demo-vt").start(() -&gt; {
+    System.out.println("  睡之前：" + Thread.currentThread());
+    sleep(100);
+    System.out.println("  睡之后：" + Thread.currentThread());
+});
+
+time("synchronized 里 sleep   ", Executors.newVirtualThreadPerTaskExecutor(), 8, i -&gt; {
+    Object lock = new Object();                  // 每个任务一把锁，没有任何竞争
+    synchronized (lock) {
+        sleep(500);                              // JDK 21–23：虚拟线程被钉在载体线程上
+    }
+});
+
+private static void time(String label, ExecutorService executor, int n, Task task) {
+    try (executor) {                             // Java 19+：close() 等待所有任务完成
+        IntStream.range(0, n).forEach(i -&gt; executor.submit(() -&gt; task.run(i)));
+    }
+}
+</pre>
+</div>
+
+<h3>③ Tomcat：一个属性</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch27/tomcat/EmbeddedVirtualThreads.java（节选）">
+<pre>
+if (virtual) {
+    connector.setProperty("useVirtualThreads", "true");   // 每个请求一个新的虚拟线程，没有池
+} else {
+    connector.setProperty("maxThreads", "20");            // 对照组：20 个平台线程
+}
+// Servlet 里就是普通的 Thread.sleep(2000)
+</pre>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch27.VirtualThreadsDemo          # JDK 21+
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+JDK 21.0.10+7-b1163.108，可用 CPU 2
+
+① 2000 个任务，每个阻塞 500ms
+  平台线程池（200 个线程） 用时 5.03 秒
+  虚拟线程（每任务一个）   用时 0.54 秒
+
+② 虚拟线程的样子
+  睡之前：VirtualThread[#2222,demo-vt]/runnable@ForkJoinPool-1-worker-2
+  睡之后：VirtualThread[#2222,demo-vt]/runnable@ForkJoinPool-1-worker-1（载体线程可能换了）
+  isVirtual = true，isDaemon = true
+
+③ 钉住：8 个任务，载体线程只有 2 个，每个任务在锁里阻塞 500ms
+  synchronized 里 sleep    用时 2.00 秒
+  ReentrantLock 里 sleep   用时 0.50 秒
+</pre>
+</div>
+
+<p>
+  ① 平台线程池每批 200 个，2000 个任务分 10 批，正好 5 秒；虚拟线程一次全部开出来，0.5 秒多一点。
+  ③ 在 JDK 24 及以上运行，两行都会是 0.5 秒左右。然后对比 Tomcat 的两种模式（两个服务器分别用不同端口启动）：
+</p>
+
+<div class="code" data-lang="bash">
+<pre>
+./run.sh ch27.tomcat.EmbeddedVirtualThreads 8080 true      # 虚拟线程
+./run.sh ch27.tomcat.EmbeddedVirtualThreads 8081 false     # 20 个平台线程
+curl 'http://localhost:8080/sleep?ms=10'
+curl 'http://localhost:8081/sleep?ms=10'
+./run.sh ch24.LoadClient http://localhost:8080/sleep 200
+./run.sh ch24.LoadClient http://localhost:8081/sleep 200
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+VirtualThread[#28,http-nio-127.0.0.1-8080-virt-1]/runnable@ForkJoinPool-1-worker-1
+Thread[#23,http-nio-127.0.0.1-8081-exec-2,5,main]
+
+/sleep × 200（虚拟线程）：总耗时 2.4 秒， 完成时间分布（秒→个数）{2=200}
+/sleep × 200（20 个平台线程）：总耗时 20.2 秒，完成时间分布（秒→个数）{2=20, 4=20, 6=20, …, 20=20}
+</pre>
+</div>
+
+<p>
+  和第 24 章的异步 Servlet 结果几乎一样（2.2 秒），但这次 Servlet 里写的是最普通的 <code>Thread.sleep</code>，没有 <code>startAsync</code>、没有回调。
+</p>
+
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>把复杂度下沉到平台</div>
+  <p>第 23、24 章手写的「保存状态、归还线程、稍后恢复」，虚拟线程由 JDK 在所有阻塞点统一完成。</p>
+  <dl>
+    <dt>取舍</dt><dd>业务代码保持同步写法，可读、可调试；代价是依赖平台的正确实现，以及钉住这类「抽象泄漏」需要了解底层才能排查。</dd>
+    <dt>替代方案</dt><dd>在应用层用响应式框架（Reactor、RxJava）。</dd>
+    <dt>还能用在</dt><dd>设计内部框架时：能在框架层解决的横切问题（重试、超时、上下文传递），不要让每个业务方各写一遍。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>只替换一个组件来引入新能力</div>
+  <p>Tomcat 只把 Worker 的执行器换成虚拟线程版本，Acceptor、Poller、Processor、容器都没动。</p>
+  <dl>
+    <dt>取舍</dt><dd>一个开关就能启用或回退，风险可控；前提是当初把「执行器」抽象成了可替换的组件（<code>Executor</code> 接口）。</dd>
+    <dt>还能用在</dt><dd>把线程池、HTTP 客户端、序列化器做成可注入的依赖，将来换实现时只动装配代码。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch30.html">第 30 章 · 扩展点设计</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>限流要限在稀缺资源上</div>
+  <p>线程池大小曾经同时起到「限制线程数」和「限制下游并发」两个作用；去掉线程池后，后者要显式实现。</p>
+  <dl>
+    <dt>取舍</dt><dd>显式限流更精确（数据库 20、某个慢服务 5），但需要逐一识别稀缺资源；隐式限流简单却粗糙。</dd>
+    <dt>还能用在</dt><dd>任何用并发换吞吐的地方：批处理任务、爬虫、消息消费者——用 <code>Semaphore</code> 或令牌桶保护下游，而不是靠线程数。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">4</span>一份代码兼容多个 JDK 版本</div>
+  <p>Maven profile 按 JDK 版本额外编译一个源码目录，基线版本不受影响。</p>
+  <dl>
+    <dt>取舍</dt><dd>能提前使用新特性又不抛弃老用户；代价是构建配置更复杂，要在 CI 里同时测试两个版本。</dd>
+    <dt>替代方案</dt><dd>多版本 jar（Multi-Release JAR，<code>META-INF/versions/21/</code>）、反射调用新 API。</dd>
+    <dt>还能用在</dt><dd>开源库的平滑升级：Tomcat 11 自己也用分版本的兼容层（<code>JreCompat</code> 一族）在 Java 17 基线上使用新 JDK 的特性。</dd>
+  </dl>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>虚拟线程是 JDK 调度的轻量线程，M:N 挂载在少量载体线程（ForkJoinPool）上，阻塞时卸载、就绪后重新挂载。</li>
+  <li>在 <code>synchronized</code> 里（JDK 21～23）或本地调用中阻塞会钉住载体线程；JDK 24 的 JEP 491 解决了前者。</li>
+  <li>Tomcat 11 用 <code>useVirtualThreads="true"</code> 把 Worker 线程池换成每任务一个虚拟线程，Servlet 代码不变。</li>
+  <li>虚拟线程适合 IO 密集的同步代码；CPU 密集任务没有收益。</li>
+  <li>去掉线程池之后，要在连接池、<code>Semaphore</code> 等稀缺资源前显式限流，并重新审视 <code>ThreadLocal</code> 缓存。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>在 <code>EmbeddedVirtualThreads</code> 的 Servlet 里加一个 <code>Semaphore(10)</code> 保护「数据库调用」（<code>sleep(200)</code>），用 <code>LoadClient</code> 发 200 个请求，计算并验证总耗时。</li>
+    <li>用 <code>-Djdk.tracePinnedThreads=full</code>（JDK 21～23 可用）运行 <code>VirtualThreadsDemo</code>，看看钉住时打印的栈。</li>
+    <li>写一个 CPU 密集的任务（例如计算 30 万以内的质数个数），分别用平台线程池和虚拟线程跑 100 个，比较耗时并解释结果。</li>
+    <li>用 <code>jcmd &lt;pid&gt; Thread.dump_to_file -format=json dump.json</code> 导出 Tomcat 虚拟线程模式下的线程转储，找到正在 <code>sleep</code> 的虚拟线程。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -32,7 +32,8 @@
     { n: 23, t: 'Coyote 与 NIO 连接器', d: 'Acceptor、Poller、Worker 与 CoyoteAdapter' },
     { n: 24, t: '异步 Servlet 与非阻塞 IO', d: 'AsyncContext、SSE 与 ReadListener' },
     { n: 25, t: '可插拔性与 Spring Boot', d: '注解、SCI、web-fragment 与嵌入式启动' },
-    { n: 26, t: 'TLS、HTTP/2 与 WebSocket', d: 'SNI/ALPN、多路复用、协议升级与帧' }
+    { n: 26, t: 'TLS、HTTP/2 与 WebSocket', d: 'SNI/ALPN、多路复用、协议升级与帧' },
+    { n: 27, t: '虚拟线程', d: 'Java 21 虚拟线程、钉住与 Tomcat 11' }
   ];
 
   const pad = (n) => String(n).padStart(2, '0');

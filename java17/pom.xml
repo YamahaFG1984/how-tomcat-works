@@ -56,4 +56,33 @@
       </plugin>
     </plugins>
   </build>
+
+  <profiles>
+    <!-- 第 27 章：在 JDK 21+ 上额外编译 src/main/java21（虚拟线程 API）；JDK 17 上自动跳过 -->
+    <profile>
+      <id>java21</id>
+      <activation><jdk>[21,)</jdk></activation>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-compiler-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>compile-java21</id>
+                <phase>compile</phase>
+                <goals><goal>compile</goal></goals>
+                <configuration>
+                  <release>21</release>
+                  <compileSourceRoots>
+                    <compileSourceRoot>${project.basedir}/src/main/java21</compileSourceRoot>
+                  </compileSourceRoots>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>
