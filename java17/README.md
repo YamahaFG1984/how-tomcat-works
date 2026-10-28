@@ -60,6 +60,7 @@ curl http://localhost:8080/SHUTDOWN       # 第 1 章的服务器靠这个 URL �
 | 31 | 设计篇：设计模式实战 | `design.ch31.PatternTour` |
 | 32 | 设计篇：并发、隔离与演进 | `design.ch32.NonFunctionalDemo` |
 | 33 | 综合：请求的完整旅程 | `ch33.JourneyTracer`（`curl -u tom:tom123 http://localhost:8080/shop/secure/orders/42`） |
+| 34 | 动手：插件化任务调度器 | `scheduler.SchedulerApp [配置文件] [运行秒数]`（源码在 `modern.scheduler`） |
 
 ## 目录结构
 

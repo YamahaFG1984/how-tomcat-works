@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 34 章 · 动手：插件化任务调度器 — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="34">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 34 章 · 综合与练习</span>
+<h1>动手：插件化任务调度器</h1>
+<p class="lede">
+  检验是否真正掌握了一种设计，最好的办法是把它用在一个完全不同的问题上。这一章做一个和 Web 毫无关系的小系统：
+  定时执行任务的调度器，任务类型由插件提供。它只有七百多行（含注释），却用上了设计篇的几乎每一条原则——
+  组件树和生命周期、拦截器链、事件监听、SPI 与隔离的插件类加载器、配置驱动的装配、有界线程池、JMX、优雅停机。
+  读完后你可以把它当作模板，用在自己的项目里。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>把一份需求翻译成 Tomcat 式的结构：哪些是组件、哪些是扩展点、哪些是装配</li>
+    <li>读懂一个完整的小系统里各种设计决定是如何互相配合的</li>
+    <li>验证重试、超时、不重叠、拒绝、优雅停机这些非功能行为</li>
+    <li>按照练习清单把它扩展成一个真正可用的工具</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="requirements">需求</h2>
+
+<div class="tw">
+<table>
+  <tr><th>需求</th><th>说明</th></tr>
+  <tr><td>按计划执行任务</td><td>「每 N 秒一次」或「启动时一次」</td></tr>
+  <tr><td>任务类型可插拔</td><td>内置几种；第三方把插件放进目录即可新增类型，插件之间、插件和宿主之间依赖隔离</td></tr>
+  <tr><td>配置驱动</td><td>任务、参数、线程数、拦截器都写在配置文件里，改配置不改代码</td></tr>
+  <tr><td>可靠性</td><td>失败重试（指数退避）；单次执行超时；同一个任务不重叠执行；线程池满了拒绝而不是无限排队</td></tr>
+  <tr><td>可观测</td><td>每个任务的执行次数、失败次数、跳过次数、上次耗时可以通过 JMX 查看；支持暂停、恢复、手动触发</td></tr>
+  <tr><td>优雅停机</td><td>Ctrl+C 或正常结束时，不再触发新任务，等待在途任务完成（有超时），停机过程中不再重试</td></tr>
+</table>
+</div>
+
+<p>明确不做的：cron 表达式、持久化、多实例下的分布式锁——它们是本章最后的练习。</p>
+
+<h2 id="mapping">从 Tomcat 借来的设计</h2>
+
+<div class="tw">
+<table>
+  <tr><th>调度器里的东西</th><th>对应的 Tomcat 设计</th><th>章节</th></tr>
+  <tr><td><code>Scheduler</code> ⊃ <code>Job</code>（<code>CompositeComponent</code>）</td><td>Engine ⊃ Wrapper，组合 + 生命周期级联</td><td>5、6、29</td></tr>
+  <tr><td><code>TaskType</code>（SPI）→ <code>Task</code></td><td>Servlet：容器只认识接口，实现由别人提供</td><td>2、30</td></tr>
+  <tr><td><code>TaskContext</code> 接口 / <code>Execution</code> 实现</td><td>RequestFacade / Request：任务只看到视图</td><td>2、31</td></tr>
+  <tr><td>拦截器链 logging → retry → timeout → 任务</td><td>Pipeline + Valve，基础阀调用 Servlet</td><td>5、31</td></tr>
+  <tr><td><code>JobEvent</code> 监听器</td><td>LifecycleListener、请求监听器</td><td>6、30</td></tr>
+  <tr><td>插件目录 + <code>PluginClassLoader</code></td><td>webapps 目录 + WebappClassLoader</td><td>8、18、30</td></tr>
+  <tr><td><code>Assembler</code> + 配置文件</td><td>Digester + server.xml</td><td>15、29</td></tr>
+  <tr><td>ticker 线程只投递、workers 执行</td><td>Poller 只派发、Worker 执行</td><td>23</td></tr>
+  <tr><td>有界线程池 + 拒绝；不重叠</td><td><code>maxThreads</code> / <code>acceptCount</code>；后台任务必须短小</td><td>23、32</td></tr>
+  <tr><td>看门狗定时器</td><td>Poller 顺带做超时检查</td><td>23</td></tr>
+  <tr><td>每个 Job 一个 MBean</td><td>每个组件一个 MBean</td><td>20、28</td></tr>
+  <tr><td>关闭钩子只调用 <code>stop()</code></td><td>Catalina 的关闭钩子</td><td>16</td></tr>
+</table>
+</div>
+
+<h2 id="architecture">结构</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 420" role="img" aria-label="调度器的结构：配置经装配器生成 Scheduler 和 Job，插件目录经 PluginClassLoader 提供任务类型">
+  <rect class="bx-p" x="20" y="20" width="170" height="70" rx="10"/>
+  <text class="ttl on-p" x="105" y="44" text-anchor="middle">配置文件</text>
+  <text class="mono sm" x="105" y="64" text-anchor="middle">jobs = hello, flaky…</text>
+  <text class="mono sm" x="105" y="80" text-anchor="middle">scheduler.threads = 3</text>
+  <rect class="bx-g" x="20" y="110" width="170" height="110" rx="10"/>
+  <text class="ttl on-g" x="105" y="134" text-anchor="middle">任务类型来源</text>
+  <text class="sm" x="105" y="156" text-anchor="middle">类路径：echo、flaky、slow</text>
+  <text class="sm" x="105" y="178" text-anchor="middle">plugins/disk-report/</text>
+  <text class="sm" x="105" y="196" text-anchor="middle">→ PluginClassLoader</text>
+  <text class="sm" x="105" y="212" text-anchor="middle">（ServiceLoader 发现）</text>
+  <path class="ln-p" d="M192 55 C220 55 220 110 236 116" marker-end="url(#ar-p)"/>
+  <path class="ln-g" d="M192 165 C220 165 220 140 236 136" marker-end="url(#ar-g)"/>
+  <rect class="bx" x="240" y="96" width="120" height="56" rx="10"/>
+  <text class="ttl" x="300" y="122" text-anchor="middle">Assembler</text>
+  <text class="sm" x="300" y="140" text-anchor="middle">所有 new 在这里</text>
+  <path class="ln" d="M362 124 H386" marker-end="url(#ar)"/>
+
+  <rect class="bx-a" x="390" y="20" width="350" height="380" rx="14"/>
+  <text class="ttl on-a" x="406" y="44">Scheduler（CompositeComponent）</text>
+  <rect class="bx" x="406" y="56" width="150" height="48" rx="8"/>
+  <text class="sm" x="481" y="76" text-anchor="middle">ticker 线程</text>
+  <text class="sm" x="481" y="94" text-anchor="middle">到点 → trigger()</text>
+  <rect class="bx" x="574" y="56" width="150" height="48" rx="8"/>
+  <text class="sm" x="649" y="76" text-anchor="middle">watchdog 线程</text>
+  <text class="sm" x="649" y="94" text-anchor="middle">超时 → interrupt</text>
+  <rect class="bx-b" x="406" y="114" width="318" height="48" rx="8"/>
+  <text class="sm" x="565" y="134" text-anchor="middle">workers：3 个线程 + 容量 4 的队列</text>
+  <text class="sm" x="565" y="152" text-anchor="middle">满了 → REJECTED 事件</text>
+  <rect class="bx-p" x="406" y="172" width="318" height="70" rx="8"/>
+  <text class="sm" x="565" y="192" text-anchor="middle">pipeline</text>
+  <text class="mono sm" x="565" y="212" text-anchor="middle">logging → retry → timeout → task.run()</text>
+  <text class="sm" x="565" y="232" text-anchor="middle">（顺序来自配置）</text>
+  <rect class="bx-g" x="406" y="252" width="318" height="34" rx="8"/>
+  <text class="sm" x="565" y="274" text-anchor="middle">listeners：retry / alert …（JobEvent）</text>
+  <rect class="bx-d" x="406" y="296" width="318" height="92" rx="10"/>
+  <text class="ttl" x="420" y="318">Job × N（LifecycleBase + JobMXBean）</text>
+  <text class="sm" x="420" y="340">Task、Schedule、参数（启动后不变）</text>
+  <text class="sm" x="420" y="358">running 标志（CAS，防重叠）、计数器</text>
+  <text class="sm" x="420" y="376">start：注册 MBean + 登记调度；stop：注销</text>
+  <rect class="bx" x="20" y="250" width="340" height="150" rx="10"/>
+  <text class="ttl" x="36" y="274">外部</text>
+  <text class="sm" x="36" y="298">JConsole / JMX：modern.scheduler:type=Job,name=…</text>
+  <text class="sm" x="36" y="318">　读统计；pause / resume / runNow</text>
+  <text class="sm" x="36" y="344">关闭钩子：scheduler.stop()</text>
+  <text class="sm" x="36" y="364">　Ctrl+C 和正常结束走同一条路</text>
+  <text class="sm" x="36" y="388">SchedulerApp：装配 → start → 运行 → stop</text>
+</svg>
+<figcaption>图 34-1　调度器的结构：和第 29 章的订单服务、Tomcat 本身是同一个骨架</figcaption>
+</figure>
+
+<h2 id="flow">一次执行的路径</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 320" role="img" aria-label="ticker 触发、CAS 防重叠、提交线程池、拦截器链执行、事件和统计">
+  <rect class="bx" x="20" y="20" width="130" height="50" rx="10"/><text class="ttl" x="85" y="42" text-anchor="middle">ticker</text><text class="sm" x="85" y="60" text-anchor="middle">到点</text>
+  <path class="ln" d="M152 45 H186" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="190" y="20" width="170" height="50" rx="10"/><text class="ttl on-a" x="275" y="42" text-anchor="middle">trigger(job)</text><text class="sm" x="275" y="60" text-anchor="middle">可用？未暂停？</text>
+  <path class="ln" d="M362 45 H396" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="400" y="20" width="170" height="50" rx="10"/><text class="ttl on-a" x="485" y="42" text-anchor="middle">running CAS</text><text class="sm" x="485" y="60" text-anchor="middle">false → true</text>
+  <path class="ln-r" d="M485 72 V100" marker-end="url(#ar-r)"/>
+  <rect class="bx-r" x="410" y="104" width="150" height="34" rx="8"/><text class="sm" x="485" y="126" text-anchor="middle">失败：SKIPPED_OVERLAP</text>
+  <path class="ln" d="M572 45 H606" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="610" y="20" width="130" height="50" rx="10"/><text class="ttl on-b" x="675" y="42" text-anchor="middle">workers</text><text class="sm" x="675" y="60" text-anchor="middle">execute()</text>
+  <path class="ln-r" d="M675 72 V100" marker-end="url(#ar-r)"/>
+  <rect class="bx-r" x="610" y="104" width="130" height="34" rx="8"/><text class="sm" x="675" y="126" text-anchor="middle">满：REJECTED</text>
+  <path class="ln-b" d="M675 140 V164 H380 V176" marker-end="url(#ar-b)"/>
+  <rect class="bx-p" x="20" y="180" width="720" height="80" rx="12"/>
+  <text class="sm" x="40" y="204">工作线程：new Execution → STARTED 事件 → pipeline：</text>
+  <text class="mono sm" x="40" y="226">logging( retry( timeout( task.run(ctx) ) ) )</text><text class="sm" x="40" y="248">→ SUCCEEDED / FAILED 事件，更新计数器，running = false</text>
+  <text class="sm" x="380" y="290" text-anchor="middle">ticker 线程只做判断和投递，几微秒就返回；任何慢的事情都在工作线程里发生</text>
+  <text class="sm" x="380" y="310" text-anchor="middle">不重叠和拒绝都是「主动丢弃」：宁可少跑一次，也不让积压无限增长（第 4、23 章：满了怎么办要事先想好）</text>
+</svg>
+<figcaption>图 34-2　从「到点」到「执行完」：两个检查、一条链、一组事件</figcaption>
+</figure>
+
+<h2 id="code">关键代码</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/scheduler/</code><code>spi/</code><code>core/Scheduler.java</code><code>core/Job.java</code><code>core/Interceptors.java</code><code>Assembler.java</code><code>SchedulerApp.java</code><code>plugins/DiskReportTaskType.java</code></div>
+
+<h3>① SPI：插件只需要实现两个方法</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../scheduler/spi/TaskType.java">
+<pre>
+public interface TaskType {
+
+    String name();
+
+    Task create(Map&lt;String, String&gt; params);
+
+    /** 后加的方法用 default 实现，老插件不用改（第 30 章标准 6） */
+    default String description() {
+        return name();
+    }
+}
+
+@FunctionalInterface
+public interface Task {
+    void run(TaskContext ctx) throws Exception;
+}
+</pre>
+</div>
+
+<p>一个完整的插件（放进 <code>plugins/</code> 目录，配上 <code>META-INF/services/modern.scheduler.spi.TaskType</code>）：</p>
+
+<div class="code" data-lang="java" data-file="java17/.../scheduler/plugins/DiskReportTaskType.java（节选）">
+<pre>
+public class DiskReportTaskType implements TaskType {
+    @Override public String name() { return "disk-report"; }
+
+    @Override
+    public Task create(Map&lt;String, String&gt; params) {
+        var path = new File(params.getOrDefault("path", "."));
+        return ctx -&gt; {
+            long percent = path.getUsableSpace() * 100 / path.getTotalSpace();
+            ctx.log("可用 " + percent + "%，由 " + getClass().getClassLoader() + " 加载");
+        };
+    }
+}
+</pre>
+</div>
+
+<h3>② trigger：只判断、只投递</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../scheduler/core/Scheduler.java（节选）">
+<pre>
+/** ticker 线程上调用：只做判断和投递，几微秒就返回 */
+void trigger(Job job) {
+    if (!job.getState().isAvailable() || job.isPaused()) return;
+    if (!job.running.compareAndSet(false, true)) {         // 上一次还没跑完：跳过，而不是排队
+        job.skipped.incrementAndGet();
+        fire(new JobEvent(JobEvent.Type.SKIPPED_OVERLAP, job.getName(), 0, 0, null));
+        return;
+    }
+    try {
+        workers.execute(() -&gt; execute(job));
+    } catch (RejectedExecutionException e) {               // 线程池和队列都满了
+        job.running.set(false);
+        fire(new JobEvent(JobEvent.Type.REJECTED, job.getName(), 0, 0, e));
+    }
+}
+</pre>
+</div>
+
+<h3>③ 拦截器：重试和超时</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../scheduler/core/Interceptors.java（节选）">
+<pre>
+public static Pipeline.Valve&lt;Execution&gt; retry(int maxAttempts, Duration firstBackoff, Scheduler scheduler) {
+    return (ex, next) -&gt; {
+        long backoff = firstBackoff.toMillis();
+        while (true) {
+            try {
+                next.invoke(ex);
+                return;
+            } catch (Exception e) {
+                // 次数用完、被中断、或者调度器正在停机：不再重试——停机时要尽快收尾
+                if (ex.attempt() &gt;= maxAttempts || e instanceof InterruptedException
+                        || !ex.job().getState().isAvailable()) throw e;
+                scheduler.fire(new JobEvent(JobEvent.Type.RETRYING, …));
+                Thread.sleep(backoff);
+                backoff *= 2;
+                ex.nextAttempt();
+            }
+        }
+    };
+}
+
+/** 超时：共享的看门狗到点中断工作线程；加锁保证任务结束后绝不会误中断这个（要还给线程池的）线程 */
+public static Pipeline.Valve&lt;Execution&gt; timeout(Duration limit, ScheduledExecutorService watchdog) {
+    return (ex, next) -&gt; {
+        Thread worker = Thread.currentThread();
+        Object lock = new Object();
+        boolean[] done = {false};
+        var alarm = watchdog.schedule(() -&gt; {
+            synchronized (lock) { if (!done[0]) worker.interrupt(); }
+        }, limit.toMillis(), TimeUnit.MILLISECONDS);
+        try {
+            next.invoke(ex);
+        } catch (InterruptedException e) {
+            throw new TimeoutException("超过 " + limit.toMillis() + " ms 被中断");
+        } finally {
+            synchronized (lock) { done[0] = true; }
+            alarm.cancel(false);
+            Thread.interrupted();                         // 清掉可能残留的中断标志
+        }
+    };
+}
+</pre>
+</div>
+
+<div class="box key">
+  <div class="t">&#128273; 拦截器的顺序就是语义</div>
+  <p>
+    配置里写的是 <code>logging, retry, timeout</code>：timeout 在 retry 里面，所以<strong>每次尝试</strong>各有 800 ms；
+    如果写成 <code>logging, timeout, retry</code>，就变成「所有重试加起来」只有 800 ms。logging 在最外层，所以它只记录最终结果，
+    重试过程由 <code>RETRYING</code> 事件交给监听器报告。这正是第 31 章「责任链：顺序就是语义」的例子。
+  </p>
+</div>
+
+<h3>④ 停机：先停组件，再停线程</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../scheduler/core/Scheduler.java（节选）">
+<pre>
+@Override
+protected void startSelf() {          // 先准备好线程，子组件（Job）启动时才能登记调度
+    ticker = Executors.newSingleThreadScheduledExecutor(named("scheduler-ticker"));
+    workers = new ThreadPoolExecutor(workerThreads, workerThreads, 0, TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue&lt;&gt;(queueCapacity), named("job-worker"), new ThreadPoolExecutor.AbortPolicy());
+}
+
+@Override
+protected void stopSelf() {           // 子组件都停了之后（不再触发）：先停止投递，再等在途任务
+    ticker.shutdownNow();
+    workers.shutdown();
+    if (!workers.awaitTermination(shutdownGrace.toMillis(), TimeUnit.MILLISECONDS)) {
+        workers.shutdownNow();        // 宽限期过了：中断剩余任务
+    }
+    watchdog.shutdownNow();
+}
+</pre>
+</div>
+
+<p>
+  <code>CompositeComponent</code> 保证了顺序：先倒序停止所有 Job（它们变成不可用，<code>trigger</code> 和重试都会看到），然后才调用 <code>stopSelf</code> 收拾线程池。
+  这和第 29 章「先关大门，再停核心」、第 11 章「卸载前等待在途请求」是同一件事。
+</p>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh scheduler.SchedulerApp 4            # 内置演示配置，运行 4 秒
+./run.sh scheduler.SchedulerApp my.properties 60   # 用自己的配置运行 60 秒（可以开 JConsole 连上去看）
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+  发现 echo         ← classpath（打印 message 参数）
+  发现 flaky        ← classpath（前 failTimes 次尝试失败）
+  发现 slow         ← classpath（睡 sleep 毫秒）
+  发现 disk-report  ← plugin disk-report（报告 path 所在磁盘的可用空间）
+任务类型：[disk-report, echo, flaky, slow]
+[lifecycle] scheduler NEW → INITIALIZING
+…
+[lifecycle] scheduler STARTING → STARTED
+  [stuck#1 job-worker-1] 开始，预计 5000 ms
+  [disk#1 job-worker-2] 可用 22%（8 GB / 39 GB），由 PluginClassLoader(disk-report) 加载
+  [disk#1 job-worker-2] 成功，用时 33 ms
+  [slow#1 job-worker-3] 开始，预计 700 ms
+  [alert] 任务 slow 上一次还没结束，本次跳过                  ← 不重叠
+  [retry] 任务 stuck 第 1 次失败（超过 800 ms 被中断），稍后重试   ← 超时 + 重试
+  [alert] 任务 slow 上一次还没结束，本次跳过
+  [stuck#2 job-worker-1] 开始，预计 5000 ms
+  [hello#1 job-worker-2] 你好，调度器
+  [hello#1 job-worker-2] 成功，用时 0 ms
+  [slow#1 job-worker-3] 完成
+  [slow#1 job-worker-3] 成功，用时 700 ms
+  …
+  [retry] 任务 flaky 第 1 次失败（下游 503（第 1 次）），稍后重试
+  [retry] 任务 flaky 第 2 次失败（下游 503（第 2 次）），稍后重试
+  [flaky#3 job-worker-2] 下游恢复，处理成功                     ← 第三次成功
+  [flaky#3 job-worker-2] 成功，用时 301 ms
+  [stuck#3 job-worker-1] 失败：java.util.concurrent.TimeoutException: 超过 800 ms 被中断
+  [alert] 任务 stuck 在第 3 次尝试后失败：超过 800 ms 被中断
+  …
+
+—— 运行 4 秒后，通过 JMX 读取统计（第 20 章）——
+  disk   type=disk-report  once           runs=1 failures=0 skipped=0 last=34ms
+  flaky  type=flaky        every 2000ms   runs=1 failures=0 skipped=0 last=301ms
+  hello  type=echo         every 1000ms   runs=4 failures=0 skipped=0 last=0ms
+  slow   type=slow         every 300ms    runs=4 failures=0 skipped=8 last=700ms
+  stuck  type=slow         once           runs=1 failures=1 skipped=0 last=2709ms
+
+—— 停止 ——
+[lifecycle] scheduler STARTED → STOPPING
+  [flaky#2 job-worker-1] 失败：java.lang.IllegalStateException: 下游 503（第 2 次）   ← 停机中不再重试
+  [alert] 任务 flaky 在第 2 次尝试后失败：下游 503（第 2 次）
+  [slow#1 job-worker-3] 完成                                  ← 在途任务被允许完成
+  [slow#1 job-worker-3] 成功，用时 700 ms
+[lifecycle] scheduler STOPPING → STOPPED
+</pre>
+</div>
+
+<p>对照需求逐条检查：</p>
+
+<ul>
+  <li><strong>插件</strong>：<code>disk-report</code> 来自插件目录，由 <code>PluginClassLoader(disk-report)</code> 加载。</li>
+  <li><strong>重试</strong>：<code>flaky</code> 前两次失败、第三次成功，统计里 failures=0——重试成功不算失败。</li>
+  <li><strong>超时</strong>：<code>stuck</code> 三次尝试各被中断，总耗时 2709 ms ≈ 3 × 800 + 100 + 200 的退避。</li>
+  <li><strong>不重叠</strong>：<code>slow</code> 每 300 ms 触发一次但每次要 700 ms，4 秒里执行 4 次、跳过 8 次。</li>
+  <li><strong>可观测</strong>：统计是通过平台 MBeanServer 读出来的，JConsole 里同样能看到并调用 <code>pause</code>、<code>runNow</code>。</li>
+  <li><strong>优雅停机</strong>：正在重试的 <code>flaky</code> 放弃了后续重试，正在执行的 <code>slow</code> 跑完后才进入 STOPPED。</li>
+</ul>
+
+<h2 id="exercises">扩展练习</h2>
+
+<p>下面的练习按难度排列。每一个都能在不修改已有类（或只改装配器）的前提下完成——这本身就是对设计的检验。</p>
+
+<ol class="steps">
+  <li><strong>新任务类型</strong>：写一个 <code>http-check</code> 插件，用 <code>HttpClient</code> 请求一个 URL，状态码不是 2xx 就抛异常。打成 jar 放进插件目录。</li>
+  <li><strong>新拦截器</strong>：<code>metrics</code> 拦截器把每次执行的耗时记到直方图里，并像第 28 章那样以 Prometheus 格式输出。</li>
+  <li><strong>新调度规则</strong>：支持 <code>cron 0 */5 * * * *</code>。只需要扩展 <code>Schedule</code> 和 <code>scheduleJob</code>——想想怎样把「下一次执行时间」的计算做成策略。</li>
+  <li><strong>舱壁</strong>：允许 <code>job.x.pool = slow-pool</code>，让慢任务使用单独的线程池（第 32 章实验 ③）。</li>
+  <li><strong>配置热更新</strong>：监视配置文件，变化时构建新的 Job 集合，对比后增删 Job（<code>addChild</code> 会立即启动，<code>removeChild</code> 会停止）。哪些修改可以不重启就生效？</li>
+  <li><strong>管理控制台</strong>：用嵌入式 Tomcat 加一个 HTTP 管理页面：列出任务、显示统计、一键暂停和触发。参考第 19、20 章，管理入口记得用 <code>RemoteAddrValve</code> 保护（第 28 章）。</li>
+  <li><strong>执行历史</strong>：加一个监听器，把每次执行结果写进 SQLite 或文件；思考它应该同步还是异步写，写失败了要不要影响任务。</li>
+  <li><strong>多实例</strong>：部署两份调度器时，同一个任务只能有一个实例执行。用数据库行锁或 Redis 实现一个「分布式不重叠」拦截器。</li>
+</ol>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>同一个骨架（组件树 + 生命周期 + 管道 + 装配）既能撑起 Tomcat，也能撑起一个调度器或订单服务。</li>
+  <li>扩展点按形态选择：任务类型是策略 + 发现机制，重试和超时是拦截链，告警是监听器。</li>
+  <li>非功能行为都要「事先想好满了怎么办」：不重叠是丢弃，线程池满是拒绝，超时是中断，停机时放弃重试。</li>
+  <li>线程分工沿用 Poller/Worker：调度线程只投递，执行线程做慢事，看门狗统一处理超时。</li>
+  <li>扩展练习都不需要修改已有的核心类——这是检验一个设计好坏最直接的方法。</li>
+</ul>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>
