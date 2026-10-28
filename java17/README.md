@@ -48,6 +48,7 @@ curl http://localhost:8080/SHUTDOWN       # 第 1 章的服务器靠这个 URL �
 | 21 | ServletContext、RequestDispatcher | `ch21.mini.DispatcherDemo` `ch21.tomcat.EmbeddedDispatch` |
 | 22 | 静态资源、错误页、字符编码 | `ch22.tomcat.EmbeddedStatic`（含 `ch22.mini.MiniDefaultServlet`） |
 | 23 | Coyote 与 NIO 连接器 | `ch23.nio.Bootstrap [端口] [worker] [maxConnections]` `ch23.nio.SlowClients [端口] [连接数] [秒]` `ch23.tomcat.EmbeddedNio` |
+| 24 | 异步 Servlet、非阻塞 IO | `ch24.mini.AsyncBootstrap` `ch24.tomcat.EmbeddedAsync` `ch24.LoadClient <URL> [并发数]` |
 
 ## 目录结构
 

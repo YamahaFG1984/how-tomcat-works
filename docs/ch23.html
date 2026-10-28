@@ -375,11 +375,10 @@ while (true) {
         poller.readAgain(w);                       // 不完整：线程走人，数据到了再说
         return;
     }
-    Adapter.RawResponse resp = adapter.service(req);
-    boolean keepAlive = req.keepAlive() &amp;&amp; running;
-    writeFully(encode(resp, keepAlive));
-    if (!keepAlive) { close(w); return; }
-    if (!buf.hasRemaining()) { poller.readAgain(w); return; }
+    var future = adapter.serviceAsync(req);        // 同步 Adapter 返回一个已完成的 Future
+    if (!future.isDone()) { … return; }            // 异步分支：第 24 章再讲
+    // respond()：写响应；不保持连接就 close，缓冲区空了就 readAgain，两种情况都返回 false
+    if (!respond(req, future)) return;
     // 缓冲区里还有字节：流水线发来的下一个请求，继续循环
 }
 </pre>

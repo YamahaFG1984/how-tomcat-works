@@ -11,6 +11,9 @@ import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.Queue;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -216,26 +219,48 @@ public final class NioEndpoint {
                         return;
                     }
                     w.requests++;
-                    Adapter.RawResponse resp;
-                    try {
-                        resp = adapter.service(req);
-                    } catch (Exception e) {
-                        resp = new Adapter.RawResponse(500, "text/plain", e.toString().getBytes(StandardCharsets.UTF_8));
-                    }
-                    boolean keepAlive = req.keepAlive() && running;
-                    writeFully(encode(resp, keepAlive));
-                    if (!keepAlive) {
-                        close(w);
+                    CompletableFuture<Adapter.RawResponse> future = adapter.serviceAsync(req);
+                    if (!future.isDone()) {
+                        // 异步：Worker 线程现在就归还；业务完成时再派一个线程回来写响应（第 24 章）
+                        future.whenComplete((r, e) -> executor.execute(() -> {
+                            try {
+                                if (respond(req, future)) run();       // 流水线里还有请求，接着处理
+                            } catch (IOException | RuntimeException ex) {
+                                close(w);
+                            }
+                        }));
                         return;
                     }
-                    if (!buf.hasRemaining()) {                     // 没有流水线里的下一个请求
-                        poller.readAgain(w);
+                    if (!respond(req, future)) {
                         return;
                     }
+                    // 缓冲区里还有字节：流水线发来的下一个请求，继续循环
                 }
             } catch (IOException | RuntimeException e) {
                 close(w);
             }
+        }
+
+        /** 写响应；返回 true 表示连接保持、而且缓冲区里已经有下一个请求 */
+        private boolean respond(RawRequest req, CompletableFuture<Adapter.RawResponse> future) throws IOException {
+            Adapter.RawResponse resp;
+            try {
+                resp = future.join();
+            } catch (CompletionException | CancellationException e) {
+                Throwable cause = e.getCause() == null ? e : e.getCause();
+                resp = new Adapter.RawResponse(500, "text/plain", cause.toString().getBytes(StandardCharsets.UTF_8));
+            }
+            boolean keepAlive = req.keepAlive() && running;
+            writeFully(encode(resp, keepAlive));
+            if (!keepAlive) {
+                close(w);
+                return false;
+            }
+            if (!w.readBuffer.hasRemaining()) {                    // 没有流水线里的下一个请求
+                poller.readAgain(w);
+                return false;
+            }
+            return true;
         }
 
         /** 非阻塞写可能只写出一部分；内核缓冲区满时临时用一个 Selector 等它可写（Tomcat 早期的 NioSelectorPool 也是这样） */
