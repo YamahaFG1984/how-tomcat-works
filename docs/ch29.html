@@ -1,0 +1,593 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 29 章 · 整体架构：分层与边界 — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="29">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 29 章 · 设计篇</span>
+<h1>整体架构：分层与边界</h1>
+<p class="lede">
+  前 28 章是在「拆」Tomcat：一个零件一个零件地看它怎么工作。设计篇反过来「装」：
+  把散落在各章的设计决定收拢成几条可以带走的原则，并用它们去设计一个和 Web 毫无关系的系统。
+  这一章讲宏观——Tomcat 为什么能在 25 年里换掉连接器、换掉线程模型、换掉包名，却没有推倒重来。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>能画出 Tomcat 的分层图，说出每一层负责什么、隔着什么接口</li>
+    <li>掌握五条架构原则：按变化切分、窄接口、统一组件模型、配置/装配/运行分离、依赖指向内核</li>
+    <li>会把这些原则映射到一个普通的业务系统上</li>
+    <li>知道什么时候<strong>不该</strong>这样设计</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="map">全景：Tomcat 的层次</h2>
+
+<p>
+  把前面各章放到一张图里，Tomcat 大致分成下面几层。纵向是控制流（谁创建谁、谁调用谁），右侧标注了对应的章节：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 430" role="img" aria-label="Tomcat 的分层：启动层、装配层、运行时骨架、边界层、核心层、可替换组件和管理面">
+  <rect class="bx-d" x="20" y="14" width="560" height="44" rx="10"/>
+  <text class="ttl" x="36" y="34">启动层</text>
+  <text class="sm" x="36" y="50">Bootstrap、Catalina、脚本：进程、类加载器层次、命令行</text>
+  <text class="sm" x="600" y="40">第 16、17 章</text>
+
+  <rect class="bx-p" x="20" y="68" width="560" height="44" rx="10"/>
+  <text class="ttl on-p" x="36" y="88">装配层</text>
+  <text class="sm" x="36" y="104">Digester、ContextConfig、HostConfig、嵌入式 API：配置 → 对象图</text>
+  <text class="sm" x="600" y="94">第 15、18、25 章</text>
+
+  <rect class="bx" x="20" y="122" width="560" height="44" rx="10"/>
+  <text class="ttl" x="36" y="142">运行时骨架</text>
+  <text class="sm" x="36" y="158">Server、Service、Lifecycle：把各部分组织成一棵可以整体启停的树</text>
+  <text class="sm" x="600" y="148">第 6、14 章</text>
+
+  <rect class="bx-b" x="20" y="176" width="200" height="120" rx="10"/>
+  <text class="ttl on-b" x="120" y="200" text-anchor="middle">边界层</text>
+  <text class="sm" x="120" y="222" text-anchor="middle">Connector / Coyote</text>
+  <text class="sm" x="120" y="240" text-anchor="middle">字节 ↔ 请求对象</text>
+  <text class="sm" x="120" y="258" text-anchor="middle">IO 模型、TLS、HTTP/2</text>
+  <text class="sm" x="120" y="282" text-anchor="middle">第 3、4、23～27 章</text>
+  <path class="ln-g" d="M222 236 H262" marker-end="url(#ar-g)"/>
+  <text class="mono sm on-g" x="242" y="228" text-anchor="middle">Adapter</text>
+  <rect class="bx-a" x="266" y="176" width="314" height="120" rx="10"/>
+  <text class="ttl on-a" x="423" y="200" text-anchor="middle">核心层：容器树 + 管道</text>
+  <text class="sm" x="423" y="222" text-anchor="middle">Engine → Host → Context → Wrapper</text>
+  <text class="sm" x="423" y="240" text-anchor="middle">每层一条 Pipeline，基础阀负责路由</text>
+  <text class="sm" x="423" y="258" text-anchor="middle">过滤器链 → Servlet（应用代码）</text>
+  <text class="sm" x="423" y="282" text-anchor="middle">第 5、11～13、21、22 章</text>
+
+  <rect class="bx-g" x="20" y="306" width="560" height="54" rx="10"/>
+  <text class="ttl on-g" x="36" y="328">可替换组件（策略插槽）</text>
+  <text class="sm" x="36" y="348">Loader（类加载）、Manager/Store（会话）、Realm（用户）、Logger、Resources —— 核心只依赖它们的接口</text>
+  <text class="sm" x="600" y="334">第 7～10 章</text>
+
+  <rect class="bx-r" x="20" y="370" width="560" height="44" rx="10"/>
+  <text class="ttl on-r" x="36" y="390">管理面</text>
+  <text class="sm" x="36" y="406">JMX MBean、Manager 应用、访问日志：从外部观察和操作运行中的组件</text>
+  <text class="sm" x="600" y="396">第 19、20、28 章</text>
+</svg>
+<figcaption>图 29-1　Tomcat 的层次：越往下越稳定，越往上越容易变</figcaption>
+</figure>
+
+<p>
+  这张图里藏着本章要讲的全部原则。下面逐条拆开，每条都回答三个问题：Tomcat 怎么做的、为什么这样做、你的项目里对应什么。
+</p>
+
+<h2 id="change">原则一：按「变化的原因」切分</h2>
+
+<p>
+  模块边界该画在哪里？最可靠的答案是：<strong>把会因为不同原因、在不同时间变化的东西分开</strong>。
+  回顾 Tomcat 二十多年的变化，每一种变化都被关在了一个模块里：
+</p>
+
+<div class="tw">
+<table>
+  <tr><th>会变的东西</th><th>历史上的变化</th><th>被关在哪里</th><th>对外的接口</th></tr>
+  <tr><td>网络协议</td><td>HTTP/1.1 → AJP → HTTP/2 → WebSocket</td><td>Coyote 的 Processor / UpgradeProtocol</td><td><code>Adapter.service()</code></td></tr>
+  <tr><td>IO 与线程模型</td><td>BIO → NIO → NIO2 → APR（已删除）→ 虚拟线程</td><td>Endpoint、Executor</td><td>Processor 看到的 socket 包装</td></tr>
+  <tr><td>部署方式</td><td>server.xml → 嵌入式 → Spring Boot</td><td>装配层</td><td>组件的构造器和 setter</td></tr>
+  <tr><td>应用代码</td><td>Servlet 2.3 → 6.1，javax → jakarta</td><td>Web 应用（独立类加载器）</td><td>Servlet API</td></tr>
+  <tr><td>用户与会话存储</td><td>内存 → 文件 → JDBC → LDAP</td><td>Realm、Manager/Store</td><td>各自的接口</td></tr>
+</table>
+</div>
+
+<p>
+  反过来看，第 4 章的 <code>HttpProcessor</code> 就是一个反例：它既解析协议、又管线程（<code>assign/await</code>）、又调用容器。
+  后来 Coyote 把它拆成了三块，正是因为这三件事是按不同节奏变化的。
+</p>
+
+<div class="box key">
+  <div class="t">&#128273; 在你的项目里</div>
+  <p>
+    列出「将来最可能变的东西」：接入方式（HTTP → 消息队列 → gRPC）、外部依赖（换支付渠道、换短信服务商）、业务规则（促销策略）、部署形态（单体 → 拆服务）。
+    每一项都应该能在<strong>一个</strong>模块里改完，而不是散落在整个代码库。如果某次需求变更让你改了十几个包，边界就画错了。
+  </p>
+</div>
+
+<h2 id="narrow">原则二：层与层之间只留窄接口</h2>
+
+<p>
+  Tomcat 各层之间的接口窄得惊人。把它们列出来，每个只有一两个核心方法：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="宽的实现、窄的接口：Adapter、Valve、Servlet、Lifecycle 四个窄接口连接各层">
+  <rect class="bx-b" x="20" y="20" width="230" height="260" rx="14"/>
+  <text class="ttl on-b" x="135" y="46" text-anchor="middle">一侧：很多实现</text>
+  <text class="sm" x="135" y="74" text-anchor="middle">Http11Processor、AjpProcessor、</text>
+  <text class="sm" x="135" y="92" text-anchor="middle">StreamProcessor（HTTP/2）</text>
+  <text class="sm" x="135" y="132" text-anchor="middle">StandardEngine/Host/Context/</text>
+  <text class="sm" x="135" y="150" text-anchor="middle">Wrapper 的基础阀、各种阀</text>
+  <text class="sm" x="135" y="190" text-anchor="middle">CoyoteAdapter、StandardWrapper</text>
+  <text class="sm" x="135" y="230" text-anchor="middle">几十个组件</text>
+
+  <rect class="bx-a" x="290" y="40" width="180" height="44" rx="8"/>
+  <text class="mono sm" x="380" y="66" text-anchor="middle">Adapter.service(req, res)</text>
+  <rect class="bx-a" x="290" y="100" width="180" height="44" rx="8"/>
+  <text class="mono sm" x="380" y="126" text-anchor="middle">Valve.invoke(req, res)</text>
+  <rect class="bx-a" x="290" y="160" width="180" height="44" rx="8"/>
+  <text class="mono sm" x="380" y="186" text-anchor="middle">Servlet.service(req, res)</text>
+  <rect class="bx-a" x="290" y="220" width="180" height="44" rx="8"/>
+  <text class="mono sm" x="380" y="246" text-anchor="middle">Lifecycle.start()/stop()</text>
+  <path class="ln" d="M252 62 H286"/><path class="ln" d="M252 122 H286"/><path class="ln" d="M252 182 H286"/><path class="ln" d="M252 242 H286"/>
+  <path class="ln" d="M472 62 H506"/><path class="ln" d="M472 122 H506"/><path class="ln" d="M472 182 H506"/><path class="ln" d="M472 242 H506"/>
+
+  <rect class="bx-g" x="510" y="20" width="230" height="260" rx="14"/>
+  <text class="ttl on-g" x="625" y="46" text-anchor="middle">另一侧：很多实现</text>
+  <text class="sm" x="625" y="74" text-anchor="middle">Engine 管道（容器）</text>
+  <text class="sm" x="625" y="132" text-anchor="middle">下一个阀 / 基础阀</text>
+  <text class="sm" x="625" y="190" text-anchor="middle">数以万计的 Web 应用</text>
+  <text class="sm" x="625" y="214" text-anchor="middle">Spring、Struts、JSF…</text>
+  <text class="sm" x="625" y="250" text-anchor="middle">Server、Service、JMX 工具</text>
+</svg>
+<figcaption>图 29-2　沙漏形：两侧可以无限扩展，中间的「腰」越窄，两侧越自由</figcaption>
+</figure>
+
+<p>
+  接口越窄，两侧能独立演化的空间就越大。最好的证明是 <code>Servlet.service()</code>：这个签名从 1997 年用到今天（只是包名从 javax 换成了 jakarta），
+  而它两侧，一边从 BIO 连接器换成了 NIO + HTTP/2 + 虚拟线程，另一边从手写 Servlet 发展出了 Spring MVC。
+  窄接口的另一个好处是<strong>可测试</strong>：第 21 章的迷你分派器能在内存里测试 Servlet，正是因为 Servlet 只要求一个 request 和一个 response。
+</p>
+
+<div class="box key">
+  <div class="t">&#128273; 在你的项目里</div>
+  <p>
+    模块之间的接口，先问「能不能只有一个方法」。服务层暴露 <code>OrderService.place(PlaceOrderCommand)</code>，
+    比暴露一个有 30 个 setter 的 <code>OrderManager</code> 好得多。参数用不可变的命令对象（record），返回值用结果对象——这就是 Tomcat 的 request/response。
+  </p>
+</div>
+
+<h2 id="component">原则三：统一的组件模型</h2>
+
+<p>
+  Tomcat 里几乎所有东西都是同一种「组件」：实现 <code>Lifecycle</code>，大多数还是容器树上的一个节点。
+  这带来了三个好处：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="组件树的启动顺序：先启动核心再打开端口，停止时先关闭端口再停止核心">
+  <rect class="bx" x="300" y="16" width="160" height="36" rx="8"/><text class="ttl" x="380" y="39" text-anchor="middle">Server</text>
+  <path class="ln" d="M380 54 V74"/>
+  <rect class="bx" x="300" y="76" width="160" height="36" rx="8"/><text class="ttl" x="380" y="99" text-anchor="middle">Service</text>
+  <path class="ln" d="M340 114 V140 H190 V152"/><path class="ln" d="M420 114 V140 H570 V152"/>
+  <rect class="bx-a" x="110" y="154" width="160" height="36" rx="8"/><text class="ttl on-a" x="190" y="177" text-anchor="middle">Engine（核心）</text>
+  <rect class="bx-b" x="490" y="154" width="160" height="36" rx="8"/><text class="ttl on-b" x="570" y="177" text-anchor="middle">Connector（大门）</text>
+  <path class="ln" d="M190 192 V210"/>
+  <rect class="bx-a" x="110" y="212" width="160" height="30" rx="6"/><text class="sm" x="190" y="232" text-anchor="middle">Host → Context → Wrapper</text>
+  <rect class="bx-g" x="20" y="256" width="340" height="34" rx="8"/>
+  <text class="sm" x="190" y="278" text-anchor="middle">启动：① Engine 及其子树 → ② Connector 开始接收</text>
+  <rect class="bx-r" x="400" y="256" width="340" height="34" rx="8"/>
+  <text class="sm" x="570" y="278" text-anchor="middle">停止：① Connector 先停止接收 → ② 再停 Engine</text>
+</svg>
+<figcaption>图 29-3　先把里面准备好再开门，先关门再收拾里面</figcaption>
+</figure>
+
+<ol class="steps">
+  <li><strong>使用者只需要启动顶层</strong>。<code>server.start()</code> 级联启动整棵树，关闭同理——不需要记住几十个组件的启动顺序。</li>
+  <li><strong>顺序由结构表达</strong>。StandardService 先启动 Engine 再启动 Connector，停止时反过来：不会有请求打到还没准备好、或者正在拆除的容器上。第 25 章 Spring Boot「最后才开端口」是同一个思想。</li>
+  <li><strong>通用工具对所有组件都有效</strong>。生命周期监听器（第 6 章）、JMX 注册（第 20 章）、后台处理（第 12 章）都是在「组件」这个层次实现的，新组件加进来自动获得这些能力。</li>
+</ol>
+
+<div class="box key">
+  <div class="t">&#128273; 在你的项目里</div>
+  <p>
+    凡是持有线程、连接、文件句柄、定时器的类，都让它实现统一的 start/stop（Spring 的 <code>SmartLifecycle</code>、Guava 的 <code>Service</code>、或者本章工具包里的 <code>LifecycleBase</code>），
+    并组织成一棵树。启动时「先依赖、后被依赖；先内部、后入口」，停止时反过来。消息消费者最后启动、最先停止，和 Connector 一样。
+  </p>
+</div>
+
+<h2 id="assembly">原则四：配置、装配、运行三段分离</h2>
+
+<p>
+  第 5～14 章的每个 Bootstrap 都在 main 方法里手工 new 出组件、用 setter 连起来；第 15 章开始，同样的对象图改由 Digester 读 server.xml 生成；
+  第 25 章，Spring Boot 又用代码生成。<strong>运行时的组件一模一样，只是装配者不同</strong>：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="配置、装配、运行三段：多种配置来源经不同装配器生成同一种对象图">
+  <text class="ttl" x="110" y="24" text-anchor="middle">配置（描述）</text>
+  <text class="ttl" x="380" y="24" text-anchor="middle">装配（创建并连接）</text>
+  <text class="ttl" x="650" y="24" text-anchor="middle">运行（只管执行）</text>
+  <rect class="bx-p" x="20" y="40" width="180" height="40" rx="8"/><text class="sm" x="110" y="65" text-anchor="middle">server.xml / web.xml</text>
+  <rect class="bx-p" x="20" y="92" width="180" height="40" rx="8"/><text class="sm" x="110" y="117" text-anchor="middle">注解 / web-fragment</text>
+  <rect class="bx-p" x="20" y="144" width="180" height="40" rx="8"/><text class="sm" x="110" y="169" text-anchor="middle">application.yml</text>
+  <rect class="bx-p" x="20" y="196" width="180" height="40" rx="8"/><text class="sm" x="110" y="221" text-anchor="middle">main 方法里的代码</text>
+  <path class="ln-p" d="M202 60 H286" marker-end="url(#ar-p)"/>
+  <path class="ln-p" d="M202 112 H286" marker-end="url(#ar-p)"/>
+  <path class="ln-p" d="M202 164 H286" marker-end="url(#ar-p)"/>
+  <path class="ln-p" d="M202 216 H286" marker-end="url(#ar-p)"/>
+  <rect class="bx" x="290" y="40" width="180" height="40" rx="8"/><text class="sm" x="380" y="65" text-anchor="middle">Digester 规则（第 15 章）</text>
+  <rect class="bx" x="290" y="92" width="180" height="40" rx="8"/><text class="sm" x="380" y="117" text-anchor="middle">ContextConfig（第 25 章）</text>
+  <rect class="bx" x="290" y="144" width="180" height="40" rx="8"/><text class="sm" x="380" y="169" text-anchor="middle">Spring Boot 工厂</text>
+  <rect class="bx" x="290" y="196" width="180" height="40" rx="8"/><text class="sm" x="380" y="221" text-anchor="middle">Bootstrap（第 5～14 章）</text>
+  <path class="ln" d="M472 60 C520 60 520 130 556 134" marker-end="url(#ar)"/>
+  <path class="ln" d="M472 112 C510 112 520 136 556 138" marker-end="url(#ar)"/>
+  <path class="ln" d="M472 164 C510 164 520 146 556 144" marker-end="url(#ar)"/>
+  <path class="ln" d="M472 216 C520 216 520 152 556 148" marker-end="url(#ar)"/>
+  <rect class="bx-a" x="560" y="90" width="180" height="100" rx="12"/>
+  <text class="ttl on-a" x="650" y="116" text-anchor="middle">同一种对象图</text>
+  <text class="sm" x="650" y="138" text-anchor="middle">StandardServer …</text>
+  <text class="sm" x="650" y="156" text-anchor="middle">普通 Java 对象 + setter</text>
+  <text class="sm" x="650" y="174" text-anchor="middle">→ start()</text>
+  <text class="sm" x="380" y="262" text-anchor="middle">运行时组件不知道自己是被谁、从什么配置创建出来的</text>
+</svg>
+<figcaption>图 29-4　组件只依赖「被注入的东西」，于是任何装配方式都能用</figcaption>
+</figure>
+
+<p>
+  这条原则的关键是<strong>组件里不出现配置解析代码，也不 new 自己的依赖</strong>。<code>StandardContext</code> 不读 web.xml（交给 ContextConfig 监听器），
+  <code>Connector</code> 不找 Engine（由 Service 注入）。好处立竿见影：嵌入式 Tomcat 只是「换一个装配者」，测试时可以用代码装配一个最小的对象图。
+</p>
+
+<div class="box key">
+  <div class="t">&#128273; 在你的项目里</div>
+  <p>
+    业务类通过构造器接收依赖（依赖注入），所有 <code>new 具体实现</code> 集中在一个「组合根」（main 方法、Spring 配置类、Guice 模块）。
+    配置读取也集中在一处，把 <code>Properties</code>/YAML 变成强类型的配置对象（record）再注入，业务代码里不出现 <code>getProperty("…")</code>。
+  </p>
+</div>
+
+<h2 id="ports">原则五：依赖指向内核，边缘可以替换</h2>
+
+<p>
+  核心层（容器树）不知道请求从什么协议来，也不知道用户存在哪里、会话存在哪里。它只定义接口，由边缘去实现：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="六边形：容器核心在中间，入站适配器 Connector 和出站适配器 Realm、Manager、Loader 围绕在四周">
+  <polygon class="bx-a" points="380,60 520,120 520,230 380,290 240,230 240,120" style="stroke-width:1.5"/>
+  <text class="ttl on-a" x="380" y="160" text-anchor="middle">核心：容器树 + 管道</text>
+  <text class="sm" x="380" y="182" text-anchor="middle">只依赖接口</text>
+  <text class="sm" x="380" y="200" text-anchor="middle">Container / Valve / Realm / Manager …</text>
+
+  <rect class="bx-b" x="20" y="130" width="170" height="90" rx="10"/>
+  <text class="ttl on-b" x="105" y="154" text-anchor="middle">入站适配器</text>
+  <text class="sm" x="105" y="176" text-anchor="middle">HTTP/1.1、HTTP/2、AJP</text>
+  <text class="sm" x="105" y="194" text-anchor="middle">连接器（经 Adapter）</text>
+  <path class="ln-b" d="M192 175 H236" marker-end="url(#ar-b)"/>
+
+  <rect class="bx-g" x="570" y="30" width="170" height="60" rx="10"/>
+  <text class="ttl on-g" x="655" y="54" text-anchor="middle">Realm</text>
+  <text class="sm" x="655" y="74" text-anchor="middle">内存 / JDBC / LDAP</text>
+  <rect class="bx-g" x="570" y="110" width="170" height="60" rx="10"/>
+  <text class="ttl on-g" x="655" y="134" text-anchor="middle">Manager / Store</text>
+  <text class="sm" x="655" y="154" text-anchor="middle">内存 / 文件 / 集群</text>
+  <rect class="bx-g" x="570" y="190" width="170" height="60" rx="10"/>
+  <text class="ttl on-g" x="655" y="214" text-anchor="middle">Loader / Resources</text>
+  <text class="sm" x="655" y="234" text-anchor="middle">目录 / WAR / 虚拟目录</text>
+  <rect class="bx-g" x="570" y="270" width="170" height="50" rx="10"/>
+  <text class="ttl on-g" x="655" y="300" text-anchor="middle">Logger / JMX</text>
+  <path class="ln-g" d="M522 140 C545 120 550 66 566 62" marker-end="url(#ar-g)"/>
+  <path class="ln-g" d="M522 160 C545 150 550 142 566 140" marker-end="url(#ar-g)"/>
+  <path class="ln-g" d="M522 200 C545 205 550 218 566 220" marker-end="url(#ar-g)"/>
+  <path class="ln-g" d="M500 240 C540 270 550 294 566 295" marker-end="url(#ar-g)"/>
+  <text class="sm" x="380" y="318" text-anchor="middle">箭头表示「调用」；而源码依赖全部指向中间：适配器实现核心定义的接口</text>
+</svg>
+<figcaption>图 29-5　这就是「端口与适配器」（六边形架构），Tomcat 比这个名词出现得还早</figcaption>
+</figure>
+
+<p>
+  第 9 章把 <code>StandardManager</code> 换成 <code>PersistentManager</code>、第 10 章把 <code>SimpleRealm</code> 换成 JDBC Realm，都不需要改容器一行代码。
+  依赖方向决定了谁能被替换：被依赖的那一方（接口）必须稳定，依赖别人的那一方（实现）可以随便换。
+</p>
+
+<div class="box key">
+  <div class="t">&#128273; 在你的项目里</div>
+  <p>
+    业务核心（领域模型、用例）定义 <code>OrderRepository</code>、<code>PaymentGateway</code>、<code>Notifier</code> 这些接口；
+    基础设施层用 JPA、支付宝 SDK、短信服务实现它们；入站一侧，HTTP Controller、MQ 监听器、定时任务都只是把外部输入翻译成用例调用。
+    检验标准：不启动数据库和 Web 服务器，能不能测试全部业务规则？
+  </p>
+</div>
+
+<h2 id="apply">把五条原则用在一个订单服务上</h2>
+
+<p>
+  为了证明这些原则和 Web 无关，本章的代码把 Tomcat 的架构原样套在一个「订单服务」上：它从一个队列里读文本命令，按模块和动作路由到处理器。
+</p>
+
+<div class="tw">
+<table>
+  <tr><th>Tomcat</th><th>本章的订单服务</th><th>典型的 Spring 项目</th></tr>
+  <tr><td>Connector + CoyoteAdapter</td><td><code>QueueEndpoint</code>：文本 → <code>Command</code></td><td>Controller、<code>@KafkaListener</code></td></tr>
+  <tr><td>Request / Response</td><td><code>Command</code>（record）/ <code>Exchange</code></td><td>请求 DTO / 响应 DTO</td></tr>
+  <tr><td>Engine → Context → Wrapper</td><td><code>Engine</code> → <code>Module</code> → <code>Handler</code></td><td>应用服务 → 用例</td></tr>
+  <tr><td>Pipeline / Valve</td><td><code>TimingValve</code>（Engine 级）、<code>AuditValve</code>（模块级）</td><td>Filter、AOP 切面、拦截器</td></tr>
+  <tr><td>Digester + server.xml</td><td><code>Assembler</code> + 配置文本</td><td><code>@Configuration</code> + application.yml</td></tr>
+  <tr><td>Server / Service / Lifecycle</td><td><code>Server</code> + 设计工具包的 <code>LifecycleBase</code></td><td><code>ApplicationContext</code> + <code>SmartLifecycle</code></td></tr>
+</table>
+</div>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 250" role="img" aria-label="订单服务的结构：QueueEndpoint 把文本解析为 Command，经 Engine 管道路由到 Module，再经 Module 管道到 Handler">
+  <rect class="bx" x="20" y="96" width="110" height="56" rx="10"/>
+  <text class="sm" x="75" y="120" text-anchor="middle">inbox 队列</text>
+  <text class="mono sm" x="75" y="138" text-anchor="middle">order create</text>
+  <path class="ln" d="M132 124 H156" marker-end="url(#ar)"/>
+  <rect class="bx-b" x="160" y="86" width="130" height="76" rx="10"/>
+  <text class="ttl on-b" x="225" y="110" text-anchor="middle">QueueEndpoint</text>
+  <text class="sm" x="225" y="130" text-anchor="middle">解析 → Command</text>
+  <text class="sm" x="225" y="148" text-anchor="middle">异常 → "ERR …"</text>
+  <path class="ln-g" d="M292 124 H316" marker-end="url(#ar-g)"/>
+  <rect class="bx-a" x="320" y="30" width="420" height="190" rx="14"/>
+  <text class="ttl on-a" x="336" y="54">Engine</text>
+  <rect class="bx" x="336" y="66" width="120" height="30" rx="6"/><text class="sm" x="396" y="86" text-anchor="middle">TimingValve</text>
+  <path class="ln" d="M458 81 H478" marker-end="url(#ar)"/>
+  <text class="sm" x="552" y="86" text-anchor="middle">基础阀：按 module 路由</text>
+  <rect class="bx-p" x="336" y="110" width="250" height="96" rx="10"/>
+  <text class="ttl on-p" x="350" y="132">Module "order"</text>
+  <rect class="bx" x="350" y="142" width="100" height="26" rx="5"/><text class="sm" x="400" y="160" text-anchor="middle">AuditValve</text>
+  <path class="ln" d="M452 155 H470" marker-end="url(#ar)"/>
+  <text class="sm" x="520" y="160" text-anchor="middle">按 action 分派</text>
+  <text class="sm" x="461" y="192" text-anchor="middle">create / query / cancel Handler</text>
+  <rect class="bx-p" x="600" y="110" width="126" height="96" rx="10"/>
+  <text class="ttl on-p" x="663" y="132" text-anchor="middle">Module "stock"</text>
+  <text class="sm" x="663" y="168" text-anchor="middle">query Handler</text>
+</svg>
+<figcaption>图 29-6　请求在订单服务里的路径，和第 23 章那张 Tomcat 调用栈一一对应</figcaption>
+</figure>
+
+<h2 id="java17">Java 17：设计工具包与订单服务</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/design/kit/</code><code>LifecycleState.java</code><code>LifecycleBase.java</code><code>CompositeComponent.java</code><code>Pipeline.java</code><code>design/ch29/</code></div>
+
+<p>
+  <code>modern.design.kit</code> 是从前面各章提炼出来的三个小组件，不依赖 Tomcat，可以直接复制到你的项目里用。设计篇后面几章和第 34 章的调度器都基于它。
+</p>
+
+<h3>① LifecycleBase：状态机写一次</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../design/kit/LifecycleBase.java（节选）">
+<pre>
+public abstract class LifecycleBase implements Lifecycle {
+
+    private volatile LifecycleState state = LifecycleState.NEW;
+    private final List&lt;Consumer&lt;LifecycleEvent&gt;&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();
+
+    @Override
+    public final synchronized void start() {
+        if (state == LifecycleState.STARTED || state == LifecycleState.STARTING) {
+            return;                                     // 重复 start：幂等
+        }
+        if (state == LifecycleState.NEW) init();        // 没 init 就 start：替使用者补上
+        transition(LifecycleState.STARTING);
+        try {
+            startInternal();                            // 子类只写自己的事
+        } catch (RuntimeException e) {
+            fail(e);
+        }
+        transition(LifecycleState.STARTED);
+    }
+
+    private void transition(LifecycleState to) {
+        LifecycleState from = state;
+        if (!from.next().contains(to)) {                // 非法转换给出清晰的错误
+            throw new IllegalStateException(name + "：不能从 " + from + " 转到 " + to);
+        }
+        state = to;
+        listeners.forEach(l -&gt; l.accept(new LifecycleEvent(this, from, to)));
+    }
+
+    protected abstract void startInternal();
+    protected abstract void stopInternal();
+}
+</pre>
+</div>
+
+<h3>② CompositeComponent：启动正序，停止倒序</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../design/kit/CompositeComponent.java（节选）">
+<pre>
+@Override
+protected final void startInternal() {
+    startSelf();
+    for (C c : children) c.start();
+}
+
+@Override
+protected final void stopInternal() {
+    List&lt;C&gt; reversed = new ArrayList&lt;&gt;(children);
+    Collections.reverse(reversed);
+    for (C c : reversed) {
+        try {
+            c.stop();
+        } catch (RuntimeException e) {
+            // 一个子组件停不下来，不能让其余的也停不下来：记录后继续
+        }
+    }
+    stopSelf();
+}
+</pre>
+</div>
+
+<h3>③ Pipeline：不可变快照上的阀链</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../design/kit/Pipeline.java（节选）">
+<pre>
+public void invoke(T context) throws Exception {
+    Object[] snapshot = valves.toArray();           // 本次调用用的阀列表，之后的修改不影响它
+    invoke(snapshot, 0, context);
+}
+
+private void invoke(Object[] snapshot, int index, T context) throws Exception {
+    if (index == snapshot.length) {
+        basic.invoke(context);                      // 基础阀永远在最后
+    } else {
+        ((Valve&lt;T&gt;) snapshot[index]).invoke(context, c -&gt; invoke(snapshot, index + 1, c));
+    }
+}
+</pre>
+</div>
+
+<h3>④ 装配器：所有 new 都在这里</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../design/ch29/Assembler.java（节选）">
+<pre>
+var engine = new Engine("engine");
+for (String valve : list(p, "engine.valves")) engine.pipeline().addValve(newInstance(valve));
+for (String moduleName : list(p, "modules")) {
+    var module = new Module(moduleName);
+    for (String entry : list(p, "module." + moduleName + ".handlers")) {
+        String[] kv = entry.split(":", 2);                     // 动作名:类名
+        module.addChild((Handler) Class.forName(kv[1]).getConstructor(String.class).newInstance(kv[0]));
+    }
+    engine.addChild(module);
+}
+var endpoint = new QueueEndpoint(p.getProperty("endpoint.name", "endpoint"), inbox, outbox);
+endpoint.setEngine(engine);                                    // 边界层依赖核心层
+
+var server = new Server("server");
+server.addChild(engine);                                       // 顺序有意义：核心在前，大门在后
+server.addChild(endpoint);
+</pre>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh design.ch29.ArchitectureDemo
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+① 配置 → 装配：
+  Server[server, NEW]
+    Engine[engine, NEW]
+      Module[order, NEW]
+        CreateOrderHandler[create, NEW]
+        QueryOrderHandler[query, NEW]
+        QueryOrderHandler[cancel, NEW]
+      Module[stock, NEW]
+        StockHandler[query, NEW]
+    QueueEndpoint[queue-endpoint, NEW]
+
+② 启动（只启动顶层，子组件级联启动）：
+              STARTED  create
+              STARTED  query
+              STARTED  cancel
+          STARTED  order
+              STARTED  query
+          STARTED  stock
+      STARTED  engine
+      STARTED  queue-endpoint          ← 核心全部就绪后，大门才打开
+  STARTED  server
+
+③ 运行：
+    [AuditValve] 审计 Command[module=order, action=create, params={id=1, amount=30}]
+    [TimingValve] order.create 用时 21590 µs
+  order create id=1 amount=30  →  OK  订单 1 已创建，金额 30
+    [AuditValve] 审计 Command[module=order, action=query, params={id=1}]
+    [TimingValve] order.query 用时 615 µs
+  order query id=1  →  OK  订单 1 金额 30
+    [TimingValve] stock.query 用时 236 µs          ← stock 模块没有 AuditValve
+  stock query sku=A-7  →  OK  商品 A-7 库存 42
+    [TimingValve] order.cancel 用时 27 µs
+  order cancel id=1  →  OK  拒绝：取消订单必须提供 operator     ← AuditValve 短路
+    [AuditValve] 审计 Command[module=order, action=create, params={id=2, amount=-5}]
+    [TimingValve] order.create 用时 211 µs
+  order create id=2 amount=-5  →  ERR 金额必须为正数            ← 业务异常在边界层翻译成协议
+    [TimingValve] payment.refund 用时 176 µs
+  payment refund id=1  →  ERR 没有模块 payment
+
+④ 停止（顺序和启动相反：先关大门，再停核心）：
+      STOPPED  queue-endpoint          ← 先停止接收
+              STOPPED  query
+          STOPPED  stock
+              STOPPED  cancel
+              STOPPED  query
+              STOPPED  create
+          STOPPED  order
+      STOPPED  engine
+  STOPPED  server
+</pre>
+</div>
+
+<p>
+  注意启动时缩进最深的先打印 STARTED：父组件先进入 STARTING，在它的 <code>startInternal</code> 里子组件逐个启动完成，最后父组件才进入 STARTED。
+  这和 Tomcat 的日志顺序完全一致。
+</p>
+
+<h2 id="when-not">什么时候不要这样设计</h2>
+
+<p>
+  Tomcat 的分层是为一个<strong>有很多种实现、要活几十年、被几百万个应用依赖</strong>的系统准备的。每一层间接都有成本：更多的类、更深的调用栈、更难的调试。
+</p>
+
+<div class="tw">
+<table>
+  <tr><th>信号</th><th>说明可以简化</th></tr>
+  <tr><td>每个接口只有一个实现，而且看不到第二个</td><td>直接用类；等第二个实现出现时再抽接口（第 18 章 Deployer 接口就是反面教材）</td></tr>
+  <tr><td>只有一种接入方式、一种存储</td><td>不需要端口与适配器那么多层，Controller 直接调 Service 就好</td></tr>
+  <tr><td>团队小、生命周期短（活动页、内部工具）</td><td>可读性和交付速度比可替换性重要</td></tr>
+  <tr><td>「为了将来可能的扩展」</td><td>先确认「将来」有没有证据；没有就别为它付今天的成本</td></tr>
+</table>
+</div>
+
+<p>
+  原则的价值在于让你<strong>知道</strong>边界在哪里，而不是一开始就把每条边界都实现出来。代码里可以先只有一个包，只要依赖方向是对的，需要时再拆就不难。
+</p>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>Tomcat 分成启动、装配、运行时骨架、边界、核心、可替换组件、管理面几层，越往下越稳定。</li>
+  <li>原则一：按变化的原因切分，每一种变化只影响一个模块。</li>
+  <li>原则二：层之间只留窄接口，接口越窄两侧越自由，也越容易测试。</li>
+  <li>原则三：统一的组件模型（生命周期 + 组合树），启动时先内部后入口，停止时反过来。</li>
+  <li>原则四：配置、装配、运行分离，组件不解析配置、不 new 依赖，任何装配方式都能用。</li>
+  <li>原则五：依赖指向内核，边缘可以替换——这就是端口与适配器架构。</li>
+  <li>这些原则有成本，只在有证据表明需要时才把边界实现出来。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>给订单服务写第二个边界：<code>HttpEndpoint</code>，用 JDK 自带的 <code>com.sun.net.httpserver.HttpServer</code> 把 <code>GET /order/query?id=1</code> 翻译成 <code>Command</code>。确认 Engine、Module、Handler 一行都不用改。</li>
+    <li>在 <code>Assembler</code> 里支持 <code>module.order.enabled=false</code>，验证关闭一个模块不影响其他模块。</li>
+    <li>给 <code>CreateOrderHandler</code> 抽出一个 <code>OrderRepository</code> 接口，写一个内存实现和一个基于文件的实现，通过配置切换。</li>
+    <li>画出你正在维护的项目的分层图，按「原则一」的表格列出最常变的三样东西，检查它们各自是否只影响一个模块。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

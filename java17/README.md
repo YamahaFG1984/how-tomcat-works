@@ -55,6 +55,7 @@ curl http://localhost:8080/SHUTDOWN       # 第 1 章的服务器靠这个 URL �
 | 26 | TLS、HTTP/2、WebSocket | `ch26.ws.MiniWebSocketServer` `ch26.ws.WsClient <ws-URL> [消息…] [--hold=秒]` `ch26.tomcat.EmbeddedWebSocket` `ch26.tomcat.EmbeddedHttp2Tls` `ch26.tomcat.Http2Client <URL> [并发数]` |
 | 27 | 虚拟线程（JDK 21+） | `ch27.VirtualThreadsDemo`（源码在 `src/main/java21`） `ch27.tomcat.EmbeddedVirtualThreads [端口] [true\|false]` |
 | 28 | 运维：调优、监控、泄漏、加固 | `ch28.tomcat.EmbeddedOps [端口] [admin IP 正则]` `ch28.leak.ClassLoaderLeakDemo` `ch28.leak.EmbeddedLeakDetection`（建议 `JAVA_OPTS="--add-opens=java.base/java.lang=ALL-UNNAMED"`） |
+| 29 | 设计篇：整体架构 | `design.ch29.ArchitectureDemo`（设计工具包在 `modern.design.kit`） |
 
 ## 目录结构
 
