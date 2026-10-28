@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 32 章 · 并发、隔离与演进 — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="32">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 32 章 · 设计篇</span>
+<h1>并发、隔离与演进</h1>
+<p class="lede">
+  前三章讲的是「功能怎么组织」。一个服务器能不能用上二十年，更多取决于另一类问题：成百上千个线程同时跑时会不会出错，
+  一个应用崩了会不会拖垮别的应用，出了问题能不能看清楚，以及当初的设计被证明是错的时候，能不能改掉而不伤害用户。
+  这一章把 Tomcat 在这几方面的做法整理成规则，用四个小实验验证它们，最后给出整个设计篇的评审清单。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>能画出 Tomcat 的「线程归属图」，说出哪些对象被哪些线程访问、靠什么保证安全</li>
+    <li>掌握六条并发规则：线程封闭、启动后不变、并发容器、写时复制、单线程拥有者、显式状态机</li>
+    <li>理解从请求、应用、资源到进程的几层隔离，以及舱壁模式</li>
+    <li>从 Tomcat 被推翻的设计中总结演进的方法</li>
+    <li>拿到一份可以直接用于设计评审的清单</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="threads">并发：谁的线程碰谁的对象</h2>
+
+<p>
+  Tomcat 的并发设计并不依赖到处加锁，而是先回答一个问题：<strong>每个对象会被哪些线程访问？</strong>答案决定了用什么手段保护它。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 340" role="img" aria-label="Tomcat 的线程归属：请求对象属于工作线程，容器配置启动后不变，会话用并发容器，Selector 只属于 Poller">
+  <rect class="bx-p" x="20" y="20" width="140" height="40" rx="8"/><text class="sm" x="90" y="45" text-anchor="middle">Acceptor（1）</text>
+  <rect class="bx-a" x="20" y="72" width="140" height="40" rx="8"/><text class="sm" x="90" y="97" text-anchor="middle">Poller（1）</text>
+  <rect class="bx-b" x="20" y="124" width="140" height="64" rx="8"/><text class="sm" x="90" y="148" text-anchor="middle">Worker × maxThreads</text><text class="sm" x="90" y="168" text-anchor="middle">或虚拟线程</text>
+  <rect class="bx-g" x="20" y="200" width="140" height="40" rx="8"/><text class="sm" x="90" y="225" text-anchor="middle">后台处理线程（1）</text>
+  <rect class="bx" x="20" y="252" width="140" height="40" rx="8"/><text class="sm" x="90" y="277" text-anchor="middle">业务线程（异步）</text>
+
+  <rect class="bx-a" x="250" y="72" width="220" height="40" rx="8"/><text class="sm" x="360" y="97" text-anchor="middle">Selector：只有 Poller 碰（单线程拥有者）</text>
+  <rect class="bx-b" x="250" y="124" width="220" height="40" rx="8"/><text class="sm" x="360" y="149" text-anchor="middle">Request / Response：线程封闭</text>
+  <rect class="bx-d" x="250" y="176" width="220" height="40" rx="8"/><text class="sm" x="360" y="201" text-anchor="middle">容器树、映射、配置：启动后不变</text>
+  <rect class="bx-g" x="250" y="228" width="220" height="40" rx="8"/><text class="sm" x="360" y="253" text-anchor="middle">会话表：ConcurrentHashMap</text>
+  <rect class="bx" x="250" y="280" width="220" height="40" rx="8"/><text class="sm" x="360" y="305" text-anchor="middle">异步状态：AsyncStateMachine</text>
+  <rect class="bx-p" x="250" y="20" width="220" height="40" rx="8"/><text class="sm" x="360" y="45" text-anchor="middle">LimitLatch：并发计数</text>
+
+  <path class="ln-p" d="M162 40 H246" marker-end="url(#ar-p)"/>
+  <path class="ln-a" d="M162 92 H246" marker-end="url(#ar-a)"/>
+  <path class="ln-b" d="M162 144 H246" marker-end="url(#ar-b)"/>
+  <path class="ln-b" d="M162 156 C200 160 210 190 246 194" marker-end="url(#ar-b)"/>
+  <path class="ln-b" d="M162 168 C200 175 210 240 246 246" marker-end="url(#ar-b)"/>
+  <path class="ln-g" d="M162 220 C200 220 210 246 246 248" marker-end="url(#ar-g)"/>
+  <path class="ln" d="M162 272 C200 272 210 296 246 298" marker-end="url(#ar)"/>
+
+  <rect class="bx-d" x="500" y="20" width="240" height="300" rx="12"/>
+  <text class="ttl" x="516" y="44">读图方法</text>
+  <text class="sm" x="516" y="70">一个对象只有一条箭头指向它：</text>
+  <text class="sm" x="530" y="88">→ 不需要任何同步</text>
+  <text class="sm" x="516" y="114">多条箭头，但都只读：</text>
+  <text class="sm" x="530" y="132">→ 保证「启动完成后不再改」，</text>
+  <text class="sm" x="530" y="150">用 volatile/启动顺序发布</text>
+  <text class="sm" x="516" y="176">多条箭头，有读有写：</text>
+  <text class="sm" x="530" y="194">→ 并发容器、写时复制、原子类</text>
+  <text class="sm" x="516" y="220">写入方之间存在竞态：</text>
+  <text class="sm" x="530" y="238">→ 显式状态机 + 同步或 CAS</text>
+  <text class="sm" x="516" y="264">需要串行访问的资源：</text>
+  <text class="sm" x="530" y="282">→ 交给一个线程独占，</text>
+  <text class="sm" x="530" y="300">其他线程发消息</text>
+</svg>
+<figcaption>图 32-1　先画出「谁碰谁」，再决定用什么保护</figcaption>
+</figure>
+
+<p>由此得到六条规则，每条在 Tomcat 里都有对应的实现：</p>
+
+<div class="tw">
+<table>
+  <tr><th>规则</th><th>Tomcat 里的实现</th><th>章节</th><th>在你的项目里</th></tr>
+  <tr><td>① 线程封闭</td><td>Request/Response 只属于处理它的线程；Servlet 实例是共享的，所以要求无状态</td><td>4、11</td><td>请求级数据放局部变量和请求对象，不放单例字段</td></tr>
+  <tr><td>② 启动后不变</td><td>Context 配置完成后才标记为可用；运行时只读</td><td>12</td><td>配置对象用 record，启动时构建，之后只读</td></tr>
+  <tr><td>③ 并发容器</td><td><code>ManagerBase</code> 的会话表是 <code>ConcurrentHashMap</code></td><td>9</td><td>共享的可变集合一律用并发容器</td></tr>
+  <tr><td>④ 写时复制</td><td>监听器数组、阀数组</td><td>6</td><td>读多写少的注册表、规则表</td></tr>
+  <tr><td>⑤ 单线程拥有者</td><td>Selector 只属于 Poller；后台任务只在一个线程里跑</td><td>12、23</td><td>需要串行化的资源交给一个线程，其他线程投递消息</td></tr>
+  <tr><td>⑥ 显式状态机</td><td><code>LifecycleState</code>、<code>AsyncStateMachine</code>（同步方法保护状态转换）</td><td>6、24</td><td>有竞态的生命周期用枚举 + 锁或 CAS 管理</td></tr>
+</table>
+</div>
+
+<h3>实验：线程封闭与写时复制</h3>
+
+<p>第一个实验模拟第 11 章的经典错误：在 Servlet 的实例字段里计数。16 个线程各处理 5 万个请求：</p>
+
+<div class="code" data-lang="java" data-file="java17/.../design/ch32/NonFunctionalDemo.java（节选）">
+<pre>
+static final class CounterServlet {
+    int hits;                                     // 共享的实例字段：所有请求线程都在改它
+
+    void service(int[] perRequest) {
+        hits++;                                   // 读-改-写，不是原子的
+        perRequest[0]++;                          // 请求自己的对象：只有当前线程能看到
+    }
+}
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+① 线程封闭：16 个线程 × 每个 50000 次请求
+  请求对象里的计数合计 800000（正确），共享字段 hits = 700000（丢了 100000 次更新）
+</pre>
+</div>
+
+<p>
+  丢失的数量每次运行都不一样，在某些机器上甚至可能碰巧是 0——这正是并发 bug 难以复现的原因。第二个实验：通知过程中一个「一次性」监听器把自己移除，这在第 6 章的场景里很常见：
+</p>
+
+<div class="code" data-lang="out">
+<pre>
+② 通知过程中，有一个监听器把自己移除（一次性监听器很常见）
+  ArrayList            ConcurrentModificationException（只通知到 1 个）
+  CopyOnWriteArrayList 通知了 3 个监听器，剩余 2 个
+</pre>
+</div>
+
+<p>
+  这甚至不需要多线程：同一个线程在遍历时修改了列表。写时复制让遍历基于一个不可变的快照，修改只影响下一次遍历——这就是 Tomcat 4 的 <code>LifecycleSupport</code> 每次增删监听器都复制数组的原因。
+</p>
+
+<h2 id="isolation">隔离：失败的影响范围</h2>
+
+<p>
+  隔离设计回答的问题是：<strong>某个东西坏了，会连累多少其他东西？</strong> Tomcat 从小到大有好几层隔离：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="从请求、应用、资源到进程的隔离层次">
+  <rect class="bx-d" x="20" y="16" width="720" height="270" rx="16"/>
+  <text class="ttl" x="40" y="40">进程 / 容器实例：不可变部署、滚动发布（第 28 章）</text>
+  <rect class="bx-p" x="40" y="54" width="680" height="218" rx="14"/>
+  <text class="ttl on-p" x="60" y="78">资源：每个 Service / Connector 自己的线程池、连接上限（舱壁）</text>
+  <rect class="bx-g" x="60" y="92" width="640" height="166" rx="12"/>
+  <text class="ttl on-g" x="80" y="116">应用：每个 Context 一个类加载器、一个会话管理器；一个应用启动失败，其他照常（第 8、18 章）</text>
+  <rect class="bx-b" x="80" y="130" width="600" height="114" rx="10"/>
+  <text class="ttl on-b" x="100" y="154">访问权限：外观对象、privileged 标志、安全管理（第 2、19 章）</text>
+  <rect class="bx-a" x="100" y="168" width="560" height="62" rx="8"/>
+  <text class="ttl on-a" x="120" y="192">请求：一个请求抛异常只得到自己的 500，线程照常回到池里</text>
+  <text class="sm" x="120" y="214">StandardWrapperValve 捕获异常 → 错误页（第 22 章）；连接级错误只关闭这一个连接</text>
+</svg>
+<figcaption>图 32-2　每一层隔离都把失败的影响限制在这一层里</figcaption>
+</figure>
+
+<p>
+  其中最容易被忽视的是<strong>资源隔离</strong>。所有工作共用一个线程池时，一类慢请求就能把池占满，让本来很快的请求也排起长队。
+  解决办法叫「舱壁」（bulkhead，船舱的隔板）：给不同类别的工作各自的线程池。Tomcat 里可以用多个 Service 或多个 Connector 实现，
+  业务代码里就是给慢接口、第三方调用单独的执行器。
+</p>
+
+<div class="code" data-lang="out">
+<pre>
+③ 舱壁：20 个慢报表（各 300ms）先提交，随后 5 个快查询（各 5ms）
+  共用一个 4 线程池：快查询平均等待 1502 ms
+  报表 2 线程 + 查询 2 线程：快查询平均等待 4 ms
+</pre>
+</div>
+
+<p>
+  总线程数一样（都是 4 个），只是分了一下组，快查询的等待时间从 1.5 秒降到 4 毫秒。代价是资源可能闲置：报表很少时，那 2 个报表线程就空着。
+</p>
+
+<h2 id="background">后台工作：一个线程驱动整棵树</h2>
+
+<p>
+  会话过期检查、类文件修改检测、自动部署扫描——这些周期性工作在 Tomcat 4 里由各个组件自己开线程完成（第 8 章的 <code>WebappLoader</code>、第 9 章的 <code>StandardManager</code> 都实现了 <code>Runnable</code>）。
+  一个 Host 部署 50 个应用，就多出上百个后台线程。Tomcat 5 起改成 Engine 上的一个线程定期调用 <code>backgroundProcess()</code>，沿着组件树递归（第 12 章）：
+</p>
+
+<div class="code" data-lang="out">
+<pre>
+④ 50 个组件的周期性任务，运行 1 秒
+  每个组件一个线程：后台线程 50 个
+  一个后台线程递归驱动：后台线程 1 个，每个组件被处理了约 20 次
+</pre>
+</div>
+
+<p>
+  这是规则 ⑤「单线程拥有者」的一个应用。代价是一个组件的后台任务卡住，会拖延其他组件；所以每个 <code>backgroundProcess()</code> 都必须短小、不能阻塞。
+</p>
+
+<h2 id="observability">可观测性是设计出来的</h2>
+
+<p>第 20、28 章讲了怎么用 JMX 和指标。这里只强调它们背后的设计决定，这些决定都要在写第一行代码时就做：</p>
+
+<ul>
+  <li><strong>给线程起名字</strong>。<code>http-nio-8080-exec-3</code>、<code>http-nio-8080-Poller</code>、<code>Catalina-utility-1</code>（Tomcat 9 起执行后台任务的线程）：线程转储里一眼就知道谁是谁。本章实验 ④ 也是靠线程名统计的。</li>
+  <li><strong>状态变化发事件</strong>。生命周期事件既是扩展点，也是诊断入口：「这个 Context 卡在 STARTING」本身就是有用的信息。</li>
+  <li><strong>每个组件维护自己的计数器</strong>。请求数、错误数、处理时间在 <code>RequestInfo</code> 里随手累加，成本极低，用的时候直接读。</li>
+  <li><strong>错误信息带上下文</strong>。Tomcat 的错误日志会写出应用名、线程名、类名（第 28 章的泄漏日志就是例子），而不只是一个异常栈。</li>
+</ul>
+
+<h2 id="evolution">演进：Tomcat 推翻过的设计</h2>
+
+<p>
+  原书写的是 Tomcat 4/5。对照今天的 Tomcat 11，很多设计被改掉了。改掉不丢人，丢人的是改不掉。下面这条时间线标出了主要的变化：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="Tomcat 4 到 11 的主要演进">
+  <path class="ln" d="M40 150 H730" marker-end="url(#ar)"/>
+  <circle cx="60" cy="150" r="6" class="bx-a"/><text class="ttl" x="60" y="132" text-anchor="middle">4.1</text>
+  <text class="sm" x="60" y="174" text-anchor="middle">Coyote</text><text class="sm" x="60" y="190" text-anchor="middle">连接器</text>
+  <circle cx="140" cy="150" r="6" class="bx-a"/><text class="ttl" x="140" y="132" text-anchor="middle">5.x</text>
+  <text class="sm" x="140" y="174" text-anchor="middle">后台线程统一</text><text class="sm" x="140" y="190" text-anchor="middle">Mapper 移到</text><text class="sm" x="140" y="206" text-anchor="middle">连接器</text>
+  <text class="sm on-r" x="140" y="94" text-anchor="middle">ValveContext、</text><text class="sm on-r" x="140" y="110" text-anchor="middle">Logger 被移除</text>
+  <circle cx="220" cy="150" r="6" class="bx-a"/><text class="ttl" x="220" y="132" text-anchor="middle">6</text>
+  <text class="sm" x="220" y="174" text-anchor="middle">NIO 连接器</text><text class="sm" x="220" y="190" text-anchor="middle">泄漏检测</text>
+  <circle cx="300" cy="150" r="6" class="bx-a"/><text class="ttl" x="300" y="132" text-anchor="middle">7</text>
+  <text class="sm" x="300" y="174" text-anchor="middle">异步 Servlet</text><text class="sm" x="300" y="190" text-anchor="middle">LifecycleState</text><text class="sm" x="300" y="206" text-anchor="middle">WebSocket</text>
+  <circle cx="380" cy="150" r="6" class="bx-a"/><text class="ttl" x="380" y="132" text-anchor="middle">8 / 8.5</text>
+  <text class="sm" x="380" y="174" text-anchor="middle">NIO 成为默认</text><text class="sm" x="380" y="190" text-anchor="middle">HTTP/2</text>
+  <text class="sm on-r" x="380" y="110" text-anchor="middle">BIO 被移除</text>
+  <circle cx="460" cy="150" r="6" class="bx-a"/><text class="ttl" x="460" y="132" text-anchor="middle">9</text>
+  <text class="sm" x="460" y="174" text-anchor="middle">Servlet 4.0</text>
+  <circle cx="540" cy="150" r="6" class="bx-a"/><text class="ttl" x="540" y="132" text-anchor="middle">10</text>
+  <text class="sm on-r" x="540" y="110" text-anchor="middle">javax → jakarta</text>
+  <circle cx="620" cy="150" r="6" class="bx-a"/><text class="ttl" x="620" y="132" text-anchor="middle">10.1</text>
+  <text class="sm on-r" x="630" y="78" text-anchor="middle">APR 连接器、</text><text class="sm on-r" x="630" y="94" text-anchor="middle">SingleThreadModel 被移除</text>
+  <circle cx="700" cy="150" r="6" class="bx-a"/><text class="ttl" x="700" y="132" text-anchor="middle">11</text>
+  <text class="sm" x="700" y="174" text-anchor="middle">Java 17 基线</text><text class="sm" x="700" y="190" text-anchor="middle">虚拟线程</text>
+  <text class="sm" x="380" y="270" text-anchor="middle">上方红字：被移除的东西或破坏性变化；下方：新增的东西。几乎每个大版本都既有加法也有减法</text>
+</svg>
+<figcaption>图 32-3　Tomcat 的二十年：加法和减法一样多</figcaption>
+</figure>
+
+<div class="tw">
+<table>
+  <tr><th>被推翻的设计</th><th>原书章节</th><th>换成了什么</th><th>为什么</th></tr>
+  <tr><td>每连接一线程的 BIO 连接器</td><td>3、4</td><td>Coyote + NIO（第 23 章）</td><td>线程不够用，慢客户端能拖垮服务器</td></tr>
+  <tr><td>ValveContext 外部迭代器</td><td>5</td><td>阀持有 next 引用</td><td>每个请求一个有状态对象，没有必要</td></tr>
+  <tr><td>容器各自的 Mapper</td><td>5、12、13</td><td>连接器里一次查完的全局 Mapper</td><td>逐层映射慢，且没人需要替换它</td></tr>
+  <tr><td>started 布尔值</td><td>6</td><td><code>LifecycleState</code> 枚举 + <code>LifecycleBase</code></td><td>布尔值表达不了「启动中」「失败」等阶段</td></tr>
+  <tr><td>自定义 Logger 接口</td><td>7</td><td>commons-logging，再到 JULI</td><td>日志是通用设施，不该自己定义</td></tr>
+  <tr><td>每个组件一个后台线程</td><td>8、9</td><td><code>backgroundProcess()</code></td><td>线程数随应用数线性增长</td></tr>
+  <tr><td>SingleThreadModel</td><td>11</td><td>无（要求 Servlet 无状态）</td><td>给了虚假的线程安全保证</td></tr>
+  <tr><td>javax.servlet 包名</td><td>全书</td><td>jakarta.servlet</td><td>Java EE 移交 Eclipse 基金会后的商标限制</td></tr>
+</table>
+</div>
+
+<h3>Tomcat 是怎么「改掉」的</h3>
+
+<ol class="steps">
+  <li><strong>先废弃，再删除</strong>。在一个大版本里标记 <code>@Deprecated</code> 并在日志里警告，下一个大版本才删除。用户至少有一个版本周期来迁移。</li>
+  <li><strong>大的破坏性变更集中在大版本</strong>。javax → jakarta 这种影响所有用户的变更单独占一个大版本（Tomcat 10），并且旧版本（9.0）继续维护多年。</li>
+  <li><strong>提供迁移工具</strong>。Tomcat 提供了 <code>jakartaee-migration</code> 工具，能把 javax 版本的 WAR 自动转换；把它的 jar 放进 Tomcat 10+ 的 lib 后，放进 <code>webapps-javaee</code> 目录的旧应用会在部署时自动转换。</li>
+  <li><strong>新接口带默认实现</strong>。Servlet API 往接口加方法时提供 <code>default</code> 实现，老的实现类不用改。</li>
+  <li><strong>窄接口让替换成为可能</strong>。连接器从 BIO 换成 NIO、再加上虚拟线程，应用代码一行没变——这是第 29 章原则二的回报。</li>
+</ol>
+
+<div class="box key">
+  <div class="t">&#128273; 演进的前提是知道谁在用</div>
+  <p>
+    能安全地删掉一个东西，前提是知道谁依赖它。公开的扩展点越多，这个问题越难回答（第 30 章）。
+    所以「少暴露」本身就是为演进做准备：内部的东西随便改，公开的东西要走废弃流程。在 Java 里，可以用模块系统（<code>module-info.java</code> 只 <code>exports</code> API 包）把这条线画得更清楚。
+  </p>
+</div>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/design/ch32/NonFunctionalDemo.java</code></div>
+
+<p>舱壁实验的核心只是两种提交方式的对比：</p>
+
+<div class="code" data-lang="java" data-file="java17/.../design/ch32/NonFunctionalDemo.java（节选）">
+<pre>
+ExecutorService shared = Executors.newFixedThreadPool(4);
+runMix(shared, shared);                                   // 报表和查询共用
+
+ExecutorService reports = Executors.newFixedThreadPool(2);
+ExecutorService queries = Executors.newFixedThreadPool(2);
+runMix(reports, queries);                                 // 各用各的
+
+private static long runMix(ExecutorService reportPool, ExecutorService queryPool) throws Exception {
+    for (int i = 0; i &lt; 20; i++) reportPool.submit(() -&gt; sleep(300));
+    List&lt;Future&lt;Long&gt;&gt; fast = new ArrayList&lt;&gt;();
+    for (int i = 0; i &lt; 5; i++) {
+        long submitted = System.nanoTime();
+        fast.add(queryPool.submit(() -&gt; {
+            long waited = (System.nanoTime() - submitted) / 1_000_000;   // 排队等了多久
+            sleep(5);
+            return waited;
+        }));
+    }
+    …
+}
+</pre>
+</div>
+
+<p>后台处理实验复用了设计工具包的 <code>CompositeComponent</code>：</p>
+
+<div class="code" data-lang="java" data-file="java17/.../design/ch32/NonFunctionalDemo.java（节选）">
+<pre>
+static final class Tree extends CompositeComponent&lt;Leaf&gt; {
+    void backgroundProcess() {                    // Tomcat 5 起：父组件递归调用子组件
+        children().forEach(Leaf::backgroundProcess);
+    }
+}
+
+ScheduledExecutorService one = Executors.newSingleThreadScheduledExecutor(r -&gt; new Thread(r, "tree-background"));
+one.scheduleWithFixedDelay(tree::backgroundProcess, 0, 50, TimeUnit.MILLISECONDS);
+</pre>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh design.ch32.NonFunctionalDemo
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+① 线程封闭：16 个线程 × 每个 50000 次请求
+  请求对象里的计数合计 800000（正确），共享字段 hits = 700000（丢了 100000 次更新）
+
+② 通知过程中，有一个监听器把自己移除（一次性监听器很常见）
+  ArrayList            ConcurrentModificationException（只通知到 1 个）
+  CopyOnWriteArrayList 通知了 3 个监听器，剩余 2 个
+
+③ 舱壁：20 个慢报表（各 300ms）先提交，随后 5 个快查询（各 5ms）
+  共用一个 4 线程池：快查询平均等待 1502 ms
+  报表 2 线程 + 查询 2 线程：快查询平均等待 4 ms
+
+④ 50 个组件的周期性任务，运行 1 秒
+  每个组件一个线程：后台线程 50 个
+  一个后台线程递归驱动：后台线程 1 个，每个组件被处理了约 20 次
+</pre>
+</div>
+
+<h2 id="checklist">设计篇总结：设计评审清单</h2>
+
+<p>
+  把第 29～32 章的原则整理成一份清单。设计一个新系统、评审别人的设计、或者重构一个老系统时，可以逐条过一遍。
+  每条后面标出了 Tomcat 里的例子，方便回头查。
+</p>
+
+<div class="tw">
+<table>
+  <tr><th>方面</th><th>要问的问题</th><th>Tomcat 的答案</th></tr>
+  <tr><td rowspan="5">架构<br>（第 29 章）</td><td>最可能变的三样东西是什么？每样是否只影响一个模块？</td><td>协议、IO 模型、部署方式各在一层</td></tr>
+  <tr><td>模块之间的接口能不能只有一两个方法？</td><td><code>Adapter.service</code>、<code>Valve.invoke</code></td></tr>
+  <tr><td>所有持有资源的组件是否有统一的 start/stop，并组成一棵树？</td><td><code>Lifecycle</code> + 容器树</td></tr>
+  <tr><td>组件里有没有解析配置、new 依赖的代码？</td><td>交给 Digester / ContextConfig</td></tr>
+  <tr><td>源码依赖是否都指向核心？核心能否脱离数据库和 Web 测试？</td><td>Realm、Manager 是接口</td></tr>
+  <tr><td rowspan="3">扩展<br>（第 30 章）</td><td>这个扩展需求是改流程、要通知、还是换实现？</td><td>阀 / 监听器 / 策略插槽</td></tr>
+  <tr><td>扩展点有默认实现吗？调用线程、顺序、失败语义写清楚了吗？</td><td>默认 Realm；Servlet 规范的约定</td></tr>
+  <tr><td>真的需要公开吗？有三个真实的用例吗？</td><td>被删掉的 Deployer、ValveContext</td></tr>
+  <tr><td rowspan="2">模式<br>（第 31 章）</td><td>这个模式解决的是哪个问题？没有这个问题时是否在过度设计？</td><td>每个模式都对应一个具体问题</td></tr>
+  <tr><td>交给外部代码的对象是视图还是本体？</td><td>各种 Facade</td></tr>
+  <tr><td rowspan="3">并发<br>（本章）</td><td>每个对象被哪些线程访问？画出来了吗？</td><td>图 32-1</td></tr>
+  <tr><td>所有池、队列、缓存都有上限吗？满了怎么办？</td><td><code>maxThreads</code>、<code>maxConnections</code>、<code>acceptCount</code></td></tr>
+  <tr><td>慢的工作和快的工作是否共用一个线程池？</td><td>多个 Service / Connector</td></tr>
+  <tr><td rowspan="2">隔离</td><td>一个模块（租户、插件）失败，影响范围有多大？</td><td>每个 Context 独立的类加载器</td></tr>
+  <tr><td>资源的获取和释放是否对称？卸载后能否被回收？</td><td>泄漏检测（第 28 章）</td></tr>
+  <tr><td rowspan="2">可观测</td><td>线程有名字吗？关键组件有计数器吗？状态变化有事件吗？</td><td>线程命名、MBean、生命周期事件</td></tr>
+  <tr><td>出问题时，能否在不重启的情况下看清内部状态？</td><td>JMX、线程转储</td></tr>
+  <tr><td rowspan="2">演进</td><td>哪些是公开 API，哪些是内部实现？边界清楚吗？</td><td>Servlet API vs Catalina 内部类</td></tr>
+  <tr><td>删除一个功能的流程是什么？有迁移路径吗？</td><td>废弃 → 删除；jakartaee-migration</td></tr>
+</table>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>并发设计从「谁碰谁」开始：线程封闭、启动后不变、并发容器、写时复制、单线程拥有者、显式状态机，各管一类情况。</li>
+  <li>隔离分请求、权限、应用、资源、进程几层；舱壁模式用分开的线程池保护快请求。</li>
+  <li>周期性工作交给一个后台线程沿组件树驱动，每个任务必须短小。</li>
+  <li>可观测性靠设计：线程命名、生命周期事件、组件内计数器、带上下文的错误信息。</li>
+  <li>Tomcat 推翻过很多设计；先废弃后删除、破坏性变更集中在大版本、提供迁移工具、窄接口，让它改得动。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>用三种方法修复实验 ① 的丢失更新：<code>synchronized</code>、<code>AtomicInteger</code>、<code>LongAdder</code>，比较 16 线程下的耗时。</li>
+    <li>把实验 ③ 的报表任务改成提交到虚拟线程执行器（JDK 21），快查询的等待时间会怎样？这说明虚拟线程解决了舱壁问题吗？（提示：想想 CPU 密集的报表。）</li>
+    <li>给实验 ④ 的 <code>Leaf.backgroundProcess()</code> 中的某一个加上 <code>sleep(500)</code>，观察其他组件被处理的次数如何变化；再想办法让它不拖累别人。</li>
+    <li>用本章的评审清单评审你最近参与的一个设计，选出得分最低的两项，写下改进方案。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

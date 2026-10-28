@@ -58,6 +58,7 @@ curl http://localhost:8080/SHUTDOWN       # 第 1 章的服务器靠这个 URL �
 | 29 | 设计篇：整体架构 | `design.ch29.ArchitectureDemo`（设计工具包在 `modern.design.kit`） |
 | 30 | 设计篇：扩展点 | `design.ch30.ExtensionDemo`（含子优先的 `modern.design.kit.PluginClassLoader`） |
 | 31 | 设计篇：设计模式实战 | `design.ch31.PatternTour` |
+| 32 | 设计篇：并发、隔离与演进 | `design.ch32.NonFunctionalDemo` |
 
 ## 目录结构
 
