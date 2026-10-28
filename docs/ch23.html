@@ -1,0 +1,600 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 23 章 · Coyote 与 NIO 连接器 — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="23">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 23 章 · 补充篇</span>
+<h1>Coyote 与 NIO 连接器</h1>
+<p class="lede">
+  第 4 章的默认连接器一个连接占一个线程：客户端不发数据，线程就干等着。
+  原书出版后不久，Tomcat 就把它换成了名为 <strong>Coyote</strong> 的连接器框架；
+  到 Tomcat 8.5，阻塞式（BIO）实现被彻底删除，默认的 HTTP/1.1 连接器变成了基于 Java NIO 的 <code>NioEndpoint</code>。
+  这一章拆开 Coyote 的分层，自己用 <code>Selector</code> 写一个迷你 NIO 连接器，并用一千个「慢客户端」和第 4 章的连接器正面比较。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>说出 Coyote 的四层：ProtocolHandler、Endpoint、Processor、Adapter，以及它们和第 4 章类的对应关系</li>
+    <li>理解阻塞模型的瓶颈在「等待」，以及 Selector 如何让一个线程看住所有空闲连接</li>
+    <li>掌握 NioEndpoint 的三类线程：Acceptor、Poller、Worker 各自做什么</li>
+    <li>分清 <code>maxConnections</code>、<code>acceptCount</code>、<code>maxThreads</code> 三个上限</li>
+    <li>知道 CoyoteAdapter 是协议层和容器之间唯一的接缝</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="coyote">从 HttpConnector 到 Coyote</h2>
+
+<p>
+  第 4 章的 <code>HttpConnector</code> + <code>HttpProcessor</code> 把「接收连接」「解析 HTTP」「调用容器」全写在两个类里。
+  Coyote 把它们拆成了可以独立替换的四层。今天 <code>server.xml</code> 里的 <code>&lt;Connector protocol="HTTP/1.1"&gt;</code>
+  实际创建的是下面这样一串对象：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 330" role="img" aria-label="Catalina Connector 持有 ProtocolHandler，后者包含 Endpoint、Processor，再经 CoyoteAdapter 进入容器">
+  <rect class="bx-d" x="20" y="16" width="520" height="250" rx="14"/>
+  <text class="ttl" x="36" y="40">Connector（Catalina 这一侧的门面，server.xml 配置的就是它）</text>
+  <rect class="bx-b" x="40" y="56" width="480" height="196" rx="12"/>
+  <text class="ttl on-b" x="56" y="80">ProtocolHandler：Http11NioProtocol</text>
+  <text class="sm" x="56" y="98">「协议 × IO 模型」的组合：Http11Nio / Http11Nio2 / AjpNio / …</text>
+  <rect class="bx-a" x="60" y="112" width="210" height="124" rx="10"/>
+  <text class="ttl on-a" x="165" y="134" text-anchor="middle">NioEndpoint</text>
+  <text class="sm" x="165" y="154" text-anchor="middle">只管 socket：接收、轮询、读写</text>
+  <text class="mono sm" x="165" y="178" text-anchor="middle">Acceptor × 1</text>
+  <text class="mono sm" x="165" y="198" text-anchor="middle">Poller × 1</text>
+  <text class="mono sm" x="165" y="218" text-anchor="middle">Executor（maxThreads）</text>
+  <path class="ln-a" d="M272 174 H304" marker-end="url(#ar-a)"/>
+  <rect class="bx-p" x="308" y="112" width="196" height="124" rx="10"/>
+  <text class="ttl on-p" x="406" y="134" text-anchor="middle">Http11Processor</text>
+  <text class="sm" x="406" y="154" text-anchor="middle">只管协议：解析请求行和头、</text>
+  <text class="sm" x="406" y="172" text-anchor="middle">keep-alive、chunked、</text>
+  <text class="sm" x="406" y="190" text-anchor="middle">填充 coyote.Request</text>
+  <text class="mono sm" x="406" y="218" text-anchor="middle">对象可回收复用</text>
+  <path class="ln-g" d="M542 174 H578" marker-end="url(#ar-g)"/>
+  <rect class="bx-g" x="582" y="122" width="158" height="104" rx="10"/>
+  <text class="ttl on-g" x="661" y="146" text-anchor="middle">CoyoteAdapter</text>
+  <text class="sm" x="661" y="168" text-anchor="middle">coyote.Request →</text>
+  <text class="sm" x="661" y="186" text-anchor="middle">catalina.Request</text>
+  <text class="sm" x="661" y="206" text-anchor="middle">映射、调用 Engine</text>
+  <path class="ln-g" d="M661 228 V282" marker-end="url(#ar-g)"/>
+  <rect class="bx" x="560" y="286" width="180" height="34" rx="8"/>
+  <text class="sm" x="650" y="308" text-anchor="middle">Engine 管道（第 13 章）</text>
+  <text class="sm" x="280" y="296" text-anchor="middle">第 4 章：HttpConnector ≈ Acceptor + 处理器池；HttpProcessor ≈ Processor + 调用容器</text>
+</svg>
+<figcaption>图 23-1　Coyote 把一个连接器拆成四层，每层都能单独替换</figcaption>
+</figure>
+
+<div class="tw">
+<table>
+  <tr><th>Coyote</th><th>职责</th><th>第 4 章的对应物</th><th>可以换成</th></tr>
+  <tr><td><code>Endpoint</code></td><td>socket 的接收、轮询、读写，线程池</td><td><code>HttpConnector.run()</code> 里的 <code>accept</code> + 处理器池</td><td><code>Nio2Endpoint</code>（AIO）；APR 版已在 10.1 删除</td></tr>
+  <tr><td><code>Processor</code></td><td>解析和生成某种协议的报文</td><td><code>HttpProcessor.parseRequest/parseHeaders</code></td><td><code>AjpProcessor</code>、HTTP/2 的 <code>StreamProcessor</code></td></tr>
+  <tr><td><code>ProtocolHandler</code></td><td>把上面两者组装起来，暴露配置属性</td><td>无</td><td>按 <code>protocol</code> 属性选择</td></tr>
+  <tr><td><code>Adapter</code></td><td>协议对象 → Servlet 对象，调用容器</td><td><code>container.invoke(request, response)</code></td><td>只有 <code>CoyoteAdapter</code> 一个实现</td></tr>
+</table>
+</div>
+
+<p>
+  这种拆法的直接好处是：HTTP/1.1、AJP、HTTP/2 共享同一个 <code>NioEndpoint</code>，而 NIO 和 NIO2 共享同一个 <code>Http11Processor</code>。
+  协议和 IO 模型两个维度可以自由组合，而不是写 3 × 2 个连接器。
+</p>
+
+<h2 id="blocking">阻塞模型的天花板</h2>
+
+<p>
+  回忆第 4 章：<code>HttpProcessor</code> 拿到 socket 后调用 <code>input.read()</code>，客户端没发数据，线程就阻塞在那里。
+  对一个 keep-alive 连接来说，大部分时间都是在「等下一个请求」：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 230" role="img" aria-label="阻塞模型下每个线程大部分时间在等待数据">
+  <text class="ttl" x="20" y="24">阻塞 IO：一个连接绑一个线程</text>
+  <text class="mono sm" x="20" y="58">线程 1</text>
+  <rect class="bx-a" x="90" y="44" width="40" height="22" rx="4"/>
+  <rect class="bx-d" x="130" y="44" width="250" height="22" rx="4"/>
+  <rect class="bx-a" x="380" y="44" width="40" height="22" rx="4"/>
+  <rect class="bx-d" x="420" y="44" width="320" height="22" rx="4"/>
+  <text class="mono sm" x="20" y="92">线程 2</text>
+  <rect class="bx-d" x="90" y="78" width="180" height="22" rx="4"/>
+  <rect class="bx-a" x="270" y="78" width="40" height="22" rx="4"/>
+  <rect class="bx-d" x="310" y="78" width="430" height="22" rx="4"/>
+  <text class="mono sm" x="20" y="126">线程 3</text>
+  <rect class="bx-r" x="90" y="112" width="650" height="22" rx="4"/>
+  <text class="sm on-r" x="415" y="127" text-anchor="middle">慢客户端：只发了半个请求头，线程一直卡在 read()</text>
+  <text class="mono sm" x="20" y="160">…</text>
+  <text class="mono sm" x="20" y="186">线程 20</text>
+  <rect class="bx-r" x="90" y="172" width="650" height="22" rx="4"/>
+  <text class="sm on-r" x="415" y="187" text-anchor="middle">处理器池满了 → 新连接直接被关闭</text>
+  <rect class="bx-a" x="420" y="206" width="20" height="14" rx="3"/><text class="sm" x="446" y="217">真正在处理请求</text>
+  <rect class="bx-d" x="560" y="206" width="20" height="14" rx="3"/><text class="sm" x="586" y="217">阻塞在 read() 上等数据</text>
+</svg>
+<figcaption>图 23-2　线程的大部分时间花在「等」上，而线程数有上限</figcaption>
+</figure>
+
+<p>
+  线程是昂贵的：每个平台线程默认要 512 KB～1 MB 的栈，操作系统调度几千个线程时上下文切换的成本也很可观。
+  于是连接数被线程数卡死。更糟的是，攻击者只要打开几百个连接、每个都慢慢地发请求头（Slowloris 攻击），
+  就能用极少的带宽让服务器拒绝所有正常用户——后面的实验会复现这一点。
+</p>
+
+<h2 id="selector">NIO：一个线程看住所有连接</h2>
+
+<p>
+  Java NIO（JDK 1.4 引入，和原书同一年）提供了 <strong>非阻塞 socket</strong> 和 <strong>Selector</strong>：
+  <code>channel.read()</code> 没有数据时立即返回 0 而不是阻塞；Selector 则可以同时监视成千上万个 channel，
+  调用一次 <code>select()</code> 就告诉你「哪几个连接现在有数据可读」。底层对应 Linux 的 <code>epoll</code>、macOS 的 <code>kqueue</code>。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="Poller 用一个 Selector 监视所有连接，只把有数据的连接派给 Worker 线程池">
+  <text class="ttl" x="20" y="24">1000 个连接</text>
+  <rect class="bx" x="20" y="36" width="70" height="20" rx="4"/><text class="mono sm" x="55" y="50" text-anchor="middle">#1</text>
+  <rect class="bx-g" x="20" y="62" width="70" height="20" rx="4"/><text class="mono sm" x="55" y="76" text-anchor="middle">#2 可读</text>
+  <rect class="bx" x="20" y="88" width="70" height="20" rx="4"/><text class="mono sm" x="55" y="102" text-anchor="middle">#3</text>
+  <rect class="bx" x="20" y="114" width="70" height="20" rx="4"/><text class="mono sm" x="55" y="128" text-anchor="middle">#4</text>
+  <rect class="bx-g" x="20" y="140" width="70" height="20" rx="4"/><text class="mono sm" x="55" y="154" text-anchor="middle">#5 可读</text>
+  <rect class="bx" x="20" y="166" width="70" height="20" rx="4"/><text class="mono sm" x="55" y="180" text-anchor="middle">…</text>
+  <rect class="bx" x="20" y="192" width="70" height="20" rx="4"/><text class="mono sm" x="55" y="206" text-anchor="middle">#1000</text>
+  <path class="ln-d" d="M92 46 H220"/><path class="ln-g" d="M92 72 H220"/><path class="ln-d" d="M92 98 H220"/>
+  <path class="ln-d" d="M92 124 H220"/><path class="ln-g" d="M92 150 H220"/><path class="ln-d" d="M92 202 H220"/>
+  <rect class="bx-a" x="224" y="56" width="190" height="120" rx="12"/>
+  <text class="ttl on-a" x="319" y="82" text-anchor="middle">Poller 线程</text>
+  <text class="mono sm" x="319" y="104" text-anchor="middle">selector.select()</text>
+  <text class="sm" x="319" y="126" text-anchor="middle">返回：#2、#5 可读</text>
+  <text class="sm" x="319" y="146" text-anchor="middle">其余 998 个不占线程</text>
+  <path class="ln-g" d="M416 100 H480" marker-end="url(#ar-g)"/>
+  <path class="ln-g" d="M416 130 H480" marker-end="url(#ar-g)"/>
+  <rect class="bx-b" x="484" y="40" width="256" height="160" rx="12"/>
+  <text class="ttl on-b" x="612" y="64" text-anchor="middle">Worker 线程池（maxThreads）</text>
+  <rect class="bx-g" x="500" y="80" width="224" height="24" rx="5"/><text class="sm" x="612" y="97" text-anchor="middle">exec-1：读 #2 → 解析 → 调用容器</text>
+  <rect class="bx-g" x="500" y="110" width="224" height="24" rx="5"/><text class="sm" x="612" y="127" text-anchor="middle">exec-2：读 #5 → 头不完整 → 立刻归还</text>
+  <rect class="bx" x="500" y="140" width="224" height="24" rx="5"/><text class="sm" x="612" y="157" text-anchor="middle">exec-3：空闲</text>
+  <rect class="bx" x="500" y="170" width="224" height="24" rx="5"/><text class="sm" x="612" y="187" text-anchor="middle">exec-4：空闲</text>
+  <text class="sm" x="380" y="250" text-anchor="middle">线程数只和「同时在处理的请求数」有关，和「连接数」无关</text>
+</svg>
+<figcaption>图 23-3　Selector 把「等待」从线程身上拿走了</figcaption>
+</figure>
+
+<h2 id="threads">NioEndpoint 的三类线程</h2>
+
+<p>
+  有了 Selector，剩下的问题是怎么分工。Tomcat 的答案是三类线程，用 jstack 或 VisualVM 看任何一个 Tomcat 进程都能看到它们的名字：
+  <code>http-nio-8080-Acceptor</code>、<code>http-nio-8080-Poller</code>、<code>http-nio-8080-exec-1</code>……
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 410" role="img" aria-label="Acceptor、Poller、Worker 之间的交互顺序">
+  <rect class="bx-p" x="30" y="14" width="150" height="34" rx="8"/><text class="ttl on-p" x="105" y="36" text-anchor="middle">Acceptor</text>
+  <rect class="bx-a" x="300" y="14" width="150" height="34" rx="8"/><text class="ttl on-a" x="375" y="36" text-anchor="middle">Poller</text>
+  <rect class="bx-b" x="570" y="14" width="150" height="34" rx="8"/><text class="ttl on-b" x="645" y="36" text-anchor="middle">Worker</text>
+  <path class="ln-d" d="M105 50 V400"/><path class="ln-d" d="M375 50 V400"/><path class="ln-d" d="M645 50 V400"/>
+
+  <text class="sm" x="113" y="74">① accept()（阻塞）</text>
+  <text class="sm" x="113" y="90">configureBlocking(false)</text>
+  <path class="ln-p" d="M107 124 H371" marker-end="url(#ar-p)"/>
+  <text class="sm" x="240" y="116" text-anchor="middle">② register：放进事件队列 + wakeup</text>
+  <text class="sm" x="383" y="150">③ 执行事件：注册 OP_READ</text>
+  <text class="sm" x="383" y="166">select() 等待…</text>
+  <text class="sm" x="383" y="194">④ 连接可读 → interestOps(0)</text>
+  <path class="ln-a" d="M377 222 H641" marker-end="url(#ar-a)"/>
+  <text class="sm" x="510" y="214" text-anchor="middle">⑤ executor.execute(SocketProcessor)</text>
+  <text class="sm" x="637" y="248" text-anchor="end">⑥ read()：有多少读多少</text>
+  <text class="sm" x="637" y="264" text-anchor="end">请求头不完整？</text>
+  <path class="ln-b" d="M643 292 H379" marker-end="url(#ar-b)"/>
+  <text class="sm" x="510" y="284" text-anchor="middle">⑦ readAgain：重新关注 OP_READ</text>
+  <text class="sm" x="637" y="312" text-anchor="end">（线程归还线程池）</text>
+  <text class="sm" x="383" y="340">…更多数据到达，重复 ④⑤⑥</text>
+  <text class="sm" x="637" y="364" text-anchor="end">⑧ 完整：Processor → Adapter → 写响应</text>
+  <path class="ln-b" d="M643 392 H379" marker-end="url(#ar-b)"/>
+  <text class="sm" x="510" y="384" text-anchor="middle">⑨ keep-alive：readAgain；否则关闭</text>
+</svg>
+<figcaption>图 23-4　一个连接在三类线程之间的流转</figcaption>
+</figure>
+
+<ol class="steps">
+  <li><strong>Acceptor</strong> 阻塞在 <code>accept()</code> 上（只有一个线程，阻塞没关系）。拿到连接后设为非阻塞，交给 Poller。连接数到达 <code>maxConnections</code> 时，它会先停下来不再 accept。</li>
+  <li><strong>Poller</strong> 是唯一操作 Selector 的线程。其他线程想注册或修改关注事件，必须把操作放进它的事件队列再 <code>wakeup()</code>，否则会和正在阻塞的 <code>select()</code> 互相卡住。</li>
+  <li>连接可读时，Poller 先把关注事件清零（<code>interestOps(0)</code>），保证同一个连接同一时刻只有一个 Worker 在处理，然后把它交给线程池。</li>
+  <li><strong>Worker</strong> 非阻塞地读取数据。请求头不完整就把已读的字节留在连接自己的缓冲区里，<strong>立即归还线程</strong>，等 Poller 下次通知。这一步就是 NIO 能扛住慢客户端的原因。</li>
+  <li>请求完整后，Worker 调用 Processor 解析、Adapter 进入容器，一直到 Servlet 返回——这段时间线程是被占用的。</li>
+  <li>Poller 还顺带做超时检查：空闲超过 <code>keepAliveTimeout</code> 的连接被关掉。</li>
+</ol>
+
+<div class="box key">
+  <div class="t">&#128273; 状态从线程栈搬到了对象里</div>
+  <p>
+    阻塞模型里，「这个连接读到哪儿了」保存在线程的局部变量里，所以线程走不开。NIO 模型把这些状态搬到了每个连接一个的
+    <code>NioSocketWrapper</code> 上（我们的版本叫 <code>SocketWrapper</code>），线程就可以随时离开、下次由别的线程接着处理。
+    这是所有事件驱动系统（Netty、Node.js、Nginx）的共同思路。
+  </p>
+</div>
+
+<h2 id="limits">三个上限：连接、队列、线程</h2>
+
+<p>NIO 连接器有三个经常被混淆的参数，它们卡在请求流转的不同位置：</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 210" role="img" aria-label="acceptCount、maxConnections、maxThreads 分别限制的位置">
+  <rect class="bx" x="20" y="70" width="120" height="60" rx="10"/>
+  <text class="ttl" x="80" y="96" text-anchor="middle">新的 TCP 连接</text>
+  <text class="sm" x="80" y="116" text-anchor="middle">三次握手完成</text>
+  <path class="ln" d="M142 100 H176" marker-end="url(#ar)"/>
+  <rect class="bx-p" x="180" y="60" width="160" height="80" rx="10"/>
+  <text class="ttl on-p" x="260" y="86" text-anchor="middle">操作系统 backlog</text>
+  <text class="mono sm" x="260" y="108" text-anchor="middle">acceptCount = 100</text>
+  <text class="sm" x="260" y="126" text-anchor="middle">满了：内核拒绝/丢弃</text>
+  <path class="ln-p" d="M342 100 H376" marker-end="url(#ar-p)"/>
+  <rect class="bx-a" x="380" y="60" width="170" height="80" rx="10"/>
+  <text class="ttl on-a" x="465" y="86" text-anchor="middle">已接收的连接</text>
+  <text class="mono sm" x="465" y="108" text-anchor="middle">maxConnections = 8192</text>
+  <text class="sm" x="465" y="126" text-anchor="middle">满了：Acceptor 暂停</text>
+  <path class="ln-a" d="M552 100 H586" marker-end="url(#ar-a)"/>
+  <rect class="bx-b" x="590" y="60" width="150" height="80" rx="10"/>
+  <text class="ttl on-b" x="665" y="86" text-anchor="middle">正在处理</text>
+  <text class="mono sm" x="665" y="108" text-anchor="middle">maxThreads = 200</text>
+  <text class="sm" x="665" y="126" text-anchor="middle">满了：任务排队</text>
+  <text class="sm" x="380" y="176" text-anchor="middle">连接数可以远大于线程数：空闲的 keep-alive 连接只占一个文件描述符和一点内存，不占线程</text>
+</svg>
+<figcaption>图 23-5　从左到右：内核队列、连接数、线程数（数字是 Tomcat 11 的默认值）</figcaption>
+</figure>
+
+<div class="tw">
+<table>
+  <tr><th>属性</th><th>默认值</th><th>满了会怎样</th><th>调优提示</th></tr>
+  <tr><td><code>maxThreads</code></td><td>200</td><td>可读的连接在线程池队列里等</td><td>和业务里阻塞操作（数据库、远程调用）的比例有关，第 28 章细讲</td></tr>
+  <tr><td><code>maxConnections</code></td><td>8192</td><td>Acceptor 停止 accept，新连接留在 backlog</td><td>主要受文件描述符上限（<code>ulimit -n</code>）约束</td></tr>
+  <tr><td><code>acceptCount</code></td><td>100</td><td>操作系统拒绝或丢弃新连接（客户端看到超时或 connection refused）</td><td>实际值还受内核参数 <code>somaxconn</code> 限制</td></tr>
+  <tr><td><code>connectionTimeout</code></td><td>60000（server.xml 示例里写 20000）</td><td>连接建立后多久没收到请求行就关闭</td><td>防慢速攻击的第一道防线</td></tr>
+  <tr><td><code>keepAliveTimeout</code></td><td>同 <code>connectionTimeout</code></td><td>两个请求之间空闲多久就关闭</td><td>前面有负载均衡器时要比它的空闲超时长</td></tr>
+</table>
+</div>
+
+<h2 id="adapter">CoyoteAdapter：协议和容器之间唯一的接缝</h2>
+
+<p>
+  Processor 解析出来的是 <code>org.apache.coyote.Request</code>：只有原始字节和协议字段，很多值甚至还没解码（用 <code>MessageBytes</code> 指向缓冲区里的一段，用到才转成 String）。
+  <code>CoyoteAdapter.service()</code> 负责：
+</p>
+
+<ol class="steps">
+  <li>取出（或创建并缓存）对应的 <code>org.apache.catalina.connector.Request</code>/<code>Response</code>，两者都是可回收复用的对象。</li>
+  <li><code>postParseRequest()</code>：URI 解码和规范化（拒绝 <code>/../</code> 这类路径）、解析会话 ID，然后调用 <code>Mapper</code> 一次性找出 Host、Context、Wrapper（第 12、13 章逐层映射的现代版）。</li>
+  <li>调用 <code>connector.getService().getContainer().getPipeline().getFirst().invoke(request, response)</code>——从这里起就是第 5 章以来熟悉的阀链。</li>
+  <li>返回后结束响应、回收对象，或者在异步模式（第 24 章）下什么都不做，等待之后再完成。</li>
+</ol>
+
+<p>本章的 Tomcat 示例在 Servlet 里打印调用栈，从栈底往上看，正好就是这条路径：</p>
+
+<div class="code" data-lang="out" data-file="curl http://localhost:8080/stack（节选）">
+<pre>
+Hello from http-nio-127.0.0.1-8080-exec-2
+  o.a.tomcat.util.threads.ThreadPoolExecutor.runWorker
+  o.a.tomcat.util.net.SocketProcessorBase.run
+  o.a.tomcat.util.net.NioEndpoint$SocketProcessor.doRun        ← Worker
+  o.a.coyote.AbstractProtocol$ConnectionHandler.process
+  o.a.coyote.AbstractProcessorLight.process
+  o.a.coyote.http11.Http11Processor.service                    ← Processor
+  o.a.catalina.connector.CoyoteAdapter.service                 ← Adapter
+  o.a.catalina.core.StandardEngineValve.invoke                 ← 第 13 章
+  o.a.catalina.valves.ErrorReportValve.invoke                  ← 第 22 章
+  o.a.catalina.core.StandardHostValve.invoke
+  o.a.catalina.authenticator.AuthenticatorBase.invoke          ← 第 10 章
+  o.a.catalina.core.StandardContextValve.invoke                ← 第 12 章
+  o.a.catalina.core.StandardWrapperValve.invoke                ← 第 11 章
+  o.a.catalina.core.ApplicationFilterChain.doFilter
+  jakarta.servlet.http.HttpServlet.service
+  modern.ch23.tomcat.EmbeddedNio$1.doGet
+</pre>
+</div>
+
+<div class="box tip">
+  <div class="t">&#9989; 前 22 章都在这一张栈里</div>
+  <p>
+    这张栈是整本书的地图：上半截是本章的 Coyote，下半截是原书第 5～13 章的容器。
+    遇到问题时打一个线程栈（<code>jstack &lt;pid&gt;</code>），对照这张图就能知道请求卡在了哪一层。
+  </p>
+</div>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch23/nio/</code><code>NioEndpoint.java</code><code>SocketWrapper.java</code><code>RawRequest.java</code><code>Adapter.java</code><code>Bootstrap.java</code><code>SlowClients.java</code><code>tomcat/EmbeddedNio.java</code></div>
+
+<p>
+  迷你版 <code>NioEndpoint</code> 大约 250 行，结构和 Tomcat 的同名类一致：一个 Acceptor 线程、一个 Poller 线程、一个固定大小的 Worker 线程池。
+  省略了 SSL、HTTP/2、请求体和 sendfile，但保留了非阻塞读、流水线、keep-alive 超时和连接数上限。
+</p>
+
+<h3>① Acceptor：连接数上限 + 交给 Poller</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch23/nio/NioEndpoint.java（节选）">
+<pre>
+private void acceptLoop() {
+    while (running) {
+        connectionLimit.acquire();                         // Semaphore ≈ Tomcat 的 LimitLatch
+        SocketChannel ch = server.accept();                // 阻塞：只有这一个线程，没关系
+        ch.configureBlocking(false);
+        connections.incrementAndGet();
+        poller.register(new SocketWrapper(ch));
+    }
+}
+</pre>
+</div>
+
+<h3>② Poller：只有它碰 Selector</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch23/nio/NioEndpoint.java（节选）">
+<pre>
+/** 其他线程不能直接改 Selector 的注册状态，所以把操作排队，由 Poller 自己执行 */
+final Queue&lt;Runnable&gt; events = new ConcurrentLinkedQueue&lt;&gt;();
+
+void readAgain(SocketWrapper w) {
+    events.add(() -&gt; { if (w.key.isValid()) w.key.interestOps(SelectionKey.OP_READ); });
+    selector.wakeup();
+}
+
+public void run() {
+    while (running) {
+        for (Runnable r; (r = events.poll()) != null; ) r.run();
+        selector.select(1000);
+        var it = selector.selectedKeys().iterator();
+        while (it.hasNext()) {
+            SelectionKey key = it.next();
+            it.remove();
+            key.interestOps(0);                            // 交给 Worker 期间不再报告这个连接
+            executor.execute(new SocketProcessor((SocketWrapper) key.attachment()));
+        }
+        timeout();                                         // 关掉空闲太久的长连接
+    }
+}
+</pre>
+</div>
+
+<h3>③ Worker：读不全就走人</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch23/nio/NioEndpoint.java（节选）">
+<pre>
+ByteBuffer buf = w.readBuffer;
+buf.compact();                                     // 切到写模式，保留还没解析的字节
+int n = w.channel.read(buf);                       // 非阻塞：有多少读多少，立刻返回
+buf.flip();
+if (n &lt; 0) { close(w); return; }
+while (true) {
+    RawRequest req = RawRequest.tryParse(buf);     // 找不到 \r\n\r\n 就返回 null
+    if (req == null) {
+        poller.readAgain(w);                       // 不完整：线程走人，数据到了再说
+        return;
+    }
+    Adapter.RawResponse resp = adapter.service(req);
+    boolean keepAlive = req.keepAlive() &amp;&amp; running;
+    writeFully(encode(resp, keepAlive));
+    if (!keepAlive) { close(w); return; }
+    if (!buf.hasRemaining()) { poller.readAgain(w); return; }
+    // 缓冲区里还有字节：流水线发来的下一个请求，继续循环
+}
+</pre>
+</div>
+
+<div class="vs">
+  <div class="old"><div class="h">第 4 章：状态在线程栈上</div>
+<div class="code" data-lang="java">
+<pre>
+// HttpProcessor.process(socket)
+input = new SocketInputStream(
+        socket.getInputStream(), 2048);
+// 阻塞在这里，直到收到完整的请求行
+parseRequest(input, output);
+parseHeaders(input);
+connector.getContainer()
+         .invoke(request, response);
+</pre>
+</div>
+  </div>
+  <div class="new"><div class="h">本章：状态在 SocketWrapper 上</div>
+<div class="code" data-lang="java">
+<pre>
+final class SocketWrapper {
+    final SocketChannel channel;
+    // 读到一半的数据留在这里，
+    // 线程可以随时离开
+    final ByteBuffer readBuffer =
+            ByteBuffer.allocate(8192);
+    volatile SelectionKey key;
+    volatile long lastAccess;
+}
+</pre>
+</div>
+  </div>
+</div>
+
+<h3>④ Tomcat 11：同样的三类线程</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch23/tomcat/EmbeddedNio.java（节选）">
+<pre>
+Connector connector = tomcat.getConnector();          // 默认协议 HTTP/1.1 = Http11NioProtocol
+connector.setProperty("maxThreads", "4");             // Worker 线程池上限
+connector.setProperty("maxConnections", "10000");     // Acceptor 的 LimitLatch
+connector.setProperty("acceptCount", "100");          // 操作系统 backlog
+connector.setProperty("connectionTimeout", "20000");
+</pre>
+</div>
+
+<h2 id="run">运行与验证</h2>
+
+<p>先启动迷你 NIO 连接器（4 个 Worker），测基本功能、keep-alive 和 HTTP 流水线：</p>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch23.nio.Bootstrap 8080 4
+curl http://localhost:8080/ http://localhost:8080/        # curl 会复用同一个连接
+printf 'GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n' | nc 127.0.0.1 8080
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+Hello from nio-exec-1，当前连接 1，JVM 线程 5
+Hello from nio-exec-2，当前连接 1，JVM 线程 6
+
+HTTP/1.1 200 OK            ← 一次 write 发来的两个请求，各自得到响应
+Connection: keep-alive
+Hello from nio-exec-2，当前连接 1，JVM 线程 8
+HTTP/1.1 200 OK
+Connection: close
+Hello from nio-exec-2，当前连接 1，JVM 线程 8
+</pre>
+</div>
+
+<p>然后是本章的重头戏：打开 1000 个只发了半个请求头的连接，再发一个正常请求。</p>
+
+<div class="code" data-lang="bash">
+<pre>
+./run.sh ch23.nio.SlowClients 8080 1000 3
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+已打开 1000 个只发了半个请求头的连接
+正常请求：HTTP 200，耗时 112 ms，响应：Hello from nio-exec-2，当前连接 1001，JVM 线程 8
+
+[monitor] 连接数 438，JVM 线程 8          ← 服务器端：连接数一路涨到 1001，线程数始终是 8
+[monitor] 连接数 906，JVM 线程 8
+[monitor] 连接数 1001，JVM 线程 8
+[monitor] 连接数 0，JVM 线程 8
+</pre>
+</div>
+
+<p>同样的攻击打第 4 章的阻塞连接器（最多 20 个处理器），只需要 50 个慢连接：</p>
+
+<div class="code" data-lang="bash">
+<pre>
+./run.sh ch04.startup.Bootstrap 8080 5 20
+./run.sh ch23.nio.SlowClients 8080 50 2
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+已打开 50 个只发了半个请求头的连接
+正常请求失败（84 ms）：java.io.IOException: HTTP/1.1 header parser received no bytes
+
+（服务器端）
+httpConnector.noProcessor：没有可用的处理器，关闭这个连接
+httpConnector.noProcessor：没有可用的处理器，关闭这个连接
+……
+</pre>
+</div>
+
+<p>最后对照 Tomcat 11（<code>maxThreads=4</code>）：线程名、1000 个慢连接，以及 8 个并发的慢请求：</p>
+
+<div class="code" data-lang="bash">
+<pre>
+./run.sh ch23.tomcat.EmbeddedNio
+./run.sh ch23.nio.SlowClients 8080 1000 1
+seq 8 | xargs -P8 -I{} curl -s -o /dev/null -w '%{time_total}\n' http://localhost:8080/slow
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+协议处理器：org.apache.coyote.http11.Http11NioProtocol
+连接器线程：http-nio-127.0.0.1-8080-Acceptor, http-nio-127.0.0.1-8080-Poller,
+           http-nio-127.0.0.1-8080-exec-1 … exec-4
+
+已打开 1000 个只发了半个请求头的连接
+正常请求：HTTP 200，耗时 101 ms，响应：Hello from http-nio-127.0.0.1-8080-exec-2
+
+2.005 2.010 2.012 2.015 4.009 4.009 4.019 4.020        ← 4 个线程，8 个 2 秒的请求：分两批完成
+</pre>
+</div>
+
+<div class="box warn">
+  <div class="t">&#9888;&#65039; NIO 解决的是「等客户端」，不是「等业务」</div>
+  <p>
+    最后一组数字说明：请求进入 Servlet 之后，线程仍然被占用到 Servlet 返回。如果业务要等数据库或远程服务 2 秒，
+    4 个线程每 2 秒只能完成 4 个请求，连接器是不是 NIO 都一样。解决这个问题要靠第 24 章的异步 Servlet，或第 27 章的虚拟线程。
+  </p>
+</div>
+
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>按变化维度分层</div>
+  <p>Coyote 把连接器拆成 Endpoint（IO 模型）、Processor（协议）、Adapter（容器接口），协议和 IO 模型可以自由组合。</p>
+  <dl>
+    <dt>取舍</dt><dd>N 种协议 × M 种 IO 只需要 N + M 个实现；代价是层与层之间的接口要设计得足够通用，调用栈也变深了。</dd>
+    <dt>替代方案</dt><dd>每种组合写一个连接器（第 4 章的做法，组合一多就失控）。</dd>
+    <dt>还能用在</dt><dd>存储层（序列化格式 × 存储介质）、消息系统（协议 × 传输）、报表（数据源 × 输出格式）：找出独立变化的维度，各自抽象。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>把状态从线程搬到对象上</div>
+  <p>连接的读取进度保存在 <code>SocketWrapper</code> 里，线程只在有事可做时才出现。</p>
+  <dl>
+    <dt>取舍</dt><dd>少量线程服务海量连接；代价是代码要写成「可中断、可恢复」的状态机，比顺序代码难读、难调试。</dd>
+    <dt>替代方案</dt><dd>虚拟线程（第 27 章）：让顺序代码在等待时自动「让出」载体线程，兼得两者。</dd>
+    <dt>还能用在</dt><dd>长流程的工作流引擎、聊天服务器、游戏服务器：把「进行到哪一步」存进对象或数据库，任何线程都能接着推进。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>单线程拥有共享资源，其他线程发消息</div>
+  <p>只有 Poller 线程操作 Selector，其他线程通过事件队列 + <code>wakeup()</code> 提交修改请求。</p>
+  <dl>
+    <dt>取舍</dt><dd>不需要锁，也不会和阻塞中的 <code>select()</code> 互相卡住；代价是修改不是立即生效，多一次排队。</dd>
+    <dt>还能用在</dt><dd>GUI 的事件分派线程、Redis 的单线程模型、Actor 模型：一个资源一个主人，其他人只能发消息。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">4</span>在每一级都设上限</div>
+  <p>backlog（acceptCount）、连接数（maxConnections）、线程数（maxThreads）分别限制请求流转的三个阶段。</p>
+  <dl>
+    <dt>取舍</dt><dd>任何一级被打满都不会拖垮其他级；代价是参数多、相互影响，调错了会出现「有空闲线程却连不上」这类现象。</dd>
+    <dt>还能用在</dt><dd>任何流水线式系统：消息消费者的预取数量、并发度、下游调用的连接池，各自设上限并监控。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch28.html">第 28 章 · 运维：调优、监控与加固</a></div>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>Coyote 把连接器拆成 ProtocolHandler、Endpoint、Processor、Adapter 四层；Tomcat 8.5 起删除了 BIO，NIO 成为默认实现。</li>
+  <li>阻塞模型一个连接占一个线程，慢客户端就能耗尽线程池；NIO 用 Selector 让空闲连接不占线程。</li>
+  <li>NioEndpoint 有三类线程：Acceptor 接收连接，Poller 用 Selector 监视可读事件，Worker 线程池处理请求；读不全时立即归还线程。</li>
+  <li><code>acceptCount</code>、<code>maxConnections</code>、<code>maxThreads</code> 分别限制内核队列、连接数、并发处理数。</li>
+  <li>CoyoteAdapter 是协议层和容器之间唯一的接缝：转换请求对象、用 Mapper 映射，然后调用 Engine 管道。</li>
+  <li>NIO 不能让慢业务变快：请求进入 Servlet 后仍然占用线程，这要靠异步 Servlet 或虚拟线程解决。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>给迷你连接器加上 <code>connectionTimeout</code>：新连接在 3 秒内没有发完请求头就关闭。再跑一次 <code>SlowClients</code>，观察服务器端连接数的变化。</li>
+    <li>把 <code>maxConnections</code> 设为 100，用 <code>SlowClients</code> 打开 300 个连接，观察第 101 个之后的连接停在哪里（提示：<code>ss -tn state syn-recv</code>、<code>ss -ltn</code> 的 Recv-Q）。</li>
+    <li>为 <code>RawRequest</code> 增加 <code>Content-Length</code> 请求体的支持：请求头完整但请求体不完整时，同样把线程还回去。</li>
+    <li>用 <code>jstack</code> 或 <code>jcmd &lt;pid&gt; Thread.print</code> 打印 Tomcat 进程的线程，在 Poller 线程的栈里找到 <code>EPoll.wait</code>（Linux）。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

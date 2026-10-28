@@ -47,6 +47,7 @@ curl http://localhost:8080/SHUTDOWN       # 第 1 章的服务器靠这个 URL �
 | 20 | JMX | `ch20.standardmbeantest.StandardAgent` `ch20.modelmbeantest1.ModelAgent` `ch20.modelmbeantest2.ModelAgent` `ch20.startup.MiniJmxServer` `ch20.tomcat.EmbeddedJmx` |
 | 21 | ServletContext、RequestDispatcher | `ch21.mini.DispatcherDemo` `ch21.tomcat.EmbeddedDispatch` |
 | 22 | 静态资源、错误页、字符编码 | `ch22.tomcat.EmbeddedStatic`（含 `ch22.mini.MiniDefaultServlet`） |
+| 23 | Coyote 与 NIO 连接器 | `ch23.nio.Bootstrap [端口] [worker] [maxConnections]` `ch23.nio.SlowClients [端口] [连接数] [秒]` `ch23.tomcat.EmbeddedNio` |
 
 ## 目录结构
 

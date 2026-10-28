@@ -28,7 +28,8 @@
     { n: 19, t: 'Manager Servlet',       d: 'ContainerServlet：让 Servlet 触碰容器内部' },
     { n: 20, t: '基于 JMX 的管理',         d: 'MBean、MBeanServer 与 Commons Modeler' },
     { n: 21, t: 'ServletContext 与 RequestDispatcher', d: 'forward、include 与三种作用域', part: '第六部分 · 补充：现代 Servlet 容器' },
-    { n: 22, t: '静态资源、错误页与字符编码', d: 'DefaultServlet、ETag/304/Range、error-page 与 UTF-8' }
+    { n: 22, t: '静态资源、错误页与字符编码', d: 'DefaultServlet、ETag/304/Range、error-page 与 UTF-8' },
+    { n: 23, t: 'Coyote 与 NIO 连接器', d: 'Acceptor、Poller、Worker 与 CoyoteAdapter' }
   ];
 
   const pad = (n) => String(n).padStart(2, '0');
