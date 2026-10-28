@@ -59,6 +59,7 @@ curl http://localhost:8080/SHUTDOWN       # 第 1 章的服务器靠这个 URL �
 | 30 | 设计篇：扩展点 | `design.ch30.ExtensionDemo`（含子优先的 `modern.design.kit.PluginClassLoader`） |
 | 31 | 设计篇：设计模式实战 | `design.ch31.PatternTour` |
 | 32 | 设计篇：并发、隔离与演进 | `design.ch32.NonFunctionalDemo` |
+| 33 | 综合：请求的完整旅程 | `ch33.JourneyTracer`（`curl -u tom:tom123 http://localhost:8080/shop/secure/orders/42`） |
 
 ## 目录结构
 

@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 33 章 · 综合：一个请求的完整旅程 — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="33">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 33 章 · 综合与练习</span>
+<h1>综合：一个请求的完整旅程</h1>
+<p class="lede">
+  32 章下来，Tomcat 被拆成了几十个零件。这一章把它们重新装回去：先跟着 Tomcat 从 <code>main</code> 方法启动到开始接客，
+  再跟着一个带认证的请求从网卡走到 Servlet 再走回来，每一步都标出它属于哪一章。
+  配套的程序会在 Engine、Host、Context、Wrapper 四层管道上各装一个追踪阀，让请求自己把旅程打印出来。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>能按顺序讲出 Tomcat 从启动到就绪的每一步</li>
+    <li>能按顺序讲出一个请求经过的每一个组件，并指出它在哪一章</li>
+    <li>拿到一张「类 → 章节」的速查表</li>
+    <li>知道怎样开始阅读真正的 Tomcat 源码</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="startup">旅程一：从 main 到就绪</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 470" role="img" aria-label="Tomcat 启动的完整顺序与对应章节">
+  <rect class="bx-d" x="20" y="14" width="530" height="34" rx="8"/><text class="sm" x="36" y="36">catalina.sh 设置 CATALINA_HOME/BASE、JVM 参数，执行 Bootstrap.main</text><text class="sm on-a" x="570" y="36">第 17 章</text>
+  <rect class="bx-d" x="20" y="56" width="530" height="34" rx="8"/><text class="sm" x="36" y="78">Bootstrap 建立 common / server / shared 类加载器，反射创建 Catalina</text><text class="sm on-a" x="570" y="78">第 17 章</text>
+  <rect class="bx-p" x="20" y="98" width="530" height="34" rx="8"/><text class="sm" x="36" y="120">Catalina 用 Digester 解析 server.xml，得到 Server → Service → Connector + Engine → Host 对象树</text><text class="sm on-a" x="570" y="120">第 15 章</text>
+  <rect class="bx" x="20" y="140" width="530" height="34" rx="8"/><text class="sm" x="36" y="162">注册关闭钩子；server.init()：所有组件 NEW → INITIALIZED，注册 MBean</text><text class="sm on-a" x="570" y="162">第 6、16、20 章</text>
+  <rect class="bx" x="20" y="182" width="530" height="34" rx="8"/><text class="sm" x="36" y="204">server.start() → Service.start()：先启动 Engine</text><text class="sm on-a" x="570" y="204">第 14 章</text>
+  <rect class="bx-a" x="20" y="224" width="530" height="34" rx="8"/><text class="sm" x="36" y="246">Engine、Host 启动；HostConfig 监听到 Host 启动，扫描 appBase 部署每个应用</text><text class="sm on-a" x="570" y="246">第 13、18 章</text>
+  <rect class="bx-a" x="40" y="266" width="510" height="34" rx="8"/><text class="sm" x="56" y="288">每个 StandardContext：创建并启动 Loader（WebappClassLoader）、Manager、Realm</text><text class="sm on-a" x="570" y="288">第 8～10、12 章</text>
+  <rect class="bx-a" x="40" y="308" width="510" height="34" rx="8"/><text class="sm" x="56" y="330">ContextConfig：web.xml + web-fragment + 注解 → Wrapper；运行 SCI</text><text class="sm on-a" x="570" y="330">第 15、25 章</text>
+  <rect class="bx-a" x="40" y="350" width="510" height="34" rx="8"/><text class="sm" x="56" y="372">监听器 contextInitialized → 过滤器 init → load-on-startup 的 Servlet</text><text class="sm on-a" x="570" y="372">第 11、25 章</text>
+  <rect class="bx-b" x="20" y="392" width="530" height="34" rx="8"/><text class="sm" x="36" y="414">最后启动 Connector：Endpoint 绑定端口，启动 Acceptor、Poller、线程池</text><text class="sm on-a" x="570" y="414">第 23 章</text>
+  <rect class="bx-g" x="20" y="434" width="530" height="30" rx="8"/><text class="sm" x="36" y="454">主线程进入 await()，在关闭端口上等待；后台线程定期 backgroundProcess</text><text class="sm on-a" x="570" y="454">第 12、14 章</text>
+</svg>
+<figcaption>图 33-1　启动的顺序：从外到内创建，先内部后入口启动</figcaption>
+</figure>
+
+<p>
+  这正是第 29 章的两条原则在起作用：配置（server.xml）→ 装配（Digester）→ 运行（start），以及「先把里面准备好再开门」——Connector 永远最后启动。
+  关闭的顺序反过来：关闭钩子或关闭端口触发 <code>server.stop()</code>，先停 Connector（不再接收新请求），再逐层停止容器，最后销毁。
+</p>
+
+<h2 id="request">旅程二：一个请求从网卡到 Servlet</h2>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 640" role="img" aria-label="一个请求经过的每个组件及对应章节">
+  <rect class="bx" x="20" y="14" width="500" height="30" rx="6"/><text class="sm" x="34" y="34">① 客户端建立 TCP 连接，完成 TLS 握手（ALPN 选出 HTTP 版本）</text><text class="sm on-a" x="540" y="34">第 26 章</text>
+  <rect class="bx-b" x="20" y="50" width="500" height="30" rx="6"/><text class="sm" x="34" y="70">② Acceptor accept() 拿到连接，LimitLatch 计数，交给 Poller</text><text class="sm on-a" x="540" y="70">第 23 章</text>
+  <rect class="bx-b" x="20" y="86" width="500" height="30" rx="6"/><text class="sm" x="34" y="106">③ Poller 发现可读，派一个 Worker（或虚拟线程）去处理</text><text class="sm on-a" x="540" y="106">第 23、27 章</text>
+  <rect class="bx-b" x="20" y="122" width="500" height="30" rx="6"/><text class="sm" x="34" y="142">④ Http11Processor 解析请求行和请求头；keep-alive、chunked</text><text class="sm on-a" x="540" y="142">第 3、4 章</text>
+  <rect class="bx-g" x="20" y="158" width="500" height="30" rx="6"/><text class="sm" x="34" y="178">⑤ CoyoteAdapter：解码 URI，Mapper 选出 Host/Context/Wrapper（重载中则等待）</text><text class="sm on-a" x="540" y="178">第 12、13、23 章</text>
+  <rect class="bx-a" x="20" y="194" width="500" height="30" rx="6"/><text class="sm" x="34" y="214">⑥ Engine 管道 → StandardEngineValve</text><text class="sm on-a" x="540" y="214">第 5、13 章</text>
+  <rect class="bx-a" x="40" y="230" width="480" height="30" rx="6"/><text class="sm" x="54" y="250">⑦ Host 管道（AccessLogValve、ErrorReportValve…）→ StandardHostValve</text><text class="sm on-a" x="540" y="250">第 13、22、28 章</text>
+  <rect class="bx-a" x="60" y="266" width="460" height="30" rx="6"/><text class="sm" x="74" y="286">⑧ 绑定上下文类加载器；请求监听器 requestInitialized</text><text class="sm on-a" x="540" y="286">第 8、21 章</text>
+  <rect class="bx-a" x="60" y="302" width="460" height="30" rx="6"/><text class="sm" x="74" y="322">⑨ Context 管道：认证器阀（BASIC/FORM）→ Realm 校验</text><text class="sm on-a" x="540" y="322">第 10、12 章</text>
+  <rect class="bx-a" x="60" y="338" width="460" height="30" rx="6"/><text class="sm" x="74" y="358">⑩ StandardContextValve：拒绝直接访问 /WEB-INF、/META-INF</text><text class="sm on-a" x="540" y="358">第 12 章</text>
+  <rect class="bx-a" x="80" y="374" width="440" height="30" rx="6"/><text class="sm" x="94" y="394">⑪ Wrapper 管道 → StandardWrapperValve：分配 Servlet 实例</text><text class="sm on-a" x="540" y="394">第 11 章</text>
+  <rect class="bx-p" x="80" y="410" width="440" height="30" rx="6"/><text class="sm" x="94" y="430">⑫ ApplicationFilterChain：按 URL 和 DispatcherType 选出的过滤器</text><text class="sm on-a" x="540" y="430">第 11、21 章</text>
+  <rect class="bx-p" x="100" y="446" width="420" height="30" rx="6"/><text class="sm" x="114" y="466">⑬ Servlet.service()：拿到的是 RequestFacade</text><text class="sm on-a" x="540" y="466">第 2、11 章</text>
+  <rect class="bx-p" x="120" y="482" width="400" height="30" rx="6"/><text class="sm" x="134" y="502">⑭ getSession() → Manager 创建会话 → 会话监听器</text><text class="sm on-a" x="540" y="502">第 9 章</text>
+  <rect class="bx-p" x="120" y="518" width="400" height="30" rx="6"/><text class="sm" x="134" y="538">⑮ forward / include / 异步：包装请求，再走一遍过滤器</text><text class="sm on-a" x="540" y="538">第 21、24 章</text>
+  <rect class="bx-g" x="20" y="560" width="500" height="30" rx="6"/><text class="sm" x="34" y="580">⑯ 一路返回：异常 → 错误页；访问日志记录；响应刷出、对象回收</text><text class="sm on-a" x="540" y="580">第 22、28 章</text>
+  <rect class="bx-b" x="20" y="596" width="500" height="30" rx="6"/><text class="sm" x="34" y="616">⑰ keep-alive：连接回到 Poller 等下一个请求；否则关闭</text><text class="sm on-a" x="540" y="616">第 4、23 章</text>
+</svg>
+<figcaption>图 33-2　一个请求的十七步（缩进表示嵌套在上一层容器的处理之中）</figcaption>
+</figure>
+
+<p>
+  这张图和第 23 章那张调用栈是同一件事的两种画法：调用栈是某一时刻的快照，这张图是整个过程。
+  下面用程序验证它。
+</p>
+
+<h2 id="trace">让请求自己说出来</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch33/JourneyTracer.java</code></div>
+
+<p>
+  <code>JourneyTracer</code> 在 Engine、Host、Context、Wrapper 的管道上各装了一个 <code>TraceValve</code>：调用 <code>getNext()</code> 之前打印「→」，之后打印「←」，
+  用一个 <code>ThreadLocal</code> 记录缩进深度。再加上 BASIC 认证、请求和会话监听器、一个同时拦截 REQUEST 和 FORWARD 的过滤器、一次 forward：
+</p>
+
+<div class="code" data-lang="java" data-file="java17/.../ch33/JourneyTracer.java（节选）">
+<pre>
+static final class TraceValve extends ValveBase {
+    @Override
+    public void invoke(Request request, Response response) throws IOException, ServletException {
+        trace(chapter, "→ " + level + " 管道：" + describe(request));
+        DEPTH.set(DEPTH.get() + 1);
+        try {
+            getNext().invoke(request, response);       // 最后一个阀之后是这一层的基础阀，它负责找下一层容器
+        } finally {
+            DEPTH.set(DEPTH.get() - 1);
+            trace(chapter, "← " + level + "（状态码 " + response.getStatus() + "）");
+        }
+    }
+}
+
+tomcat.getEngine().getPipeline().addValve(new TraceValve("[13]", "Engine"));
+tomcat.getHost().getPipeline().addValve(new TraceValve("[13]", "Host"));
+ctx.getPipeline().addValve(new TraceValve("[12]", "Context"));
+ctx.getPipeline().addValve(new BasicAuthenticator());           // 认证器排在追踪阀之后
+orders.getPipeline().addValve(new TraceValve("[11]", "Wrapper"));
+</pre>
+</div>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch33.JourneyTracer
+curl -o /dev/null -w '%{http_code}\n' http://localhost:8080/shop/secure/orders/42     # 不带凭据
+curl -u tom:tom123 http://localhost:8080/shop/secure/orders/42
+</pre>
+</div>
+
+<p>不带凭据的请求：</p>
+
+<div class="code" data-lang="out">
+<pre>
+401
+[13]    → Engine 管道：线程 http-nio-127.0.0.1-8080-exec-1，Mapper 已选好 Host=localhost Context=/shop Wrapper=orders
+[13]      → Host 管道：StandardEngineValve 交给了 Host localhost
+[21]        ServletRequestListener.requestInitialized
+[12]        → Context 管道：StandardHostValve 交给了 Context /shop，用户 = null
+[12]        ← Context（状态码 401）                ← BasicAuthenticator 短路了，根本没到 Wrapper
+[21]        ServletRequestListener.requestDestroyed
+[13]      ← Host（状态码 401）
+[13]    ← Engine（状态码 401）
+</pre>
+</div>
+
+<p>带凭据的请求：</p>
+
+<div class="code" data-lang="out">
+<pre>
+订单 #42（tom）
+[13]    → Engine 管道：线程 http-nio-127.0.0.1-8080-exec-2，Mapper 已选好 Host=localhost Context=/shop Wrapper=orders
+[13]      → Host 管道：StandardEngineValve 交给了 Host localhost
+[21]        ServletRequestListener.requestInitialized
+[12]        → Context 管道：StandardHostValve 交给了 Context /shop，用户 = null
+[11]          → Wrapper 管道：StandardContextValve 交给了 Wrapper orders，用户 = tom
+[11]            → AuditFilter（REQUEST）
+[2,11]            OrderServlet.doGet：servletPath=/secure/orders pathInfo=/42 参数 id=42
+[9]               HttpSessionListener.sessionCreated id=4C1D96ED…
+[21]              forward → /WEB-INF/views/order
+[11]              → AuditFilter（FORWARD）
+[21]                OrderView 渲染（dispatcherType=FORWARD）
+[11]              ← AuditFilter
+[11]            ← AuditFilter
+[11]          ← Wrapper（状态码 200）
+[12]        ← Context（状态码 200）
+[21]        ServletRequestListener.requestDestroyed
+[13]      ← Host（状态码 200）
+[13]    ← Engine（状态码 200）
+</pre>
+</div>
+
+<p>从这段输出里能读出好几个前面章节的结论：</p>
+
+<ol class="steps">
+  <li><strong>映射在进入容器之前就完成了</strong>。Engine 阀第一次被调用时，<code>Host</code>、<code>Context</code>、<code>Wrapper</code> 已经确定——这是 CoyoteAdapter 里的 Mapper 做的（第 23 章），原书第 12、13 章那种逐层映射已经被替换了。</li>
+  <li><strong>阀的顺序有意义</strong>。Context 层的追踪阀排在认证器前面，所以它看到的用户还是 <code>null</code>；到了 Wrapper 层，认证已经完成，用户是 <code>tom</code>。</li>
+  <li><strong>短路发生在最早能判断的地方</strong>。没有凭据时，认证器直接返回 401，Wrapper、过滤器、Servlet 都没有执行。</li>
+  <li><strong>forward 不经过 Wrapper 管道</strong>。分派由 <code>ApplicationDispatcher</code> 直接分配目标 Servlet 并构建过滤器链（第 21 章），所以第二次只看到了 <code>AuditFilter（FORWARD）</code>，没有看到 Wrapper 追踪阀。</li>
+  <li><strong>从头到尾是同一个线程</strong>。所有输出都来自 <code>exec-2</code>：同步处理中，线程封闭让请求对象不需要任何同步（第 32 章）。</li>
+</ol>
+
+<h2 id="classmap">类 → 章节速查表</h2>
+
+<p>读 Tomcat 源码或排查问题时，看到一个类名，可以从这里找到讲它的章节：</p>
+
+<div class="tw">
+<table>
+  <tr><th>类 / 接口（Tomcat 11）</th><th>作用</th><th>章节</th></tr>
+  <tr><td><code>org.apache.catalina.startup.Bootstrap</code> / <code>Catalina</code></td><td>启动、类加载器层次、命令行</td><td>17</td></tr>
+  <tr><td><code>org.apache.tomcat.util.digester.Digester</code></td><td>XML → 对象图</td><td>15</td></tr>
+  <tr><td><code>org.apache.catalina.core.StandardServer</code> / <code>StandardService</code></td><td>顶层组件、关闭端口</td><td>14</td></tr>
+  <tr><td><code>org.apache.catalina.util.LifecycleBase</code></td><td>生命周期模板方法与状态机</td><td>6、29</td></tr>
+  <tr><td><code>org.apache.catalina.connector.Connector</code></td><td>连接器门面</td><td>3、4、23</td></tr>
+  <tr><td><code>org.apache.tomcat.util.net.NioEndpoint</code></td><td>Acceptor、Poller、线程池</td><td>23</td></tr>
+  <tr><td><code>org.apache.coyote.http11.Http11Processor</code></td><td>HTTP/1.1 解析</td><td>3、4、23</td></tr>
+  <tr><td><code>org.apache.coyote.http2.Http2UpgradeHandler</code></td><td>HTTP/2 连接</td><td>26</td></tr>
+  <tr><td><code>org.apache.catalina.connector.CoyoteAdapter</code></td><td>协议 → 容器的接缝</td><td>23</td></tr>
+  <tr><td><code>org.apache.catalina.mapper.Mapper</code></td><td>一次性映射 Host/Context/Wrapper</td><td>12、13、23</td></tr>
+  <tr><td><code>org.apache.catalina.core.StandardPipeline</code> / <code>ValveBase</code></td><td>管道与阀</td><td>5</td></tr>
+  <tr><td><code>org.apache.catalina.core.StandardEngine</code> / <code>StandardHost</code></td><td>顶层容器、虚拟主机</td><td>13</td></tr>
+  <tr><td><code>org.apache.catalina.core.StandardContext</code></td><td>Web 应用</td><td>12</td></tr>
+  <tr><td><code>org.apache.catalina.core.StandardWrapper</code> / <code>StandardWrapperValve</code></td><td>Servlet 实例管理</td><td>11</td></tr>
+  <tr><td><code>org.apache.catalina.core.ApplicationFilterChain</code></td><td>过滤器链</td><td>11</td></tr>
+  <tr><td><code>org.apache.catalina.core.ApplicationContext</code> / <code>ApplicationDispatcher</code></td><td>ServletContext、forward/include</td><td>21</td></tr>
+  <tr><td><code>org.apache.catalina.connector.RequestFacade</code></td><td>交给 Servlet 的外观</td><td>2</td></tr>
+  <tr><td><code>org.apache.catalina.loader.WebappLoader</code> / <code>ParallelWebappClassLoader</code></td><td>应用类加载器、重载、泄漏检测</td><td>8、28</td></tr>
+  <tr><td><code>org.apache.catalina.session.StandardManager</code> / <code>PersistentManager</code></td><td>会话管理</td><td>9</td></tr>
+  <tr><td><code>org.apache.catalina.realm.*</code> / <code>org.apache.catalina.authenticator.*</code></td><td>用户存储、认证方式</td><td>10</td></tr>
+  <tr><td><code>org.apache.catalina.startup.ContextConfig</code></td><td>web.xml、注解、SCI</td><td>15、25</td></tr>
+  <tr><td><code>org.apache.catalina.startup.HostConfig</code></td><td>自动部署</td><td>18</td></tr>
+  <tr><td><code>org.apache.catalina.servlets.DefaultServlet</code></td><td>静态资源</td><td>22</td></tr>
+  <tr><td><code>org.apache.catalina.valves.ErrorReportValve</code> / <code>AccessLogValve</code></td><td>错误页、访问日志</td><td>22、28</td></tr>
+  <tr><td><code>org.apache.coyote.AsyncStateMachine</code></td><td>异步请求状态</td><td>24</td></tr>
+  <tr><td><code>org.apache.tomcat.websocket.server.WsSci</code> / <code>WsFilter</code></td><td>WebSocket</td><td>26</td></tr>
+  <tr><td><code>org.apache.catalina.manager.ManagerServlet</code></td><td>管理应用</td><td>19</td></tr>
+  <tr><td><code>org.apache.tomcat.util.modeler.Registry</code></td><td>MBean 注册</td><td>20</td></tr>
+</table>
+</div>
+
+<h2 id="source">接下来：读真正的 Tomcat 源码</h2>
+
+<p>本书的迷你实现都是为了让你能读懂真实的源码。建议的路线：</p>
+
+<ol class="steps">
+  <li><strong>拿到源码</strong>：<code>git clone https://github.com/apache/tomcat.git</code>，切到 <code>11.0.x</code> 分支。它用 Ant 构建（<code>ant</code>），但只读代码的话，用 IDE 直接打开即可；或者在本工程里让 IDE 下载 <code>tomcat-embed-core</code> 的源码 jar。</li>
+  <li><strong>用调试器代替通读</strong>：在本章的 <code>JourneyTracer</code> 里，于 <code>CoyoteAdapter.service</code>、<code>StandardContextValve.invoke</code>、<code>StandardWrapperValve.invoke</code>、<code>ApplicationFilterChain.internalDoFilter</code> 下断点，发一个请求，单步走一遍。</li>
+  <li><strong>按本书的顺序读</strong>：连接器（<code>org.apache.coyote</code>、<code>org.apache.tomcat.util.net</code>）→ 容器（<code>org.apache.catalina.core</code>）→ 组件（<code>loader</code>、<code>session</code>、<code>realm</code>）→ 启动（<code>startup</code>）。每读一个类，先回到对应章节看一眼迷你版。</li>
+  <li><strong>读测试</strong>：<code>test/</code> 目录里的测试（例如 <code>TestStandardContext</code>、<code>TestMapper</code>）往往比注释更能说明边界情况。</li>
+  <li><strong>读变更</strong>：每个版本的 <code>changelog</code> 和安全公告说明了「为什么改」，是学习设计演进的最好材料（第 32 章）。</li>
+</ol>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>启动：脚本 → Bootstrap（类加载器）→ Catalina（Digester 装配）→ init → start（先容器后连接器）→ await。</li>
+  <li>请求：Acceptor → Poller → Worker → Processor → CoyoteAdapter（Mapper）→ Engine → Host → Context → Wrapper → 过滤器链 → Servlet，然后原路返回。</li>
+  <li>映射在进入容器前一次完成；阀的顺序决定了每一层能看到什么；短路发生在最早能判断的地方；forward 只经过过滤器。</li>
+  <li>速查表把 Tomcat 11 的主要类对应到本书章节，读源码时可以随时回查。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>给 <code>JourneyTracer</code> 加一个 <code>AccessLogValve</code> 到 Host 管道，观察它的输出出现在追踪日志的什么位置，解释原因。</li>
+    <li>让 <code>OrderServlet</code> 在 id 为 0 时抛出异常，并配置一个错误页。追踪 ERROR 分派经过了哪些阀和过滤器。</li>
+    <li>把 <code>OrderServlet</code> 改成异步（<code>startAsync</code> 后在另一个线程里 <code>dispatch</code>），观察追踪日志里线程名和嵌套结构的变化。</li>
+    <li>按「源码」一节的方法，在 <code>Mapper.internalMapWrapper</code> 下断点，验证第 12 章讲的四条映射规则在真实代码里的顺序。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>
