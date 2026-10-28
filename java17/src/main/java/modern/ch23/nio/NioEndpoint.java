@@ -57,6 +57,11 @@ public final class NioEndpoint {
     public int getConnections() { return connections.get(); }
     public int getMaxConnections() { return maxConnections; }
 
+    /** 实际监听的端口（构造时传 0 表示让操作系统分配，测试里常用） */
+    public int getLocalPort() throws IOException {
+        return ((InetSocketAddress) server.getLocalAddress()).getPort();
+    }
+
     public void start() throws IOException {
         server = ServerSocketChannel.open();
         server.bind(new InetSocketAddress("127.0.0.1", port), 100);   // 100 = acceptCount，操作系统的等待队列

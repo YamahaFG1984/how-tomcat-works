@@ -40,7 +40,8 @@
     { n: 31, t: '设计模式实战', d: '十二个模式：在 Tomcat 里找到，在业务里用上' },
     { n: 32, t: '并发、隔离与演进', d: '线程归属、舱壁、被推翻的设计与评审清单' },
     { n: 33, t: '综合：一个请求的完整旅程', d: '启动与请求的全过程、类与章节速查', part: '第八部分 · 综合与练习' },
-    { n: 34, t: '动手：插件化任务调度器', d: '把设计篇的原则用在一个非 Web 系统上' }
+    { n: 34, t: '动手：插件化任务调度器', d: '把设计篇的原则用在一个非 Web 系统上' },
+    { n: 35, t: '附录：路线、术语与自测', d: '三条学习路线、术语表、分部分自测题', part: '附录' }
   ];
 
   const pad = (n) => String(n).padStart(2, '0');
@@ -222,7 +223,8 @@
   const grid = document.getElementById('toc-grid');
   if (grid) {
     grid.className = 'toc-grid';
-    grid.innerHTML = CHAPTERS.map(({ n, t, d }) =>
+    grid.innerHTML = CHAPTERS.map(({ n, t, d, part }) =>
+      (part ? `<div class="toc-part">${part}</div>` : '') +
       `<a class="toc-card" href="${href(n)}">` +
       `<div class="n">第 ${n} 章</div>` +
       `<div class="t">${t}</div>` +

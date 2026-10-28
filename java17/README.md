@@ -20,6 +20,16 @@ curl http://localhost:8080/SHUTDOWN       # 第 1 章的服务器靠这个 URL �
 `run.sh <类名> [参数...]` 中的类名省略了公共前缀 `modern.`。大多数服务器的第一个参数是端口号（默认 8080），
 按回车即可停止（第 14 章起改用关闭端口，第 16 章起支持 Ctrl+C / kill）。
 
+## 测试
+
+```bash
+mvn verify          # 编译 + 运行 JUnit 5 测试（JDK 17 和 21 都应通过）
+```
+
+测试覆盖映射规则、密码哈希、RequestDispatcher、静态资源的条件/范围请求、迷你 NIO 连接器（流水线、慢客户端、异步）、
+WebSocket 握手、类加载器泄漏、设计工具包和第 34 章的调度器。仓库根目录的 `.github/workflows/ci.yml`
+会在每次推送时用 JDK 17 和 21 各跑一遍，并检查 `docs/` 的站内链接。
+
 ## 每章可运行的类
 
 每章通常包含两部分：`startup/`（或章节根包）是和原书类一一对应的「迷你 Catalina」，

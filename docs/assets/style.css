@@ -463,3 +463,35 @@ ol.steps > li {
   dd { margin: 0; }
   .see { margin-top: 8px; font-size: 13px; color: var(--fg-faint); }
 }
+
+/* 自测题：题目常显，答案折叠 */
+.quiz {
+  counter-reset: q; list-style: none; padding-left: 0;
+
+  > li {
+    counter-increment: q; position: relative; padding: 12px 16px 12px 52px; margin: 10px 0;
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+
+    &::before {
+      content: counter(q); position: absolute; left: 14px; top: 12px;
+      width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center;
+      background: var(--blue-bg); color: var(--blue); border: 1px solid var(--blue);
+      font-size: 13px; font-weight: 700;
+    }
+  }
+  details { margin-top: 6px; font-size: 14.5px; }
+  summary {
+    cursor: pointer; color: var(--accent-2); font-size: 13px; font-weight: 700; width: fit-content;
+    &:hover { text-decoration: underline; }
+  }
+  details[open] summary { margin-bottom: 4px; }
+  details p { margin: 4px 0 0; color: var(--fg-soft); }
+}
+
+/* 首页目录的分组标题 */
+.toc-grid > .toc-part {
+  grid-column: 1 / -1; margin: 12px 0 -2px;
+  font-size: 13px; font-weight: 700; letter-spacing: .06em; color: var(--accent-2);
+  border-bottom: 1px solid var(--line); padding-bottom: 6px;
+  &:first-child { margin-top: 0; }
+}

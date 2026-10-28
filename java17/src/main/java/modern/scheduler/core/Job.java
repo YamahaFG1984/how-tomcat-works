@@ -37,7 +37,14 @@ public final class Job extends LifecycleBase implements JobMXBean {
         this.params = Map.copyOf(params);
     }
 
-    void attach(Scheduler scheduler) { this.scheduler = scheduler; }
+    void attach(Scheduler scheduler) {
+        this.scheduler = scheduler;
+        // 进入 STARTED 之后才登记调度。如果在 startInternal 里登记，ticker 线程可能在状态还是 STARTING 时
+        // 就触发 trigger()，被「不可用」检查静默丢掉——一次性任务就永远不会执行了（单元测试发现的竞态）
+        addLifecycleListener(e -> {
+            if (e.to() == modern.design.kit.LifecycleState.STARTED) scheduler.scheduleJob(this);
+        });
+    }
     Task task() { return task; }
     Schedule schedule() { return schedule; }
     Map<String, String> params() { return params; }
@@ -50,7 +57,6 @@ public final class Job extends LifecycleBase implements JobMXBean {
         } catch (Exception e) {
             throw new IllegalStateException(e);
         }
-        scheduler.scheduleJob(this);
     }
 
     @Override

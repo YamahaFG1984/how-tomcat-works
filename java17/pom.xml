@@ -21,6 +21,7 @@
     <maven.compiler.release>17</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <tomcat.version>11.0.21</tomcat.version>
+    <junit.version>5.11.4</junit.version>
   </properties>
 
   <dependencies>
@@ -36,6 +37,12 @@
       <artifactId>tomcat-embed-websocket</artifactId>
       <version>${tomcat.version}</version>
     </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>
@@ -47,6 +54,15 @@
         <configuration>
           <!-- 不用 -Xlint:all：JDK 21 的 this-escape 检查会对原书 new LifecycleSupport(this) 这类写法报警告 -->
           <compilerArgs><arg>-Xlint:unchecked,deprecation,removal,rawtypes,cast,fallthrough,finally,overrides,static,try,varargs</arg></compilerArgs>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.5.2</version>
+        <configuration>
+          <!-- 第 28 章：Tomcat 的 ThreadLocal 泄漏检测需要 add-opens，和 catalina.sh 的默认参数一致 -->
+          <argLine>--add-opens=java.base/java.lang=ALL-UNNAMED</argLine>
         </configuration>
       </plugin>
       <plugin>

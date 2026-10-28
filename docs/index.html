@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>How Tomcat Works 图解教程 · 从 Socket 到 Catalina</title>
-<meta name="description" content="《How Tomcat Works》20 章的中文图解教程，每章附带可运行的 Java 17 + Tomcat 11 对照代码。">
+<meta name="description" content="《How Tomcat Works》中文图解教程：原书 20 章 + 现代 Tomcat 补充篇 + 设计篇 + 综合实战，每章附带可运行的 Java 17 + Tomcat 11 代码。">
 <link rel="stylesheet" href="assets/style.css">
 </head>
 <body data-chapter="0">
@@ -13,7 +13,7 @@
 <main>
 
 <div class="hero">
-  <span class="chapter-eyebrow">面向初学者的 20 章图解教程</span>
+  <span class="chapter-eyebrow">面向初学者的 35 章图解教程</span>
   <h1>How Tomcat Works：从 Socket 到 Catalina</h1>
   <p class="sub">
     这套教程整理自 Budi Kurniawan 与 Paul Deck 的经典著作《How Tomcat Works》。原书从一个三个类的 Web 服务器开始，
@@ -21,10 +21,16 @@
     这里保留原书的全部主线和关键源码，配上大量示意图，并为<strong>每一章</strong>提供一份可以直接运行的
     <strong>Java 17 + Tomcat 11</strong> 对照代码，让你看清二十年前的设计在今天变成了什么样。
   </p>
+  <p class="sub" style="margin-top:10px">
+    在原书 20 章之外，还补充了原书之后的 8 章（RequestDispatcher、静态资源与编码、NIO 连接器、异步 Servlet、
+    Spring Boot 的启动方式、HTTP/2 与 WebSocket、虚拟线程、运维），4 章<strong>设计篇</strong>（架构原则、扩展点、设计模式、
+    并发与演进——可以直接用到你自己的 Java 项目里），以及综合实战和附录。
+  </p>
   <p style="margin-top:14px">
     <span class="pill">Socket / HTTP</span><span class="pill">Servlet 6.1（jakarta）</span><span class="pill">连接器</span>
     <span class="pill">Pipeline &amp; Valve</span><span class="pill">Lifecycle</span><span class="pill">类加载器</span>
     <span class="pill">Session</span><span class="pill">Realm</span><span class="pill">Digester</span><span class="pill">JMX</span>
+    <span class="pill">NIO / HTTP/2</span><span class="pill">异步与虚拟线程</span><span class="pill">设计原则</span>
     <span class="pill">Java 17</span><span class="pill">嵌入式 Tomcat 11</span>
   </p>
 </div>
@@ -77,7 +83,8 @@
 
 <h2 id="toc">章节目录</h2>
 
-<p>原书 20 章可以分为五个部分：先从零写一个 Web 服务器和最简单的 Servlet 容器，再做出 Tomcat 4 的默认连接器，然后逐个讲解容器用到的组件，接着是四种标准容器的实现，最后是启动、部署和管理。</p>
+<p>前五个部分对应原书 20 章：先从零写一个 Web 服务器和最简单的 Servlet 容器，再做出 Tomcat 4 的默认连接器，然后逐个讲解容器用到的组件，接着是四种标准容器的实现，最后是启动、部署和管理。</p>
+<p>第六部分补上原书之后二十年的变化；第七部分（设计篇）把散落在各章的设计决定提炼成可以带走的原则；第八部分用一个完整的请求追踪和一个插件化任务调度器把全书串起来；附录给出学习路线、术语表和自测题。</p>
 
 <div id="toc-grid"></div>
 
@@ -89,6 +96,7 @@
   <li><strong>原理与原书代码</strong>：用图解释这一章的组件是做什么的、为什么这样设计，并摘录原书和 Tomcat 4/5 的关键源码。</li>
   <li><strong>Java 17 对照版</strong>：同一功能的现代写法。通常包含两部分——一个和原书类一一对应的「迷你 Catalina」实现（接在前几章的代码上逐步长大），以及用<strong>嵌入式 Tomcat 11</strong> 真实 API 写出的同等程序。</li>
   <li><strong>运行与验证</strong>：所有输出都来自真实运行，你可以照着命令复现。</li>
+  <li><strong>设计要点</strong>：这一章里可以带到别的项目的设计决定，按「做法 → 取舍 → 替代方案 → 还能用在哪」整理，并链接到设计篇。</li>
   <li><strong>小结与动手练习</strong>。</li>
 </ol>
 
@@ -99,7 +107,7 @@
 
 <h2 id="java17">运行 Java 17 对照代码</h2>
 
-<p>对照代码位于仓库的 <code>java17/</code> 目录，是一个普通的 Maven 工程，唯一的依赖是 <code>tomcat-embed-core</code>（它自带 jakarta.servlet 6.1 API、Catalina、Digester、JULI、modeler）。</p>
+<p>对照代码位于仓库的 <code>java17/</code> 目录，是一个普通的 Maven 工程，主要依赖是 <code>tomcat-embed-core</code>（它自带 jakarta.servlet 6.1 API、Catalina、Digester、JULI、modeler），第 26 章另加 <code>tomcat-embed-websocket</code>，测试用 JUnit 5。</p>
 
 <div class="code" data-lang="bash">
 <pre>
@@ -117,6 +125,10 @@ bin/startup.sh &amp;&amp; bin/shutdown.sh        # 第 17 章：用脚本启停�
   <tr><th>目录</th><th>内容</th></tr>
   <tr><td><code>src/main/java/modern/chNN/</code></td><td>第 NN 章的代码；<code>startup/</code> 是启动类，<code>tomcat/</code> 是 Tomcat 11 版本</td></tr>
   <tr><td><code>src/main/java/modern/common/</code></td><td>各章共用的工具：动态代理外观、Servlet 接口的默认实现等</td></tr>
+  <tr><td><code>src/main/java/modern/design/</code></td><td>设计篇（第 29～32 章）的代码；<code>design/kit/</code> 是可以直接复用的生命周期、组合组件、管道、插件类加载器</td></tr>
+  <tr><td><code>src/main/java/modern/scheduler/</code></td><td>第 34 章的插件化任务调度器</td></tr>
+  <tr><td><code>src/main/java21/</code></td><td>需要 JDK 21 的代码（第 27 章虚拟线程），由 Maven profile 在 JDK 21+ 上自动编译</td></tr>
+  <tr><td><code>src/test/java/</code></td><td>JUnit 5 测试，<code>mvn verify</code> 运行；GitHub Actions 在 JDK 17 和 21 上各跑一遍</td></tr>
   <tr><td><code>webroot/</code></td><td>示例 Servlet 的源码（jakarta 版），由 <code>compile-servlets.sh</code> 编译</td></tr>
   <tr><td><code>myApp/</code>、<code>webapps/app1/</code></td><td>按标准目录结构组织的 Web 应用（第 8 章起使用）</td></tr>
   <tr><td><code>conf/</code>、<code>bin/</code>、<code>etc/</code></td><td>server.xml、tomcat-users.xml、启动脚本、Digester 示例 XML</td></tr>
@@ -141,6 +153,8 @@ bin/startup.sh &amp;&amp; bin/shutdown.sh        # 第 17 章：用脚本启停�
   <tr><td>Digester、Modeler</td><td>Commons Digester / Commons Modeler</td><td>并入 Tomcat：<code>org.apache.tomcat.util.digester</code> / <code>.modeler</code>（第 15、20 章）</td></tr>
   <tr><td>JMX</td><td>需要单独的实现（MX4J）</td><td>JDK 内置，平台 MBean 服务器（第 20 章）</td></tr>
   <tr><td>安全管理器</td><td>可选的沙箱</td><td>Java 17 废弃，Tomcat 11 已移除支持</td></tr>
+  <tr><td>配置方式</td><td>只有 web.xml</td><td>注解、web-fragment、<code>ServletContainerInitializer</code>；Spring Boot 用代码启动嵌入式 Tomcat（第 25 章）</td></tr>
+  <tr><td>异步与协议</td><td>同步阻塞的 HTTP/1.1</td><td>异步 Servlet、非阻塞 IO、HTTP/2、WebSocket（第 24、26 章）</td></tr>
 </table>
 </div>
 
@@ -151,6 +165,7 @@ bin/startup.sh &amp;&amp; bin/shutdown.sh        # 第 17 章：用脚本启停�
 <div class="box tip">
   <div class="t">&#128161; 推荐的阅读顺序</div>
   <p>第 1–5 章是基础，务必按顺序读并亲手跑一遍代码；第 6–10 章是容器的各个组件，彼此相对独立；第 11–14 章把组件拼成标准容器；第 15–20 章讲配置、启动、部署和管理。读完第 17 章后，再回头看一遍首页的全景图，你会发现每个方框你都亲手写过一个。</p>
+  <p>时间有限时，按目标挑一条路线：理解原理、排查与运维、学习设计——见<a href="ch35.html#paths">第 35 章的三条学习路线</a>。</p>
 </div>
 
 </main>

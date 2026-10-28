@@ -299,6 +299,16 @@ protected void stopSelf() {           // 子组件都停了之后（不再触发
   这和第 29 章「先关大门，再停核心」、第 11 章「卸载前等待在途请求」是同一件事。
 </p>
 
+<div class="box warn">
+  <div class="t">&#9888;&#65039; 单元测试抓到的一个竞态</div>
+  <p>
+    第一版在 <code>Job.startInternal()</code> 里把自己登记到 ticker。演示程序跑了很多次都正常，但 <code>SchedulerTest</code> 偶尔失败：
+    一次性任务（<code>once</code>）被 ticker 线程立即触发时，Job 还处于 STARTING 状态，<code>trigger()</code> 的「是否可用」检查把它静默丢掉了，
+    这个任务就永远不会执行。修复方法是给 Job 挂一个生命周期监听器，<strong>进入 STARTED 之后</strong>才登记调度——
+    和 Tomcat 最后才启动 Connector 是同一条原则：准备好之后再接活。测试代码在 <code>java17/src/test/java/modern/scheduler/SchedulerTest.java</code>。
+  </p>
+</div>
+
 <h2 id="run">运行与验证</h2>
 
 <div class="code" data-lang="bash">
