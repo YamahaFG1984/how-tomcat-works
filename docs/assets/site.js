@@ -31,7 +31,8 @@
     { n: 22, t: '静态资源、错误页与字符编码', d: 'DefaultServlet、ETag/304/Range、error-page 与 UTF-8' },
     { n: 23, t: 'Coyote 与 NIO 连接器', d: 'Acceptor、Poller、Worker 与 CoyoteAdapter' },
     { n: 24, t: '异步 Servlet 与非阻塞 IO', d: 'AsyncContext、SSE 与 ReadListener' },
-    { n: 25, t: '可插拔性与 Spring Boot', d: '注解、SCI、web-fragment 与嵌入式启动' }
+    { n: 25, t: '可插拔性与 Spring Boot', d: '注解、SCI、web-fragment 与嵌入式启动' },
+    { n: 26, t: 'TLS、HTTP/2 与 WebSocket', d: 'SNI/ALPN、多路复用、协议升级与帧' }
   ];
 
   const pad = (n) => String(n).padStart(2, '0');

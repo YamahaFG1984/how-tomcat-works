@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>第 26 章 · TLS、HTTP/2 与 WebSocket — How Tomcat Works 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="26">
+<div id="app">
+<aside id="sidebar"></aside>
+<main>
+
+<span class="chapter-eyebrow">第 26 章 · 补充篇</span>
+<h1>TLS、HTTP/2 与 WebSocket</h1>
+<p class="lede">
+  原书里的连接器只说一种语言：明文的 HTTP/1.1，一问一答。今天的 Tomcat 还要处理加密（TLS）、
+  在一个连接上并行跑几十个请求（HTTP/2），以及把一个 HTTP 连接「升级」成双向的消息通道（WebSocket）。
+  这三者有一个共同点：它们都发生在<strong>连接器</strong>这一层，到了容器里，Servlet 几乎感觉不到区别。
+  本章各写一个能跑的例子，其中 WebSocket 服务器不依赖任何库，从握手到帧格式全部手写。
+</p>
+
+<div class="goals">
+  <h4>本章目标</h4>
+  <ul>
+    <li>知道 TLS 在 Tomcat 里配置在哪里，SNI 和 ALPN 分别解决什么问题</li>
+    <li>理解 HTTP/2 的多路复用，以及 Tomcat 如何把每个「流」当作一个普通请求交给容器</li>
+    <li>掌握 WebSocket 的握手和帧格式，能读懂 <code>Sec-WebSocket-Accept</code> 是怎么算出来的</li>
+    <li>理解 HTTP 升级机制（<code>HttpServletRequest.upgrade</code>）如何让一个连接离开 Servlet 管道</li>
+  </ul>
+</div>
+
+<div id="chapter-toc"></div>
+
+<h2 id="tls">TLS：加密发生在连接器里</h2>
+
+<p>
+  HTTPS 就是在 TCP 和 HTTP 之间加一层 TLS。对 Tomcat 来说，它是连接器的一个属性：
+  同一个 <code>NioEndpoint</code>，读写 socket 时多一步加解密（<code>SecureNioChannel</code> 包装了 <code>SSLEngine</code>）。
+  容器只能通过 <code>request.isSecure()</code>、<code>getScheme()</code> 和一些请求属性（客户端证书、加密套件）知道这是一个 HTTPS 请求。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 290" role="img" aria-label="TLS 握手中 ClientHello 携带 SNI 和 ALPN，Tomcat 据此选择证书和应用层协议">
+  <rect class="bx" x="40" y="16" width="130" height="34" rx="8"/><text class="ttl" x="105" y="38" text-anchor="middle">客户端</text>
+  <rect class="bx-a" x="590" y="16" width="130" height="34" rx="8"/><text class="ttl on-a" x="655" y="38" text-anchor="middle">Tomcat 8443</text>
+  <path class="ln-d" d="M105 52 V280"/><path class="ln-d" d="M655 52 V280"/>
+  <path class="ln" d="M107 84 H651" marker-end="url(#ar)"/>
+  <text class="mono sm" x="380" y="72" text-anchor="middle">ClientHello：SNI = localhost，ALPN = [h2, http/1.1]</text>
+  <rect class="bx-b" x="420" y="96" width="225" height="62" rx="10"/>
+  <text class="sm" x="532" y="116" text-anchor="middle">TLSClientHelloExtractor 先读出：</text>
+  <text class="sm" x="532" y="134" text-anchor="middle">SNI → 选哪个 SSLHostConfig（证书）</text>
+  <text class="sm" x="532" y="150" text-anchor="middle">ALPN → 选 h2 还是 http/1.1</text>
+  <path class="ln-a" d="M653 184 H109" marker-end="url(#ar-a)"/>
+  <text class="mono sm" x="380" y="176" text-anchor="middle">ServerHello + 证书（CN=localhost），ALPN = h2</text>
+  <path class="ln" d="M107 214 H651" marker-end="url(#ar)"/>
+  <text class="sm" x="380" y="206" text-anchor="middle">密钥交换完成（TLS 1.3 只需一个往返）</text>
+  <rect class="bx-g" x="107" y="232" width="546" height="34" rx="8"/>
+  <text class="sm" x="380" y="254" text-anchor="middle">之后的字节都是密文；解密后交给 Http2UpgradeHandler（h2）或 Http11Processor（http/1.1）</text>
+</svg>
+<figcaption>图 26-1　一次握手要决定两件事：用哪张证书（SNI），说哪种 HTTP（ALPN）</figcaption>
+</figure>
+
+<ul>
+  <li><strong>SNI（Server Name Indication）</strong>：一个 IP 上托管多个 HTTPS 域名时，服务器得在发证书<em>之前</em>知道客户端要访问哪个域名。客户端把域名明文放在 ClientHello 里，Tomcat 按它选择 <code>&lt;SSLHostConfig hostName="…"&gt;</code>。这是第 13 章「虚拟主机」在 TLS 层的对应物。</li>
+  <li><strong>ALPN（Application-Layer Protocol Negotiation）</strong>：客户端列出自己会说的协议，服务器挑一个。浏览器只通过 ALPN 使用 HTTP/2，所以「HTTP/2 必须配 HTTPS」在实践中是成立的。</li>
+</ul>
+
+<div class="box note">
+  <div class="t">&#128161; JSSE 还是 OpenSSL？</div>
+  <p>
+    Tomcat 默认用 JDK 自带的 JSSE 实现 TLS，线程名里的 <code>https-jsse-nio-8443-exec-1</code> 就是这个意思。
+    也可以换成 OpenSSL（以前通过 tomcat-native 库，Tomcat 11 在 Java 22+ 上还能通过 FFM API 直接调用），握手性能更好。
+    配置方式相同，都是 <code>SSLHostConfig</code>。很多部署干脆让前面的 Nginx 或云负载均衡器终结 TLS，Tomcat 只跑明文。
+  </p>
+</div>
+
+<h2 id="h2">HTTP/2：一个连接，多个流</h2>
+
+<p>
+  HTTP/1.1 的 keep-alive 让连接可以复用，但一个连接上同一时刻只能有一个请求在跑，后面的必须排队（队头阻塞）。
+  浏览器的办法是对同一个域名开 6 个连接。HTTP/2 换了思路：报文被切成二进制<strong>帧</strong>，每帧标明属于哪个<strong>流</strong>（stream），
+  不同流的帧可以在一个连接上交错发送：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 270" role="img" aria-label="HTTP/1.1 一个连接一次一个请求，HTTP/2 一个连接上多个流的帧交错">
+  <text class="ttl" x="20" y="24">HTTP/1.1：一个连接上请求排队</text>
+  <text class="mono sm" x="20" y="54">连接 1</text>
+  <rect class="bx-a" x="90" y="40" width="150" height="22" rx="4"/><text class="sm" x="165" y="55" text-anchor="middle">请求 A（慢）</text>
+  <rect class="bx-b" x="244" y="40" width="60" height="22" rx="4"/><text class="sm" x="274" y="55" text-anchor="middle">B</text>
+  <rect class="bx-g" x="308" y="40" width="60" height="22" rx="4"/><text class="sm" x="338" y="55" text-anchor="middle">C</text>
+  <text class="sm on-r" x="380" y="55">B、C 被 A 堵住 → 浏览器只好多开连接</text>
+
+  <text class="ttl" x="20" y="104">HTTP/2：帧交错，流互不等待</text>
+  <text class="mono sm" x="20" y="134">连接 1</text>
+  <rect class="bx-a" x="90" y="120" width="34" height="22" rx="3"/><text class="mono sm" x="107" y="135" text-anchor="middle">A1</text>
+  <rect class="bx-b" x="128" y="120" width="34" height="22" rx="3"/><text class="mono sm" x="145" y="135" text-anchor="middle">B1</text>
+  <rect class="bx-g" x="166" y="120" width="34" height="22" rx="3"/><text class="mono sm" x="183" y="135" text-anchor="middle">C1</text>
+  <rect class="bx-b" x="204" y="120" width="34" height="22" rx="3"/><text class="mono sm" x="221" y="135" text-anchor="middle">B2</text>
+  <rect class="bx-g" x="242" y="120" width="34" height="22" rx="3"/><text class="mono sm" x="259" y="135" text-anchor="middle">C2</text>
+  <rect class="bx-a" x="280" y="120" width="34" height="22" rx="3"/><text class="mono sm" x="297" y="135" text-anchor="middle">A2</text>
+  <rect class="bx-a" x="318" y="120" width="34" height="22" rx="3"/><text class="mono sm" x="335" y="135" text-anchor="middle">A3</text>
+  <text class="sm" x="366" y="135">流 A、B、C 各自的 HEADERS / DATA 帧</text>
+
+  <rect class="bx-d" x="20" y="166" width="720" height="92" rx="10"/>
+  <text class="ttl" x="36" y="190">Tomcat 内部</text>
+  <text class="sm" x="36" y="212">每个连接一个 Http2UpgradeHandler：读帧、按流 ID 分发，维护流量控制窗口和 HPACK 头部压缩表</text>
+  <text class="sm" x="36" y="232">每个流一个 StreamProcessor，提交到同一个线程池 → CoyoteAdapter → 容器（和 HTTP/1.1 请求走同一条路）</text>
+  <text class="sm" x="36" y="250">对 Servlet 来说：一个流 = 一个请求，request.getProtocol() 返回 "HTTP/2.0"</text>
+</svg>
+<figcaption>图 26-2　HTTP/2 把「一个连接一次一个请求」变成「一个连接很多个流」</figcaption>
+</figure>
+
+<p>
+  在 Tomcat 里开启 HTTP/2 只需要给连接器加一个<strong>升级协议</strong>：<code>&lt;UpgradeProtocol className="org.apache.coyote.http2.Http2Protocol"/&gt;</code>。
+  它支持两种进入方式：HTTPS 上通过 ALPN 协商（h2），明文上通过 <code>Upgrade: h2c</code> 头或者「直接说 HTTP/2」（prior knowledge）。
+  第 23 章那张 Coyote 分层图在这里体现了价值：HTTP/2 复用了 <code>NioEndpoint</code> 和 <code>CoyoteAdapter</code>，只替换了中间的 Processor。
+</p>
+
+<div class="box warn">
+  <div class="t">&#9888;&#65039; 服务器推送已经退场</div>
+  <p>
+    HTTP/2 曾经有「服务器推送」：服务器主动把客户端还没请求的资源推过去（Servlet 4.0 的 <code>PushBuilder</code>）。
+    实践证明它很难用好，主流浏览器已移除支持，Servlet 6.1 也将其标记为废弃。现在的替代方案是 <code>103 Early Hints</code> 和 <code>&lt;link rel="preload"&gt;</code>。
+  </p>
+</div>
+
+<h2 id="ws">WebSocket：从 HTTP 升级出来的双向通道</h2>
+
+<p>
+  第 24 章的 SSE 只能服务器往客户端推。聊天、协同编辑、游戏需要双向、低延迟的消息，这就是 WebSocket。
+  它的巧妙之处在于开场：先发一个普通的 HTTP 请求，双方同意之后，<strong>同一个 TCP 连接</strong>就改说另一种协议。
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 300" role="img" aria-label="WebSocket 握手：HTTP 请求带 Upgrade 和 Sec-WebSocket-Key，服务器回 101 和 Sec-WebSocket-Accept，之后交换帧">
+  <rect class="bx" x="40" y="16" width="130" height="34" rx="8"/><text class="ttl" x="105" y="38" text-anchor="middle">客户端</text>
+  <rect class="bx-a" x="590" y="16" width="130" height="34" rx="8"/><text class="ttl on-a" x="655" y="38" text-anchor="middle">服务器</text>
+  <path class="ln-d" d="M105 52 V290"/><path class="ln-d" d="M655 52 V290"/>
+  <rect class="bx-b" x="180" y="60" width="400" height="76" rx="8"/>
+  <text class="mono sm" x="194" y="78">GET /chat HTTP/1.1</text>
+  <text class="mono sm" x="194" y="94">Upgrade: websocket　Connection: Upgrade</text>
+  <text class="mono sm" x="194" y="110">Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==</text>
+  <text class="mono sm" x="194" y="126">Sec-WebSocket-Version: 13</text>
+  <path class="ln-b" d="M107 100 H176" marker-end="url(#ar-b)"/><path class="ln-b" d="M582 100 H651" marker-end="url(#ar-b)"/>
+  <rect class="bx-g" x="180" y="148" width="400" height="60" rx="8"/>
+  <text class="mono sm" x="194" y="166">HTTP/1.1 101 Switching Protocols</text>
+  <text class="mono sm" x="194" y="182">Upgrade: websocket　Connection: Upgrade</text>
+  <text class="mono sm" x="194" y="198">Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=</text>
+  <path class="ln-g" d="M651 178 H584" marker-end="url(#ar-g)"/><path class="ln-g" d="M178 178 H109" marker-end="url(#ar-g)"/>
+  <text class="sm" x="380" y="228" text-anchor="middle">Accept = Base64( SHA-1( Key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11" ) )</text>
+  <path class="ln-p" d="M107 254 H651" marker-end="url(#ar-p)"/>
+  <text class="sm" x="380" y="248" text-anchor="middle">文本帧（客户端发出的帧必须加掩码）</text>
+  <path class="ln-p" d="M653 280 H109" marker-end="url(#ar-p)"/>
+  <text class="sm" x="380" y="274" text-anchor="middle">文本帧（服务器可以随时主动发送）</text>
+</svg>
+<figcaption>图 26-3　握手是 HTTP，握手之后是帧</figcaption>
+</figure>
+
+<p>
+  <code>Sec-WebSocket-Accept</code> 的计算不是为了安全，而是为了确认「对方真的懂 WebSocket」：
+  一个不懂的普通 HTTP 服务器不可能碰巧回出正确的值。上图里的 Key 和 Accept 是 RFC 6455 给出的标准例子，本章用 Tomcat 验证过。
+  握手之后，数据以帧为单位传输：
+</p>
+
+<figure>
+<svg class="dgm" viewBox="0 0 760 200" role="img" aria-label="WebSocket 帧格式：FIN、opcode、MASK、长度、掩码键、负载">
+  <rect class="bx-a" x="20" y="40" width="60" height="44" rx="4"/><text class="mono sm" x="50" y="58" text-anchor="middle">FIN</text><text class="sm" x="50" y="76" text-anchor="middle">1 位</text>
+  <rect class="bx" x="80" y="40" width="70" height="44" rx="4"/><text class="mono sm" x="115" y="58" text-anchor="middle">RSV1-3</text><text class="sm" x="115" y="76" text-anchor="middle">3 位</text>
+  <rect class="bx-b" x="150" y="40" width="90" height="44" rx="4"/><text class="mono sm" x="195" y="58" text-anchor="middle">opcode</text><text class="sm" x="195" y="76" text-anchor="middle">4 位</text>
+  <rect class="bx-p" x="240" y="40" width="60" height="44" rx="4"/><text class="mono sm" x="270" y="58" text-anchor="middle">MASK</text><text class="sm" x="270" y="76" text-anchor="middle">1 位</text>
+  <rect class="bx-g" x="300" y="40" width="110" height="44" rx="4"/><text class="mono sm" x="355" y="58" text-anchor="middle">长度</text><text class="sm" x="355" y="76" text-anchor="middle">7 位</text>
+  <rect class="bx-d" x="410" y="40" width="110" height="44" rx="4"/><text class="mono sm" x="465" y="58" text-anchor="middle">扩展长度</text><text class="sm" x="465" y="76" text-anchor="middle">0 / 16 / 64 位</text>
+  <rect class="bx-p" x="520" y="40" width="100" height="44" rx="4"/><text class="mono sm" x="570" y="58" text-anchor="middle">掩码键</text><text class="sm" x="570" y="76" text-anchor="middle">0 / 32 位</text>
+  <rect class="bx" x="620" y="40" width="120" height="44" rx="4"/><text class="mono sm" x="680" y="58" text-anchor="middle">负载</text><text class="sm" x="680" y="76" text-anchor="middle">…</text>
+  <text class="sm" x="20" y="118">opcode：0x1 文本　0x2 二进制　0x0 续帧　0x8 关闭　0x9 ping　0xA pong</text>
+  <text class="sm" x="20" y="140">长度：&lt; 126 直接放在 7 位里；126 表示后面跟 16 位长度；127 表示后面跟 64 位长度</text>
+  <text class="sm" x="20" y="162">掩码：客户端→服务器的每一帧都要用随机 4 字节异或，防止中间代理把它当成 HTTP 缓存起来（缓存投毒）</text>
+  <text class="sm" x="20" y="184">FIN = 0 表示消息还没完，后面跟 opcode = 0 的续帧：一条大消息可以拆成多帧发送</text>
+</svg>
+<figcaption>图 26-4　最少 2 个字节的帧头，比 HTTP 头部小得多</figcaption>
+</figure>
+
+<h3>在 Tomcat 里：升级让连接离开 Servlet 管道</h3>
+
+<p>
+  Servlet 3.1 提供了通用的升级 API：<code>request.upgrade(MyHandler.class)</code>。调用它的 Servlet 或过滤器写完 101 响应后，
+  这个连接就不再按 HTTP 解析了，连接器会把之后的数据交给 <code>HttpUpgradeHandler</code>。Tomcat 的 WebSocket 实现就建立在它之上：
+</p>
+
+<ol class="steps">
+  <li><code>WsSci</code>（第 25 章的 SCI 机制）在应用启动时创建 <code>WsServerContainer</code>，注册所有 <code>@ServerEndpoint</code>，并装上过滤器 <code>WsFilter</code>。</li>
+  <li>握手请求和普通请求一样走完第 23 章那张栈：连接器 → CoyoteAdapter → Engine → Host → Context → 过滤器链。</li>
+  <li><code>WsFilter</code> 发现这是一个指向已注册端点的握手请求，校验头部、计算 Accept，调用 <code>request.upgrade(WsHttpUpgradeHandler.class)</code>。</li>
+  <li>请求处理结束后，连接器发现「已升级」，把这个 socket 交给 <code>WsHttpUpgradeHandler</code>。之后每当 Poller 发现数据可读，就由它解析帧并回调 <code>@OnMessage</code>。</li>
+</ol>
+
+<div class="box key">
+  <div class="t">&#128273; 一个踩到的坑：没有 Servlet 就没有过滤器</div>
+  <p>
+    本章的 Tomcat 示例第一版返回了 404。原因是第 12 章的映射规则：请求必须先映射到某个 Wrapper，<code>StandardContextValve</code>
+    才会构建过滤器链；Context 里一个 Servlet 都没有时，请求在到达 <code>WsFilter</code> 之前就被判为 404。
+    普通 Web 应用有 DefaultServlet 兜底（第 22 章），所以遇不到。修复办法就是加一个映射到 <code>/</code> 的 DefaultServlet。
+  </p>
+</div>
+
+<h2 id="java17">Java 17 对照版</h2>
+
+<div class="src-ref"><b>源码</b><code>java17/src/main/java/modern/ch26/ws/</code><code>MiniWebSocketServer.java</code><code>Frame.java</code><code>WsClient.java</code><code>tomcat/ChatEndpoint.java</code><code>tomcat/EmbeddedWebSocket.java</code><code>tomcat/EmbeddedHttp2Tls.java</code><code>tomcat/Http2Client.java</code></div>
+
+<p>本章新增了一个依赖 <code>tomcat-embed-websocket</code>（Jakarta WebSocket 2.2 的 API 和 Tomcat 的实现）。</p>
+
+<h3>① 手写 WebSocket：握手</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch26/ws/MiniWebSocketServer.java（节选）">
+<pre>
+static final String GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";   // RFC 6455 规定的常量
+
+static String acceptKey(String key) {
+    byte[] sha1 = MessageDigest.getInstance("SHA-1").digest((key + GUID).getBytes(ISO_8859_1));
+    return Base64.getEncoder().encodeToString(sha1);
+}
+
+out.write(("HTTP/1.1 101 Switching Protocols\r\n"
+        + "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+        + "Sec-WebSocket-Accept: " + acceptKey(key) + "\r\n\r\n").getBytes(ISO_8859_1));
+// 从这里开始，同一个 socket 上读写的都是帧
+</pre>
+</div>
+
+<h3>② 手写 WebSocket：读一帧</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch26/ws/Frame.java（节选）">
+<pre>
+record Frame(boolean fin, int opcode, boolean masked, byte[] payload) {
+
+    static Frame read(DataInputStream in) throws IOException {
+        int b0 = in.readUnsignedByte();
+        int b1 = in.readUnsignedByte();
+        boolean fin = (b0 &amp; 0x80) != 0;
+        int opcode = b0 &amp; 0x0F;
+        boolean masked = (b1 &amp; 0x80) != 0;
+        long len = b1 &amp; 0x7F;
+        if (len == 126) len = in.readUnsignedShort();
+        else if (len == 127) len = in.readLong();
+        byte[] mask = new byte[4];
+        if (masked) in.readFully(mask);
+        byte[] payload = new byte[(int) len];
+        in.readFully(payload);
+        if (masked) {
+            for (int i = 0; i &lt; payload.length; i++) payload[i] ^= mask[i % 4];
+        }
+        return new Frame(fin, opcode, masked, payload);
+    }
+}
+</pre>
+</div>
+
+<h3>③ Tomcat：注解式端点</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch26/tomcat/ChatEndpoint.java（节选）">
+<pre>
+@ServerEndpoint("/chat")
+public class ChatEndpoint {                         // 每个连接一个实例
+
+    private static final Set&lt;Session&gt; SESSIONS = new CopyOnWriteArraySet&lt;&gt;();
+
+    @OnOpen
+    public void onOpen(Session session) {
+        SESSIONS.add(session);
+        broadcast("系统：" + session.getId() + " 加入，当前 " + SESSIONS.size() + " 人");
+    }
+
+    @OnMessage
+    public void onMessage(String message, Session session) {
+        broadcast(session.getId() + "：" + message);
+    }
+
+    private static void broadcast(String text) {
+        for (Session s : SESSIONS) {
+            synchronized (s) {                      // 同一个会话不允许并发发送
+                s.getBasicRemote().sendText(text);
+            }
+        }
+    }
+}
+</pre>
+</div>
+
+<div class="code" data-lang="java" data-file="java17/.../ch26/tomcat/EmbeddedWebSocket.java（节选）">
+<pre>
+Tomcat.addServlet(ctx, "default", new DefaultServlet());     // 没有它，握手请求到不了 WsFilter
+ctx.addServletMappingDecoded("/", "default");
+ctx.addServletContainerInitializer(new WsSci(), null);        // 创建 ServerContainer、装 WsFilter
+ctx.addServletContainerInitializer((classes, sc) -&gt; {
+    var container = (ServerContainer) sc.getAttribute(ServerContainer.class.getName());
+    container.addEndpoint(ChatEndpoint.class);                 // 相当于扫描到 @ServerEndpoint
+}, null);
+</pre>
+</div>
+
+<h3>④ Tomcat：HTTPS + HTTP/2</h3>
+
+<div class="code" data-lang="java" data-file="java17/.../ch26/tomcat/EmbeddedHttp2Tls.java（节选）">
+<pre>
+var https = new Connector();                                  // 默认 HTTP/1.1 NIO
+https.setPort(8443);
+https.setScheme("https");
+https.setSecure(true);
+https.setProperty("SSLEnabled", "true");
+var ssl = new SSLHostConfig();                                // 可以有多个，按 SNI 主机名选择
+var cert = new SSLHostConfigCertificate(ssl, SSLHostConfigCertificate.Type.RSA);
+cert.setCertificateKeystoreFile(keystore.toString());         // 启动时用 keytool 生成的自签名证书
+cert.setCertificateKeystorePassword("changeit");
+ssl.addCertificate(cert);
+https.addSslHostConfig(ssl);
+https.addUpgradeProtocol(new Http2Protocol());                // TLS + ALPN 协商 h2
+tomcat.getService().addConnector(https);
+
+tomcat.getConnector().addUpgradeProtocol(new Http2Protocol());  // 明文 8080 也支持 h2c
+</pre>
+</div>
+
+<p>
+  对应的 server.xml 写法是在 <code>&lt;Connector&gt;</code> 里嵌套 <code>&lt;SSLHostConfig&gt;</code>、<code>&lt;Certificate&gt;</code> 和
+  <code>&lt;UpgradeProtocol&gt;</code>——Digester（第 15 章）会创建出完全相同的对象。
+</p>
+
+<h2 id="run">运行与验证</h2>
+
+<p>先跑手写的 WebSocket 服务器，用 JDK 自带的 <code>java.net.http.WebSocket</code> 当客户端：</p>
+
+<div class="code" data-lang="bash">
+<pre>
+cd java17
+./run.sh ch26.ws.MiniWebSocketServer
+./run.sh ch26.ws.WsClient ws://localhost:8080/ 你好 time "$(printf 'x%.0s' $(seq 200))"
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+（客户端）                                  （服务器）
+→ 你好                                      [握手] key=ZKDc90+h8JLgcWEtzIAuOw== → accept=L92zPG6IonJaadp9JECYZoh8YFo=
+→ time                                      [收到] fin=true masked=true len=6 "你好"
+→ xxxx…（200 个 x）                         [收到] fin=true masked=true len=4 "time"
+← pong                                      [收到] fin=true masked=true len=200 "xxxx…"   ← 走了 16 位扩展长度
+← echo: 你好                                [关闭] 客户端发起关闭
+← 现在是 09:37:04
+← echo: xxxx…
+← close 1000 bye
+</pre>
+</div>
+
+<p>「你好」是 6 个字节（UTF-8 每个汉字 3 字节）；客户端发来的每一帧 <code>masked=true</code>。再跑 Tomcat 的聊天室，开两个客户端：</p>
+
+<div class="code" data-lang="bash">
+<pre>
+./run.sh ch26.tomcat.EmbeddedWebSocket
+./run.sh ch26.ws.WsClient ws://localhost:8080/chat 我先来 --hold=3     # 终端 A，多待 3 秒
+./run.sh ch26.ws.WsClient ws://localhost:8080/chat 大家好               # 终端 B
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+（终端 A）
+← 系统：0 加入，当前 1 人
+→ 我先来
+← pong
+← 0：我先来
+← 系统：1 加入，当前 2 人        ← B 加入后，A 收到了服务器主动推来的消息
+← 1：大家好
+← 系统：1 离开（NORMAL_CLOSURE）
+← close 1000 bye
+</pre>
+</div>
+
+<p>用 curl 发一个原始握手请求，可以验证 RFC 6455 里的标准例子：</p>
+
+<div class="code" data-lang="bash">
+<pre>
+curl -i -N -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
+     -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' http://localhost:8080/chat
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+HTTP/1.1 101
+Upgrade: websocket
+Connection: upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+</pre>
+</div>
+
+<p>最后是 HTTP/2。<code>--noproxy '*'</code> 是因为本机设置了 HTTPS 代理，直连 localhost 时要绕开它：</p>
+
+<div class="code" data-lang="bash">
+<pre>
+./run.sh ch26.tomcat.EmbeddedHttp2Tls
+curl -k -v --noproxy '*' --http2 https://localhost:8443/info      # TLS + ALPN
+curl --http2-prior-knowledge http://localhost:8080/info           # h2c，直接说 HTTP/2
+curl -v --http2 http://localhost:8080/info                        # h2c，先 HTTP/1.1 再升级
+./run.sh ch26.tomcat.Http2Client https://localhost:8443/slow 20   # 20 个各需 1 秒的请求
+</pre>
+</div>
+
+<div class="code" data-lang="out">
+<pre>
+* ALPN: curl offers h2,http/1.1
+* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384 / X25519 / RSASSA-PSS
+* ALPN: server accepted h2
+*  subject: CN=localhost
+&lt; HTTP/2 200
+protocol=HTTP/2.0 secure=true scheme=https 客户端端口=41390 线程=https-jsse-nio-127.0.0.1-8443-exec-2
+
+protocol=HTTP/2.0 secure=false scheme=http 客户端端口=49512 线程=http-nio-127.0.0.1-8080-exec-2
+
+&lt; HTTP/1.1 101
+&lt; Upgrade: h2c
+&lt; HTTP/2 200
+protocol=HTTP/2.0 secure=false scheme=http 客户端端口=49514 …
+
+20 个请求，总耗时 1.1 秒，协议 [HTTP_2]，服务器看到的客户端端口 [54292]
+</pre>
+</div>
+
+<p>
+  最后一行是多路复用的证据：20 个请求并行完成（1.1 秒而不是 20 秒），而服务器看到的客户端端口只有一个——它们共用了一个 TCP 连接。
+  同样的测试用 HTTP/1.1 需要 20 个连接（第 24 章的 <code>LoadClient</code> 就是这么做的）。
+</p>
+
+<h2 id="design">设计要点</h2>
+
+<p>这一章的代码里有几个可以带到别的项目里的设计决定。每条按「做法 → 取舍 → 替代方案 → 还能用在哪」来写；系统的讨论见<a href="ch29.html">设计篇</a>。</p>
+
+<div class="dp">
+  <div class="h"><span class="n">1</span>新协议作为「升级」挂到旧协议上</div>
+  <p>HTTP/2 和 WebSocket 都从 HTTP/1.1 连接升级而来，Tomcat 用 <code>UpgradeProtocol</code> / <code>HttpUpgradeHandler</code> 承接，复用同一个 Endpoint。</p>
+  <dl>
+    <dt>取舍</dt><dd>不需要新端口，能穿过只认 HTTP 的防火墙和代理，老客户端照常工作；代价是握手多一个往返，协议实现要处理「升级前」和「升级后」两种状态。</dd>
+    <dt>还能用在</dt><dd>协议版本协商（客户端声明支持的版本，服务器挑一个）、数据库驱动的能力协商、API 的内容协商（<code>Accept</code> 头）。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch32.html">第 32 章 · 并发、隔离与演进</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">2</span>把新东西翻译成旧接口</div>
+  <p>HTTP/2 的每个流被包装成一个普通请求，经 CoyoteAdapter 交给容器，Servlet 不用改一行代码。</p>
+  <dl>
+    <dt>取舍</dt><dd>生态里所有过滤器、框架都直接受益；代价是旧接口表达不了新能力（流优先级、推送），只能另开 API 或放弃。</dd>
+    <dt>还能用在</dt><dd>引入新的消息中间件时，先实现旧的消费者接口；新存储引擎先兼容旧的 DAO 接口，再逐步暴露新特性。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch29.html">第 29 章 · 整体架构：分层与边界</a></div>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">3</span>握手里验证「对方真的懂」</div>
+  <p>WebSocket 用 Key + 固定 GUID 的 SHA-1 证明服务器理解协议；客户端帧加掩码防止被代理误解。</p>
+  <dl>
+    <dt>取舍</dt><dd>几行代码的成本，换来与不懂协议的中间设备之间不会产生歧义；它不是认证，安全仍要靠 TLS 和应用层鉴权。</dd>
+    <dt>还能用在</dt><dd>自定义协议的魔数和版本号、文件格式的签名头：开场先确认双方说的是同一种语言。</dd>
+  </dl>
+</div>
+<div class="dp">
+  <div class="h"><span class="n">4</span>边界处终结复杂度</div>
+  <p>TLS 可以在 Tomcat 终结，也常常交给前面的负载均衡器；无论哪种，容器只通过 <code>isSecure()</code> 感知。</p>
+  <dl>
+    <dt>取舍</dt><dd>证书和加密集中管理，应用服务器更简单；代价是负载均衡器到 Tomcat 之间是明文，需要 <code>RemoteIpValve</code> 读取 <code>X-Forwarded-Proto</code> 才能得到正确的 <code>isSecure()</code>。</dd>
+    <dt>还能用在</dt><dd>API 网关统一做鉴权、限流、协议转换，后端服务只处理业务。</dd>
+  </dl>
+  <div class="see">延伸：<a href="ch28.html">第 28 章 · 运维：调优、监控与加固</a></div>
+</div>
+
+<h2 id="summary">小结</h2>
+
+<ul>
+  <li>TLS 是连接器的属性：<code>SSLHostConfig</code> 配置证书，SNI 用来选证书，ALPN 用来选 HTTP 版本。</li>
+  <li>HTTP/2 用帧和流实现多路复用；Tomcat 通过 <code>Http2Protocol</code> 升级协议支持 h2 和 h2c，每个流作为一个普通请求交给容器。</li>
+  <li>WebSocket 从一次 HTTP 握手开始（101 + <code>Sec-WebSocket-Accept</code>），之后同一连接上交换带掩码的帧。</li>
+  <li>Tomcat 的 WebSocket 由 <code>WsSci</code> 启动、<code>WsFilter</code> 握手、<code>request.upgrade()</code> 让连接离开 Servlet 管道。</li>
+</ul>
+
+<div class="exercise">
+  <h3>动手练习</h3>
+  <ol>
+    <li>给 <code>MiniWebSocketServer</code> 加上分片支持：收到 <code>fin=false</code> 的文本帧时先缓存，直到 <code>fin=true</code> 的续帧到达再拼成完整消息。</li>
+    <li>用 <code>keytool</code> 再生成一张 <code>CN=example.test</code> 的证书，给 HTTPS 连接器加第二个 <code>SSLHostConfig(hostName="example.test")</code>，用 <code>curl -k --resolve example.test:8443:127.0.0.1 https://example.test:8443/info -v</code> 观察服务器返回了哪张证书。</li>
+    <li>把 <code>Http2Client</code> 改成 <code>HttpClient.Version.HTTP_1_1</code>，比较 20 个请求的总耗时和客户端端口数量。</li>
+    <li>给聊天室加一个心跳：服务器每 10 秒给每个会话发一个 ping，30 秒内没有收到 pong 就关闭会话。</li>
+  </ol>
+</div>
+
+<div id="pager"></div>
+</main>
+</div>
+<script src="assets/site.js"></script>
+</body>
+</html>

@@ -30,6 +30,12 @@
       <artifactId>tomcat-embed-core</artifactId>
       <version>${tomcat.version}</version>
     </dependency>
+    <!-- 第 26 章：WebSocket（jakarta.websocket 2.2 API + Tomcat 的实现 WsSci） -->
+    <dependency>
+      <groupId>org.apache.tomcat.embed</groupId>
+      <artifactId>tomcat-embed-websocket</artifactId>
+      <version>${tomcat.version}</version>
+    </dependency>
   </dependencies>
 
   <build>
